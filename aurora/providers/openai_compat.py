@@ -1,0 +1,306 @@
+"""OpenAI-compatible servers: llama.cpp (--jinja), OpenRouter, LM Studio, …
+Streaming, tool calls, usage. Malformed tool-call responses raise
+MalformedToolCall so agent.py can retry-then-degrade (R5)."""
+
+import ipaddress
+import json
+from typing import Callable
+from urllib.parse import urlparse
+
+import httpx
+
+from .base import (MalformedToolCall, Provider, ProviderError, ToolCall,
+                   TurnResult, cancellable_sse)
+from .happy_eyeballs import HappyEyeballsTransport
+
+
+def _is_bare_ip(base_url: str) -> bool:
+    """True when the endpoint is a literal private/loopback IP rather than a
+    hostname. A LAN reverse proxy (e.g. Caddy) commonly serves a cert issued
+    for its Tailscale/hostname name only — hitting it by bare IP always
+    mismatches, so we skip TLS verification for that case specifically
+    (hostnames, including .ts.net, keep full verification)."""
+    host = (urlparse(base_url).hostname or "").lower()
+    try:
+        return ipaddress.ip_address(host).is_private or \
+               ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_lan_host(base_url: str) -> bool:
+    """True for a self-hosted server on the local machine / LAN / tailnet —
+    somewhere a connect SHOULD fail fast when it's off. A public API
+    (openrouter.ai, …) is not: its TLS handshake can legitimately be slow, so
+    it gets a longer connect budget (see `_client`)."""
+    host = (urlparse(base_url).hostname or "").lower()
+    if not host or host == "localhost" or host.endswith((".local", ".ts.net")):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_private or \
+               ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False   # a public DNS name → remote
+
+
+def _to_openai_tools(specs: list[dict]) -> list[dict]:
+    return [{"type": "function",
+             "function": {"name": s["name"], "description": s["description"],
+                          "parameters": s["parameters"]}} for s in specs]
+
+
+class OpenAICompatProvider(Provider):
+    def __init__(self, name: str, config: dict, timeout: float = 300):
+        super().__init__(name, config, timeout)
+        # one connection pool per active endpoint so fail-over doesn't keep
+        # Taxing TLS/TCP setup and a dead pooled connection is never reused.
+        self._http: dict[str, httpx.Client] = {}
+        self._working_url: str | None = None
+        self._working_url_at: float = 0.0
+
+    @property
+    def _client(self) -> httpx.Client:
+        """One persistent connection pool per provider — a multi-tool turn
+        makes many requests, and per-request TLS/TCP setup adds up (more so
+        against OpenRouter/remote than localhost)."""
+        cached = self._http.get(self.base_url)
+        if cached is not None:
+            return cached
+        # connect (TCP + TLS handshake) is bounded separately from the
+        # long read timeout. A self-hosted/LAN server that's off must fail
+        # in seconds (OS default ~2min looked like a hang off-grid); but a
+        # PUBLIC API's TLS handshake can be slow over a poor link, and a 5s
+        # budget there causes false "unreachable"/handshake-timeout, so
+        # remote gets more room.
+        connect = 5 if _is_lan_host(self.base_url) else 20
+        # Happy Eyeballs (RFC 8305): race IPv4/IPv6 and use whichever
+        # connects first, so a dead public-IPv6 route (Tailscale up →
+        # blackhole) doesn't stall every handshake for the full timeout
+        # (17s vs 0.15s). `retries=2` also retries a transient connect/TLS
+        # failure on the winning family — httpcore retries only
+        # ConnectError/ConnectTimeout, before the request is sent, so no
+        # duplicate request and no duplicated streamed text.
+        client = httpx.Client(
+            transport=HappyEyeballsTransport(
+                retries=2, verify=not _is_bare_ip(self.base_url)),
+            timeout=httpx.Timeout(self.timeout, connect=connect))
+        self._http[self.base_url] = client
+        return client
+
+    def _probe(self, url: str) -> bool:
+        """Quick connectivity test for a local endpoint. Public URLs are
+        assumed reachable and not probed; local endpoints are checked with a
+        short /props request so we can fail over fast instead of waiting for
+        the main request to time out."""
+        if not _is_lan_host(url):
+            return True
+        base = url.removesuffix("/v1")
+        try:
+            h = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            httpx.get(f"{base}/props", headers=h, timeout=2,
+                     verify=not _is_bare_ip(url)).raise_for_status()
+            return True
+        except Exception:
+            return False
+
+    def pick_endpoint(self, cache_ok: bool = True) -> str:
+        """Return the first configured endpoint that answers our probe.
+        If none answer, fall back to the first URL so error messages point
+        at a real address. Caches the choice briefly so footer /status calls
+        don't probe on every render."""
+        import time
+        urls = self._base_urls
+        if not urls:
+            return self.base_url
+        if (cache_ok and self._working_url
+                and time.time() - self._working_url_at < 10):
+            self.base_url = self._working_url
+            return self._working_url
+        for url in urls:
+            if self._probe(url):
+                self._working_url = url
+                self._working_url_at = time.time()
+                self.base_url = url
+                return url
+        # nothing reachable — pin first URL and let the next request fail
+        self._working_url = urls[0]
+        self._working_url_at = 0.0
+        self.base_url = urls[0]
+        return urls[0]
+
+    def live_context_limit(self) -> int | None:
+        """llama.cpp exposes the real loaded -c via /props (R13)."""
+        # /props is a llama.cpp endpoint; a PUBLIC API (OpenRouter, …) has no
+        # such route, so probing it just wastes a slow request (~6s) on the
+        # first status render — and it's on the UI thread, so it freezes the
+        # whole app at startup. Only a local/tailnet llama.cpp server has it.
+        self.pick_endpoint(cache_ok=True)
+        if not _is_lan_host(self.base_url):
+            return None
+        try:
+            r = self._client.get(f"{self.base_url.removesuffix('/v1')}/props",
+                                 timeout=4,
+                                 headers=self._auth_headers())
+            n = r.json().get("default_generation_settings", {}).get("n_ctx")
+            return int(n) if n else None
+        except Exception:
+            return None
+
+    def live_model_name(self) -> str | None:
+        """llama.cpp exposes the real loaded model's basename via /props."""
+        self.pick_endpoint(cache_ok=True)
+        if not _is_lan_host(self.base_url):
+            return None
+        try:
+            r = self._client.get(f"{self.base_url.removesuffix('/v1')}/props",
+                                 timeout=4,
+                                 headers=self._auth_headers())
+            path = r.json().get("model_path")
+            return path.rsplit("/", 1)[-1] if path else None
+        except Exception:
+            return None
+
+    def context_limit(self, model: str) -> int:
+        return self.live_context_limit() or super().context_limit(model)
+
+    def _auth_headers(self) -> dict:
+        h = {"Content-Type": "application/json"}
+        if self.api_key and self.api_key != "none":
+            h["Authorization"] = f"Bearer {self.api_key}"
+        return h
+
+    def turn(self, model, messages, system, tools, on_text, cancel) -> TurnResult:
+        # pick a working endpoint before every turn so we fail over fast
+        # when the LAN/Tailscale path changes between messages.
+        self.pick_endpoint(cache_ok=False)
+        if isinstance(system, list):  # flatten anthropic-style system blocks
+            system = "\n".join(b.get("text", "") for b in system)
+        msgs = ([{"role": "system", "content": system}] if system else []) + messages
+        payload = {"model": model, "messages": msgs, "stream": True,
+                   "stream_options": {"include_usage": True}}
+        if tools:
+            payload["tools"] = _to_openai_tools(tools)
+        if self.extra_body:
+            payload.update(self.extra_body)
+
+        # A stale pooled keep-alive connection — the server/proxy closed it
+        # while the app sat idle — resets on reuse ("Connection reset by peer",
+        # RemoteProtocolError "Server disconnected"). httpcore's connect-retry
+        # doesn't cover a failure DURING the request, so retry here — but only
+        # while nothing has streamed yet (a mid-stream drop keeps its partial).
+        _RETRIABLE = (httpx.ConnectError, httpx.ReadError, httpx.WriteError,
+                      httpx.RemoteProtocolError, httpx.PoolTimeout)
+        _ATTEMPTS = 3
+        for _attempt in range(_ATTEMPTS):
+            result = TurnResult()
+            pending: dict[int, dict] = {}   # index -> {id, name, args-fragments}
+            try:
+                for kind, a, _b in cancellable_sse(
+                        lambda: self._client.stream(
+                            "POST", f"{self.base_url}/chat/completions",
+                            headers=self._auth_headers(), json=payload),
+                        cancel):
+                    if kind == "status":
+                        if a >= 400:
+                            body = _b or ""
+                            # llama.cpp surfaces template/parse failures as
+                            # 500s with "Failed to parse" — gpt-oss mode
+                            if "parse" in body.lower():
+                                raise MalformedToolCall(body)
+                            raise ProviderError(f"{self.name} HTTP {a}: {body}")
+                        continue
+                    line = a
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    chunk = json.loads(data)
+                    usage = chunk.get("usage")
+                    if usage:
+                        result.input_tokens = usage.get("prompt_tokens", 0)
+                        result.output_tokens = usage.get("completion_tokens", 0)
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    ch = choices[0]
+                    if ch.get("finish_reason"):
+                        result.stop_reason = ch["finish_reason"]
+                    delta = ch.get("delta", {})
+                    # thinking models (Qwen3.x) stream reasoning separately —
+                    # route it to on_think (UI decides how to show it); it never
+                    # enters the stored/copyable text
+                    rc = delta.get("reasoning_content")
+                    if rc and self.on_think:
+                        self.on_think(rc)
+                    if delta.get("content"):
+                        result.text += delta["content"]
+                        on_text(delta["content"])
+                    for tc in delta.get("tool_calls") or []:
+                        i = tc.get("index", 0)
+                        slot = pending.setdefault(i, {"id": "", "name": "", "args": []})
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        fn = tc.get("function", {})
+                        if fn.get("name"):
+                            slot["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            slot["args"].append(fn["arguments"])
+            except httpx.HTTPError as e:
+                # mid-stream drop (read timeout on a slow long generation,
+                # server restart): the user already WATCHED the partial text
+                # stream — keep it in history instead of discarding the turn
+                if result.text:
+                    note = (f"\n[stream interrupted: {e.__class__.__name__} — "
+                            f"partial answer kept]")
+                    try:
+                        on_text(note)
+                    except Exception:
+                        pass
+                    result.text += note
+                    result.stop_reason = "interrupted"
+                    pending.clear()   # half-received tool calls are unusable
+                    return result
+                # nothing streamed yet: a transient connection failure (stale
+                # pooled keep-alive reset after idle) is safe to retry fresh
+                if _attempt + 1 < _ATTEMPTS and isinstance(e, _RETRIABLE):
+                    import time
+                    time.sleep(0.3 * (_attempt + 1))
+                    continue
+                # the cached "working" URL may have gone down mid-turn — force
+                # a re-probe on the next send so failover can try other URLs.
+                if isinstance(e, _RETRIABLE):
+                    self._working_url_at = 0.0
+                raise ProviderError(f"{self.name} request failed: {e}") from e
+            break   # streamed to completion — stop retrying
+
+        if cancel():  # watcher aborted the stream — never act on partials
+            result.stop_reason = "cancelled"
+            pending.clear()
+            return result
+
+        for i in sorted(pending):
+            slot = pending[i]
+            raw = "".join(slot["args"]) or "{}"
+            try:
+                args = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise MalformedToolCall(
+                    f"unparseable tool arguments for {slot['name'] or '?'}: {raw[:200]}") from e
+            if not slot["name"]:
+                raise MalformedToolCall(f"tool call with no name: {raw[:200]}")
+            result.tool_calls.append(
+                ToolCall(slot["id"] or f"call_{i}", slot["name"], args))
+        return result
+
+    def assistant_message(self, result: TurnResult) -> dict:
+        msg: dict = {"role": "assistant", "content": result.text or None}
+        if result.tool_calls:
+            msg["tool_calls"] = [{"id": c.id, "type": "function",
+                                  "function": {"name": c.name,
+                                               "arguments": json.dumps(c.arguments)}}
+                                 for c in result.tool_calls]
+        return msg
+
+    def tool_result_message(self, call: ToolCall, output: str) -> dict:
+        return {"role": "tool", "tool_call_id": call.id, "content": output}

@@ -1,0 +1,65 @@
+# Aurora config — machine-neutral template. Copy to config.yaml and adjust
+# for your own setup. Keys come from the keystore (env var → OS keyring →
+# encrypted file → prompt); never put them here.
+
+providers:
+  anthropic:
+    type: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+  openrouter:
+    type: openai
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+  local:
+    type: openai
+    # `base_url` can be a single endpoint OR a list; Aurora tries them in
+    # order and uses the first one that responds. Useful if your local
+    # llama.cpp server is reachable both over LAN and a VPN/tailnet.
+    base_url: http://localhost:8080/v1
+    api_key_env: LLAMA_API_KEY   # unset/blank if your server needs no key
+
+# first entry = the model Aurora starts on
+models:
+  - provider: local
+    model: local            # whatever your local server currently has loaded
+    tools: true
+  - provider: openrouter
+    model: moonshotai/kimi-k2.7-code
+    tools: true
+  - provider: anthropic
+    model: claude-sonnet-5
+    tools: true
+  - provider: anthropic
+    model: claude-opus-4-8
+    tools: true
+  - provider: anthropic
+    model: claude-haiku-4-5-20251001
+    tools: true
+
+runtime:
+  max_iterations: 10
+  web_search: true
+  timeout: 300
+  # R58: scan prompts + tool output for likely secrets (API keys, tokens,
+  # .env-style credentials) and challenge before sending/logging. /redact
+  # on|off toggles + persists here.
+  redact_secrets: true
+  # Startup logo rendered on the left of the banner (relative to this file)
+  logo: images/base.png
+
+# Optional: LlamaDesk (github.com/<you>/llamadesk or your own instance) is a
+# companion model-library switcher for a local llama.cpp server — lets
+# /model list and load from a library of ggufs, not just whatever's already
+# running. Remove this whole block if you don't use it; Aurora works fine
+# without it (the `local` provider above is all you need for a single
+# always-loaded local model).
+# llamadesk:
+#   url: http://localhost:8097
+#   token_env: LLAMADESK_TOKEN
+#   ctx: 65536              # context size requested on library loads
+
+# `aurora key set <VAR>` offers to run these (shown first, needs a "y") and
+# stores the printed value in the keystore. No secret lives in this file.
+# Example: fetch a key from a remote box over ssh instead of typing it in —
+# key_fetch:
+#   LLAMA_API_KEY: ssh myhost "grep '^LLAMA_API_KEY=' /etc/environment | cut -d= -f2-"
