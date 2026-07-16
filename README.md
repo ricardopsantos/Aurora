@@ -12,7 +12,18 @@ the quick start.
 > use every day. Named after my beautiful two-year-old daughter Aurora,
 > always with her hair bow.
 
-![Aurora running in a terminal](images/aurora.png)
+![Aurora after boot: the bootstrap brief (rules read, context indexes clean), live token counts, and the /model picker](images/aurora.png)
+
+**Start every session oriented.** Save a bootstrap prompt once and Aurora
+offers to run it at every boot — the repo ships a good default
+([`bootstrap.example.md`](bootstrap.example.md)): read the README and rules
+files, bootstrap `.agentic_context/` if present, check the git state, and
+report a short brief before touching anything.
+
+```
+/bootstrap set bootstrap.example.md            # global default
+/bootstrap set bootstrap.example.md project    # just this project (.aurora/bootstrap.md)
+```
 
 ## Why Aurora exists
 

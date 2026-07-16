@@ -1323,6 +1323,19 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   probe (bounded, 120s-cached, and now harmless to in-flight requests per
   R82a); `Session.log`'s open-per-event writes (single-writer by design).
 
+### Shipped bootstrap prompt + boot hero image (2026-07-16, R83)
+- **R83. The repo ships a recommended start prompt,
+  `bootstrap.example.md`** — orient in the project before touching
+  anything: read README + rules files (AGENTS.md/CLAUDE.md/CONTRIBUTING.md),
+  bootstrap `.agentic_context/` when present, check the git state (branch/
+  dirty files/last commits), reply with a short brief and wait; read-only
+  until then. Installed with `/bootstrap set bootstrap.example.md`
+  (optionally `project`). Documented in README ("Start every session
+  oriented"). The hero image (`images/aurora.png`, used by both the README
+  and ricardopsantos.org/aurora) now shows Aurora at boot offering to run
+  this prompt — banner, bootstrap ask menu, collapsed input, two-line
+  status bar, rendered in the TUI's real colors/layout.
+
 ### Defaults
 - Aurora **starts on whichever model is first in `config.yaml`'s
   `models:` list** — no longer necessarily the free local one; the user's

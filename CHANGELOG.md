@@ -18,6 +18,10 @@ numbered requirements record, see `AURORA.md`.
 - `/model remove <url-or-name>` (R81): drop a configured model (any
   provider) from config.yaml; removing the current one falls back to the
   first remaining model with a usable key.
+- `bootstrap.example.md` (R83): a recommended start prompt that orients
+  Aurora in the project at boot — install with
+  `/bootstrap set bootstrap.example.md`. The README/site hero image now
+  shows it.
 - Full-screen TUI status bar now shows live input/output token counts during
   a turn and a final token tag after the response.
 - TUI now persists full tracebacks of uncaught event-loop exceptions to
