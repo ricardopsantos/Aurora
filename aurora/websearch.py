@@ -36,14 +36,25 @@ _TAG = re.compile(r"<[^>]+>")
 _WS = re.compile(r"\n\s*\n\s*\n+")
 
 
+_FETCH_CAP = 2_000_000  # bytes — a page this big is never useful past the cap
+
+
 def web_fetch(url: str, **_) -> str:
     try:
-        r = httpx.get(url, timeout=20, follow_redirects=True,
-                      headers={"User-Agent": "Aurora/0.1"})
-        r.raise_for_status()
+        # stream with a byte cap — a plain .get() would download an
+        # arbitrarily large body into memory before we ever truncate
+        with httpx.stream("GET", url, timeout=20, follow_redirects=True,
+                          headers={"User-Agent": "Aurora/0.1"}) as r:
+            r.raise_for_status()
+            buf = bytearray()
+            for chunk in r.iter_bytes():
+                buf += chunk
+                if len(buf) >= _FETCH_CAP:
+                    break
+        html = bytes(buf[:_FETCH_CAP]).decode(
+            r.encoding or "utf-8", errors="replace")
     except Exception as e:
         return f"[web_fetch error: {e}]"
-    html = r.text
     html = re.sub(r"<(script|style)[\s\S]*?</\1>", "", html, flags=re.I)
     text = _TAG.sub("", html)
     text = _WS.sub("\n\n", text).strip()

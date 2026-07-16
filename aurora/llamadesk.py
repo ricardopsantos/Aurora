@@ -79,6 +79,15 @@ class LlamaDesk:
                            json={"model": name, "ctx": ctx, "ngl": ngl},
                            timeout=self.timeout)
             r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                hint = ("no token configured" if not self.token else
+                         "token rejected — may be stale")
+                raise LlamaDeskError(
+                    f"LlamaDesk switch: 401 unauthorized ({hint}). "
+                    f"Set llamadesk.token_env in config.yaml and run "
+                    f"`aurora key set <ENV_VAR>` with a valid token.") from e
+            raise LlamaDeskError(f"LlamaDesk switch: {e}") from e
         except httpx.HTTPError as e:
             raise LlamaDeskError(f"LlamaDesk switch: {e}") from e
 

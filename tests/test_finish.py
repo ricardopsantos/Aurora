@@ -74,9 +74,9 @@ def engine(tmp_path, monkeypatch):
     cfg = tmp_path / "config.yaml"
     cfg.write_text(textwrap.dedent("""\
         providers:
-          anthropic: {type: anthropic, api_key_env: FAKE_KEY}
+          openrouter: {type: openai, api_key_env: FAKE_KEY}
         models:
-          - {provider: anthropic, model: claude-sonnet-5, tools: true}
+          - {provider: openrouter, model: some-model, tools: true}
         runtime: {max_iterations: 5}
     """))
     return Engine(str(cfg))
@@ -84,12 +84,12 @@ def engine(tmp_path, monkeypatch):
 
 def test_compact_folds_history(engine):
     engine.messages = [
-        {"role": "user", "content": [{"type": "text", "text": "question"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
     ]
     assert engine.compact_history() == 2
     assert len(engine.messages) == 1
-    body = engine.messages[0]["content"][0]["text"]
+    body = engine.messages[0]["content"]
     assert "question" in body and "answer" in body
     assert engine.compact_history() == 1  # idempotent-ish: folds again
 
@@ -102,7 +102,7 @@ def test_resume_rebuilds_history(engine):
     n = engine.resume_from("resumetest01")
     assert n == 2
     assert engine.session.id == "resumetest01"
-    assert engine.messages[0]["content"][0]["text"] == "first question"
+    assert engine.messages[0]["content"] == "first question"
     assert engine.messages[1]["role"] == "assistant"
 
 
@@ -134,22 +134,6 @@ def test_mdrender_lines(monkeypatch):
     r2 = mdrender.LineRenderer()
     monkeypatch.setattr(mdrender, "RESET", "")  # colours off → byte-faithful
     assert r2.render("**raw**") == "**raw**"
-
-
-# ── anthropic parallel tool results: ONE user message per round ────────────
-def test_anthropic_parallel_tool_results_single_message():
-    from aurora.providers.anthropic import AnthropicProvider
-    from aurora.providers.base import ToolCall
-
-    p = AnthropicProvider("anthropic", {})
-    pairs = [(ToolCall("a", "read_file", {}), "out-a"),
-             (ToolCall("b", "grep", {}), "out-b")]
-    msgs = p.tool_results_messages(pairs)
-    assert len(msgs) == 1                      # one user message, not two
-    assert msgs[0]["role"] == "user"
-    ids = [b["tool_use_id"] for b in msgs[0]["content"]]
-    assert ids == ["a", "b"]                   # every call answered
-    assert p.tool_results_messages([]) == []
 
 
 def test_agent_flushes_parallel_calls_via_bulk_api(tmp_path):

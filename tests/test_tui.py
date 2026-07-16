@@ -16,7 +16,8 @@ def _mouse_up():
 
 
 class _Stats:
-    model, used, limit, pct, cost_usd, session_id = "m", 1200, 64000, 2.0, 0, "s1"
+    model, used, limit, pct, cost_usd, session_id, cost_known = \
+        "m", 1200, 64000, 2.0, 0, "s1", False
 
 
 class _FakeEngine:
@@ -408,6 +409,32 @@ def _status_line2(t):
     return text.split("\n")[1].strip()
 
 
+def _status_line1(t):
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    ctrl = next(c for c in t.app.layout.find_all_controls()
+                if isinstance(c, FormattedTextControl)
+                and any("session " in f[1] for f in
+                        (c.text() if callable(c.text) else c.text)))
+    text = "".join(f[1] for f in ctrl.text())
+    return text.split("\n")[0].strip()
+
+
+def test_draft_token_estimate_shown_while_typing(t):
+    t.input.buffer.text = "hello world this is a test prompt"  # 35 chars
+    assert "- ↑8" in _status_line1(t)
+
+
+def test_draft_token_estimate_hidden_when_empty(t):
+    t.input.buffer.text = "   "
+    assert "↑" not in _status_line1(t)
+
+
+def test_draft_token_estimate_hidden_in_bash_mode(t):
+    t._bash_mode = True
+    t.input.buffer.text = "ls -la"
+    assert "↑" not in _status_line1(t)
+
+
 def test_status_hint_row_in_prompt_mode(t):
     assert _status_line2(t) == (
         "/ commands · ! bash · \\n/\\br newline · Ctrl+J newline · "
@@ -683,3 +710,53 @@ def test_closed_rows_reenable_the_render_cache(t):
     t.append("out\n")                            # closes the row
     first = t._fragments()
     assert t._fragments() is first               # cache hit — no rebuild
+
+
+# ── R62: the first Esc shows an "Esc again to …" hint on status line 2 ─────
+def test_esc_armed_shows_cancel_hint(t):
+    t._busy = True
+    t._on_escape(lambda: None)                  # 1st press arms
+    assert "Esc again to cancel this" in _status_line2(t)
+
+
+def test_esc_armed_shows_quit_hint(t):
+    t._on_escape(lambda: None)                  # idle empty prompt: arms exit
+    assert "Esc again to quit" in _status_line2(t)
+
+
+def test_esc_armed_shows_leave_bash_hint(t):
+    t._bash_mode = True
+    t._on_escape(lambda: None)
+    assert "Esc again to leave bash mode" in _status_line2(t)
+
+
+def test_esc_hint_expires_back_to_tooltips(t):
+    t._on_escape(lambda: None)
+    t._esc_armed_at -= 3                        # age the arm past the 2s window
+    t._exit_confirm = False                     # user typed/state moved on
+    assert _status_line2(t).startswith("/ commands")
+
+
+# ── R48: drag-select coords vs. the bottom-anchor top pad ──────────────────
+def test_drag_select_accounts_for_top_pad(t, monkeypatch):
+    # short transcript in a tall window: content is top-padded, so mouse rows
+    # arrive offset by the pad — the copied text must NOT be
+    t.append("alpha\nbeta\ngamma\n")
+    t._fragments()
+    monkeypatch.setattr(t, "_pad", lambda: 5)
+    t.sel_begin((6, 0))                   # visual row 6 == text row 1 ("beta")
+    t.sel_drag((6, 4))
+    assert t._sel == ((1, 0), (1, 4))     # stored unpadded
+    assert t.sel_finish() is True
+    assert t._sel_text(t._sel_frozen) == "beta"
+
+
+def test_drag_select_render_overlay_shifts_back_by_pad(t, monkeypatch):
+    t.append("alpha\nbeta\n")
+    t._fragments()
+    monkeypatch.setattr(t, "_pad", lambda: 3)
+    t.sel_begin((4, 0))
+    t.sel_drag((4, 4))
+    frags = t._render_fragments()
+    sel_text = "".join(s for style, s, *_ in frags if "reverse" in style)
+    assert sel_text == "beta"

@@ -47,6 +47,11 @@ class ContextStats:
     limit: int
     cost_usd: float
     session_id: str
+    cost_known: bool = False   # only render the $ badge when this is True —
+    # an unpriced model (local, or a remote model missing from
+    # remote_context_limits.json) always has cost_usd == 0.0, which is
+    # indistinguishable from "genuinely priced, $0 spent so far" without
+    # this flag
 
     @property
     def pct(self) -> float:
@@ -134,12 +139,7 @@ class Engine:
         return self.models
 
     def switch_model(self, model_entry: dict) -> None:
-        """Switch model; flatten history across a provider-type change so the
-        new provider only ever sees its own message shape (R4)."""
-        old_kind = self.provider_kind()
-        new_kind = self.provider_kind(model_entry)
-        if self.messages and old_kind != new_kind:
-            self.messages = [compact.flattened_as_user_message(self.messages, new_kind)]
+        """Switch model."""
         self.current = model_entry
         self._limit_cache = {}  # a switch can change the live n_ctx
         self.session.log("model_switch", model=model_entry.get("model"))
@@ -175,6 +175,43 @@ class Engine:
         one moment that cache must be invalidated)."""
         self._key_ok.pop(pkey, None)
 
+    def add_model(self, model_id: str,
+                  provider: str = "openrouter") -> tuple[dict, bool]:
+        """/model add (R80): append an OpenRouter model entry to config.yaml
+        and the live model list. Returns (entry, created) — created is False
+        when the exact (provider, model) pair was already configured, in
+        which case nothing is written."""
+        existing = next((m for m in self.models
+                         if m.get("model") == model_id
+                         and m.get("provider") == provider), None)
+        if existing is not None:
+            return existing, False
+        entry = {"provider": provider, "model": model_id, "tools": True}
+        config.persist_model_entry(self.cfg, entry)  # self.models aliases cfg["models"]
+        self.session.log("model_add", model=model_id, provider=provider)
+        return entry, True
+
+    def remove_model(self, model_id: str) -> tuple[int, dict | None]:
+        """/model remove (R81): drop every config entry matching model_id
+        (any provider). If the CURRENT model was removed, fall back to the
+        first remaining model with a usable key (same rule as first boot).
+        Returns (removed_count, new_current) — new_current is None when the
+        selection didn't change, {} when nothing is left to switch to.
+        Cached info in remote_context_limits.json is deliberately kept
+        (harmless; a re-add gets its ctx/pricing instantly)."""
+        removed = config.remove_model_entries(self.cfg, model_id)
+        if not removed:
+            return 0, None
+        self.session.log("model_remove", model=model_id)
+        if self.current.get("model") != model_id:
+            return removed, None
+        new = self._default_model()
+        if new:
+            self.switch_model(new)
+        else:
+            self.current = {}
+        return removed, new
+
     def valid_models(self) -> list[dict]:
         """Configured models whose provider has a key available (no prompt)."""
         return [m for m in self.models if self._has_key(m.get("provider"))]
@@ -185,6 +222,11 @@ class Engine:
         through the front end. Mutates conversation state; logs everything.
         bootstrap=True tags the logged user event so session listings can
         skip the boilerplate prompt when picking a preview line."""
+        if not self.current.get("model"):
+            # possible since /model remove (R81) can empty the config
+            fe.notify("no model selected — /model to pick one, or "
+                      "/model add <url> to add one")
+            return
         provider = self._provider_for(self.current, interactive=True)
         provider.extra_body = self.current.get("extra_body") or {}
         provider.on_think = getattr(fe, "on_think", None)
@@ -204,11 +246,7 @@ class Engine:
                 elif decision == "redact":
                     user_text = secretscan.redact(user_text, matches)
 
-        kind = self.provider_kind()
-        if kind == "anthropic":
-            user_msg = {"role": "user", "content": [{"type": "text", "text": user_text}]}
-        else:
-            user_msg = {"role": "user", "content": user_text}
+        user_msg = {"role": "user", "content": user_text}
         self.messages.append(user_msg)
         self.session.log("user", text=user_text, model=model,
                          **({"bootstrap": True} if bootstrap else {}))
@@ -222,6 +260,7 @@ class Engine:
             ask_continue=fe.ask_continue,
             notify=fe.notify,
             cancelled=fe.cancelled,
+            on_usage=getattr(fe, "on_usage", None),
             # R47: label each pre-mutation snapshot with the causing prompt
             checkpoint=lambda tool: rewind.checkpoint(f"[{tool}] {user_text}"),
             on_request=getattr(fe, "on_request", None),
@@ -236,8 +275,9 @@ class Engine:
 
         # a turn that produced NOTHING (provider error / interrupt before any
         # assistant output) leaves the user message dangling — the next send
-        # would then stack two consecutive user turns, which Anthropic 400s.
-        # The prompt stays in the session log; retyping re-sends it cleanly.
+        # would then stack two consecutive user turns, which most chat APIs
+        # reject. The prompt stays in the session log; retyping re-sends it
+        # cleanly.
         if self.messages and self.messages[-1] is user_msg:
             self.messages.pop()
 
@@ -280,8 +320,9 @@ class Engine:
         else:
             limit = provider.context_limit(model)
             self._limit_cache[key] = (limit, _time.time())
-        cost = self._cost if self.provider_kind() != "openai" else 0.0
-        return ContextStats(model, self._used, limit, cost, self.session.id)
+        known = bool(getattr(provider, "has_pricing", None)) and provider.has_pricing(model)
+        return ContextStats(model, self._used, limit, self._cost,
+                            self.session.id, cost_known=known)
 
     def clear(self) -> None:
         self.messages = []
@@ -303,7 +344,6 @@ class Engine:
         n = len(self.messages)
         if not n:
             return 0
-        kind = self.provider_kind()
         transcript = compact.flatten_history(self.messages)
         summary = ""
         try:
@@ -313,8 +353,7 @@ class Engine:
                    "tasks, constraints the user stated. Drop: pleasantries, "
                    "superseded attempts, full file dumps. Reply with ONLY the "
                    "summary.\n\n" + transcript)
-            msg = ([{"role": "user", "content": [{"type": "text", "text": ask}]}]
-                   if kind == "anthropic" else [{"role": "user", "content": ask}])
+            msg = [{"role": "user", "content": ask}]
             result = provider.turn(self.current.get("model", ""), msg,
                                    "", None, lambda _s: None, lambda: False)
             summary = (result.text or "").strip()
@@ -322,11 +361,9 @@ class Engine:
             pass  # model unreachable → plain flatten below
         if summary:
             body = "[Summary of the earlier conversation:]\n\n" + summary
-            self.messages = [{"role": "user",
-                              "content": [{"type": "text", "text": body}]
-                              if kind == "anthropic" else body}]
+            self.messages = [{"role": "user", "content": body}]
         else:
-            self.messages = [compact.flattened_as_user_message(self.messages, kind)]
+            self.messages = [compact.flattened_as_user_message(self.messages)]
         self.session.log("compact", folded=n, summarized=bool(summary))
         return n
 
@@ -359,9 +396,16 @@ class Engine:
         # sure we test the one we would actually use for a request.
         if callable(getattr(provider, "pick_endpoint", None)):
             provider.pick_endpoint(cache_ok=False)
-        if self.provider_kind() == "anthropic":
+        # /props is llama.cpp-only and reports whatever's actually loaded on
+        # the LOCAL backend — meaningless for a real remote model. A gateway
+        # that unifies local + remote behind one LAN base_url (aurora-
+        # gateway) means the base_url alone can't tell them apart anymore;
+        # only the "local" sentinel (config's `model: local` entry) can, so
+        # any other selected model must skip the /props probe entirely
+        # instead of silently reporting the wrong (locally-loaded) model.
+        if self.current.get("model") != "local":
             return {"ok": bool(provider.api_key),
-                    "detail": "key stored" if provider.api_key else "no API key"}
+                    "detail": "remote API (no health endpoint)"}
         try:
             import httpx
             from .providers.openai_compat import _is_bare_ip
@@ -383,16 +427,7 @@ class Engine:
                                    "schema changed? (llama.cpp upgrade)")}
             return {"ok": True, "detail": f"{model} ready, ctx {n_ctx}"}
         except Exception as e:
-            # remote OpenAI-compatible APIs (OpenRouter…) have no /props —
-            # not an outage, just no llama.cpp health surface
-            if "openrouter" in provider.base_url:
-                return {"ok": bool(provider.api_key),
-                        "detail": "remote API (no health endpoint)"}
             return {"ok": False, "detail": f"unreachable: {e}"}
-
-    def set_max_iterations(self, n: int) -> None:
-        self.max_iterations = n
-        persist_runtime_value(self.cfg, "max_iterations", n)
 
     def set_redact_secrets(self, on: bool) -> None:
         self.redact_secrets = on
@@ -442,19 +477,14 @@ class Engine:
         Rebuilt as flat text (tool blocks aren't replayed), shaped for the
         current provider. Returns the number of turns restored."""
         past = Session(session_id)
-        kind = self.provider_kind()
         restored = 0
         msgs: list[dict] = []
         for r in past.records():
             ev, text = r.get("event"), r.get("text", "")
             if ev not in ("user", "assistant") or not text:
                 continue
-            if kind == "anthropic":
-                msgs.append({"role": ev if ev == "user" else "assistant",
-                             "content": [{"type": "text", "text": text}]})
-            else:
-                msgs.append({"role": ev if ev == "user" else "assistant",
-                             "content": text})
+            msgs.append({"role": ev if ev == "user" else "assistant",
+                         "content": text})
             restored += 1
         if restored:
             self.messages = msgs

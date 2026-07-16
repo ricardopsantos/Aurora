@@ -19,7 +19,7 @@ def _provider_label(provider) -> str:
     Tailscale/LAN entry a user may have keyed with something personal) and
     NEVER a local base_url (a MagicDNS/LAN hostname can bake in a personal
     name too). Config is user data; Aurora never echoes it back verbatim."""
-    base = getattr(provider, "base_url", "") or _default_base_url(provider)
+    base = getattr(provider, "base_url", "")
     if not base:
         return "the API"
     try:
@@ -32,20 +32,11 @@ def _provider_label(provider) -> str:
     return urlparse(base).hostname or "remote backend"   # public SaaS domains are fine to show
 
 
-def _default_base_url(provider) -> str:
-    """A provider with no explicit base_url still has a real, public,
-    well-known default (Anthropic's own API) — safe to name/test against."""
-    from .providers.anthropic import AnthropicProvider
-    if isinstance(provider, AnthropicProvider):
-        return "https://api.anthropic.com"
-    return ""
-
-
 def _connectivity_hint(provider) -> str:
     """A command the user can run to test the same connection themselves —
     concrete for a public remote host (its domain isn't personal), generic
     (no hostname) for a local/LAN one."""
-    base = getattr(provider, "base_url", "") or _default_base_url(provider)
+    base = getattr(provider, "base_url", "")
     if not base:
         return ""
     try:
@@ -78,6 +69,7 @@ class AgentCallbacks:
     # R58: hashes (secrets.hash_value) of confirmed false positives — matches
     # against these are dropped before secret_challenge ever fires again
     secret_allowlist: set | None = None
+    on_usage: Callable[[int, int], None] | None = None
 
 
 def _norm(ans, default_note: str = "") -> tuple:
@@ -125,7 +117,7 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
             # R5: one corrective retry, then degrade to chat. The corrective
             # nudge is a transient message — removed whether the retry
             # succeeds or not, so it never pollutes history (and never leaves
-            # two consecutive user turns, which Anthropic rejects).
+            # two consecutive user turns, which most chat APIs reject).
             if tool_specs is not None and not turn.degraded:
                 cb.notify(f"local model emitted a malformed tool call ({e}); retrying once")
                 messages.append({"role": "user",
@@ -136,13 +128,16 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                 try:
                     result = provider.turn(model, messages, system, tool_specs,
                                            cb.on_text, cb.cancelled)
-                    messages.pop()  # retry succeeded — drop the transient nudge
                 except MalformedToolCall:
                     cb.notify("still malformed — dropping tools for this session (chat only)")
                     turn.degraded = True
                     tool_specs = None
-                    messages.pop()  # drop the transient nudge; retry chat-only
                     continue
+                finally:
+                    # drop the transient nudge on EVERY retry outcome — a
+                    # ProviderError raised here would otherwise leave it in
+                    # history as a stray consecutive user message
+                    messages.pop()
             else:
                 raise
         except ProviderError as e:
@@ -151,6 +146,16 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                 cb.notify(f"provider error: {e}")
                 cb.notify("context is full — /compact to summarize and continue, "
                           "or /clear to start fresh")
+            elif "429" in msg or ("rate" in msg.lower() and "limit" in msg.lower()):
+                # a free-tier model (e.g. an OpenRouter ":free" variant) shares
+                # a rate-limited pool across everyone using it without their
+                # own key on that specific upstream — not a bug, an expected
+                # limit. The raw error is a wall of provider JSON; give the
+                # actionable summary instead.
+                cb.notify("rate-limited by the provider — this model's free "
+                          "tier is shared; try again shortly, add your own "
+                          "provider key to get your own limit, or /model to "
+                          "switch to another backend")
             elif any(s in msg.lower() for s in
                      ("timed out", "connect", "unreachable", "refused")):
                 # NEVER echo the raw exception here: it embeds the provider's
@@ -171,6 +176,8 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
         turn.input_tokens = result.input_tokens or turn.input_tokens
         turn.billed_input += result.input_tokens  # every iteration is billed
         turn.output_tokens += result.output_tokens
+        if cb.on_usage is not None:
+            cb.on_usage(result.input_tokens, result.output_tokens)
 
         if result.stop_reason == "cancelled":
             cb.notify("interrupted")
@@ -181,17 +188,16 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
         if not result.tool_calls:
             return turn  # final answer
 
-        # All of a round's results are flushed as ONE unit: Anthropic requires
-        # every tool_use of an assistant turn answered in a single following
-        # user message (parallel calls as separate messages 400 with
-        # "roles must alternate"). OpenAI keeps one role:tool message each.
+        # A round's results are flushed as ONE unit through a provider's
+        # optional tool_results_messages() hook (bulk API), if it has one —
+        # otherwise one message per result via tool_result_message().
         round_out: list[tuple] = []  # (ToolCall, output)
 
         def _flush() -> None:
             fn = getattr(provider, "tool_results_messages", None)
             if fn is not None:
                 messages.extend(fn(round_out))
-            else:  # simple/mock providers: one message per result
+            else:
                 for c, o in round_out:
                     messages.append(provider.tool_result_message(c, o))
             round_out.clear()

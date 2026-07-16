@@ -29,6 +29,11 @@ class Frontend(Protocol):
     def on_tool_result(self, name: str, output: str) -> None:
         """A tool finished; `output` is what the model will see."""
 
+    def on_usage(self, input_tokens: int, output_tokens: int) -> None:
+        """Provider-reported token counts for the current model request.
+        Called once per request/iteration after the stream finishes.
+        Both arguments may be 0 when the provider did not report usage."""
+
     def notify(self, message: str) -> None:
         """An out-of-band notice (degrade, interrupt, allowlist add, error)."""
 

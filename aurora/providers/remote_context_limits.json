@@ -1,0 +1,62 @@
+[
+  {
+    "model": "moonshotai/kimi-k2.7-code",
+    "provider": "openrouter",
+    "code": "kimi-k2.7-code",
+    "context_size": 256000,
+    "price_in_per_mtok": 0.253,
+    "price_out_per_mtok": 3.69,
+    "pricing_url": "https://openrouter.ai/moonshotai/kimi-k2.7-code#pricing",
+    "description": "MoonshotAI: Kimi K2.7 Code is a coding-focused model in Moonshot AI's Kimi K2 family, built to complete end-to-end programming tasks reliably over long contexts. It uses a native multimodal mixture-of-experts architecture that accepts text and image input, and it always operates in a thinking mode, preserving full reasoning content across multi-turn conversations. With a 256K-token context window, it targets long-horizon coding, agentic task decomposition, and multi-turn dialogue. The model activates 32B parameters out of roughly 1T total."
+  },
+  {
+    "model": "z-ai/glm-5.2",
+    "provider": "openrouter",
+    "code": "glm-5.2",
+    "context_size": 1000000,
+    "price_in_per_mtok": 0.367,
+    "price_out_per_mtok": 3.60,
+    "pricing_url": "https://openrouter.ai/z-ai/glm-5.2#pricing",
+    "description": "GLM 5.2 is a large-scale reasoning model from Z.ai. It supports text input and output with a 1M-token context window, and is suited for long-horizon agent workflows, project-level software engineering, and complex multi-step automation. Reasoning efforts high and xhigh are supported; xhigh maps to max reasoning. It is particularly strong at coding and tool use across long-running tasks, able to maintain engineering context and follow standards consistently through a full development workflow, from requirements to multi-platform deployment, in a single task."
+  },
+  {
+    "model": "qwen/qwen3-coder:free",
+    "provider": "openrouter",
+    "code": "qwen3-coder",
+    "context_size": 1000000,
+    "price_in_per_mtok": 0.0,
+    "price_out_per_mtok": 0.0,
+    "pricing_url": "https://openrouter.ai/qwen/qwen3-coder:free",
+    "description": "Qwen3-Coder-480B-A35B-Instruct is a Mixture-of-Experts (MoE) code generation model developed by the Qwen team. It is optimized for agentic coding tasks such as function calling, tool use, and long-context reasoning over repositories. The model features 480 billion total parameters, with 35 billion active per forward pass (8 out of 160 experts)."
+  },
+  {
+    "model": "google/gemma-4-31b-it:free",
+    "provider": "openrouter",
+    "code": "gemma-4-31b-it",
+    "context_size": 256000,
+    "price_in_per_mtok": 0.0,
+    "price_out_per_mtok": 0.0,
+    "pricing_url": "https://openrouter.ai/google/gemma-4-31b-it:free",
+    "description": "Gemma 4 31B Instruct is Google DeepMind's 30.7B dense multimodal model supporting text and image input with text output. Features a 256K token context window, configurable thinking/reasoning mode, native function calling, and multilingual support across 140+ languages. Strong on coding, reasoning, and document understanding tasks. Apache 2.0 license."
+  },
+  {
+    "model": "anthropic/claude-fable-5",
+    "provider": "openrouter",
+    "code": "claude-fable-5",
+    "context_size": 1000000,
+    "price_in_per_mtok": 2.56,
+    "price_out_per_mtok": 49.95,
+    "pricing_url": "https://openrouter.ai/anthropic/claude-fable-5",
+    "description": "Claude Fable 5 is a Mythos-class model from Anthropic, built for autonomous knowledge work and coding. It supports text, image, and file inputs with text output, with reasoning support and a 1M-token context window. It is suited for long-running, complex, and asynchronous tasks that previously required frequent human check-ins. It is particularly strong at end-to-end work that would otherwise take a person hours, days, or weeks - taking on problems that are long-running, ambiguous, or highly multi-step. It executes well-scoped tasks with few mistakes, automatically self-correcting through verification loops, and ships with robust safeguards."
+  },
+  {
+    "model": "anthropic/claude-sonnet-4.6",
+    "provider": "openrouter",
+    "code": "claude-sonnet-4.6",
+    "context_size": 1000000,
+    "price_in_per_mtok": 1.56,
+    "price_out_per_mtok": 15.00,
+    "pricing_url": "https://openrouter.ai/anthropic/claude-sonnet-4.6",
+    "description": "Sonnet 4.6 is Anthropic's most capable Sonnet-class model yet, with frontier performance across coding, agents, and professional work. It excels at iterative development, complex codebase navigation, end-to-end project management with memory, polished document creation, and confident computer use for web QA and workflow automation."
+  }
+]

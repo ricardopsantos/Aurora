@@ -14,8 +14,14 @@
 ## 1. Requirements (agreed, final)
 
 ### Providers & models
-- **R1.** Anthropic provider — default model `claude-sonnet-5`; opus/haiku in
-  the picker. API key never stored in plaintext (see R22).
+- **R1.** *(Built pre-2026-07-10: Anthropic provider — default model
+  `claude-sonnet-5`; opus/haiku in the picker. See git history for the full
+  original spec.)* **Removed 2026-07-15** at the user's request: OpenRouter-
+  compatible models only, for now. `providers/anthropic.py` deleted,
+  `providers/__init__.py`'s factory now always returns
+  `OpenAICompatProvider`, `config.yaml`'s `anthropic` provider block and
+  `claude-*` model entries removed — historical numbering preserved, not
+  reused for something else. See R74.
 - **R1b.** OpenRouter provider — via the same `openai_compat` code
   (`https://openrouter.ai/api/v1`, `${OPENROUTER_API_KEY}` through the
   keystore). Models listed in config appear in the picker with a `$` tag;
@@ -50,7 +56,9 @@
   Reads and web tools are free.
 - **R8.** Diff preview before every write/edit approval.
 - **R9.** Loop cap: **max 5 tool iterations** per turn, then Aurora pauses and
-  asks approval to continue. `/max N` changes it live and persists to config.
+  asks approval to continue. *(The original `/max N` live-change command was
+  removed alongside R61's teardown — `runtime.max_iterations` in config.yaml
+  is now the only way to change it; see ARCHITECTURE.md §8.)*
 - **R10.** `!cmd` passthrough runs bash locally with no LLM involved.
 - **R11.** Skills: `/name args` runs python/executable skills from `skills/`
   (ported from the Terminal-Agent V2 prototype); `/skills` lists them.
@@ -95,10 +103,9 @@
 ### Install & security
 - **R21.** One-command install: `./install.sh` — prompts for the data dir
   (default `~/.aurora`, user-selectable → `AURORA_HOME`), creates a venv,
-  installs, symlinks `aurora` into PATH. Mostly pure-python deps (`httpx`,
-  `PyYAML`, `prompt_toolkit`, `keyring`, `cryptography`, `ddgs`) plus Pillow
-  for the startup logo, so macOS and
-  Linux behave identically. Machine sync = `git pull`; nothing
+  installs, symlinks `aurora` into PATH. Pure-python deps (`httpx`,
+  `PyYAML`, `prompt_toolkit`, `keyring`, `cryptography`, `ddgs`), so macOS
+  and Linux behave identically. Machine sync = `git pull`; nothing
   machine-specific is committed (keys via env/keyring, endpoints in config
   with env overrides).
 - **R22.** API-key storage, first hit wins: ① env var (the standard
@@ -135,8 +142,8 @@ checks. Swap the UI (HTML, websocket) by implementing `Frontend`.
 aurora/
   __main__.py      # entry: aurora | --continue | --man | key set | config path
   config.py        # yaml + ${ENV} expansion + /max write-back
-  providers/       # base, anthropic, openai_compat (streaming, tool use,
-                   #   caching, thinking channel, extra_body, bulk tool results)
+  providers/       # base, openai_compat (streaming, tool use, thinking
+                   #   channel, extra_body), happy_eyeballs (R: RFC 8305)
   engine.py        # ENGINE FACADE: all conversation state; the API a UI drives
   frontend.py      # the engine ⇄ UI Protocol (streaming, approvals, secrets)
   agent.py         # tool loop: cap w/ continue-blocks, s/c/n-reason approvals,
@@ -160,7 +167,8 @@ aurora/
 install.sh         # venv + editable install + PATH symlink + data-dir marker
 config.yaml        # committed: providers, models(+extra_body), runtime, llamadesk, key_fetch
 tests/             # test_core, test_finish, test_architecture, test_memory,
-                   #   test_rewind, test_secrets, test_tui (165 tests)
+                   #   test_rewind, test_secrets, test_tui,
+                   #   test_expand_newlines (178 tests)
 ```
 
 Phases (each ended runnable) — **all seven DONE**:
@@ -174,10 +182,10 @@ Phases (each ended runnable) — **all seven DONE**:
 
 ## 3. Test plan
 
-Automated — **165 tests passing** (`tests/test_core.py`, `tests/test_finish.py`,
+Automated — **178 tests passing** (`tests/test_core.py`, `tests/test_finish.py`,
 `tests/test_architecture.py`, `tests/test_memory.py`, `tests/test_rewind.py`,
-`tests/test_secrets.py`, `tests/test_tui.py`; pytest, no network — providers
-mocked):
+`tests/test_secrets.py`, `tests/test_tui.py`, `tests/test_expand_newlines.py`;
+pytest, no network — providers mocked):
 - config: env expansion, missing-key errors, `/max` persistence
 - allowlist: pattern matching (command prefixes, path globs), persistence round-trip
 - tools: read/write/edit/grep against a tmpdir; edit_file rejects non-unique anchors
@@ -475,9 +483,10 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   input area.** `ui.select(prompt, options)` is the choice primitive:
   classic REPL prints a numbered list read by number or key letter; the TUI
   monkeypatches it (same trick as `builtins.input`) to render a `❯`-pointer
-  menu — ↑/↓ move, Enter confirms, digits 1–9 jump-select, **Esc == "No"
-  whenever a No is offered** (else the safest fallback: an explicit Stop,
-  otherwise the last option). While the menu owns the area it is
+  menu — ↑/↓ move, Enter confirms, digits 1–9 jump-select. **Esc is a no-op
+  while a menu is open — the pick must be explicit** (revised with R62; the
+  original Esc == "No"/safest-fallback shortcut was dropped so a stray Esc
+  can never silently answer a challenge). While the menu owns the area it is
   a pure chooser: every non-navigation key is swallowed (a `Keys.Any`
   fallback that specific bindings still beat). Approvals (R7/R50) and the
   iteration-cap ask (R50) route through it; the `comment` choice then falls
@@ -750,9 +759,10 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
     day to also open a menu, for consistency across all three cases: an
     explicit choice the user actively picks, not an implicit "you pressed
     Esc twice, that's confirmation enough."
-  - **NOT part of this rule, deliberately**: a menu/approval challenge still
-    resolves on a SINGLE Esc (to the safest option, R54) — it already has its
-    own explicit choice mechanism; clearing typed text on a non-empty input
+  - **NOT part of this rule, deliberately**: while a menu/approval challenge
+    is open, Esc is a no-op — the challenge already has its own explicit
+    choice mechanism and must be answered by an actual pick (revises R54's
+    original Esc-to-safest shortcut); clearing typed text on a non-empty input
     line stays single-press too — trivially reversible, unlike cancelling/
     leaving/quitting.
   - **The 2-second window is real, not just "immediately after"**: a second
@@ -810,7 +820,8 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
     the suite's `AURORA_HOME`/keyring isolation. Always mock BOTH in the
     SAME command for any check of this code.
 
-### `/remember` temporarily hidden from discovery (2026-07-12)
+### Standalone operation (agreed 2026-07-10)
+- **Aurora MUST work with no local server/LlamaDesk reachable** (installed
   anywhere, off LAN and off any VPN/tailnet, e.g. running only OpenRouter
   models). Verified: every backend probe is bounded (health probes capped at
   ~5s, LlamaDesk client 5s) and degrades to a message, never a crash or a
@@ -954,28 +965,365 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   pruning) excludes `SAFE_COMMANDS` single-token entries — a bare `find` is
   intentional here, not a pre-R43 leftover.
 
-### Context-size picker on a LlamaDesk library load (2026-07-13, R68)
-- **R68. Loading a LlamaDesk library model (R3) asks which context size to
-  load it at, instead of silently using `config.yaml`'s fixed
-  `llamadesk.ctx`.** `ui._pick_ctx(default_ctx, native)` — called from
-  `_pick_model`'s library-load branch, after the eviction confirm, before
-  `desk.switch()` — shows a numbered/arrow-key menu (same `select()`
-  primitive as everywhere else) built from a fixed ladder (`_CTX_LADDER =
-  [4096, 8192, 16384, 32768, 65536, 131072, 262144]`), FILTERED to `<=
-  native` — `native` (the gguf's `ctx_native`, from
-  `LlamaDesk.models_detail()`) is the hard ceiling; Aurora never rope-extends
-  a model past what it was trained for. `native` itself is always added as
-  an explicit "(native max)" option even when it isn't a round ladder value
-  (e.g. a model reporting `100000` exactly). A `custom…` entry drops into a
-  free-text prompt validated `0 < ctx <= native`. The default-selected rung
-  is `min(config llamadesk.ctx, native)` — the same value the old fixed-ctx
-  logic computed — so a blank Enter reproduces pre-R68 behavior exactly; the
-  chosen value is used for that one load only, never written back to
-  `config.yaml` (RAM headroom is per-machine, per-model — not something to
-  sync). `native=None` (an older LlamaDesk server with no `ctx_native`
-  field) drops the ceiling entirely: the full ladder shows, and `custom…`
-  accepts any positive integer, matching the old fully-permissive behavior.
+### Context-size picker on a LlamaDesk library load (2026-07-13, R68; actually implemented 2026-07-15)
+- **R68.** *(Spec'd 2026-07-13 and fully tested in `test_core.py` — a
+  7-rung ladder, `native` always offered even off-ladder, a free-text
+  `custom…` entry. That version was never actually wired into `ui.py`; the
+  real code kept silently doing `ctx = min(config, native)` with no prompt
+  at all until this was noticed and fixed 2026-07-15 — see git history for
+  the original spec text.)* **Simplified and actually implemented
+  2026-07-15**, local models only (LlamaDesk library loads — remote/
+  OpenRouter models have no "load at ctx N" step, their limit is fixed by
+  the provider): loading a LlamaDesk library model (R3) now genuinely asks
+  which context size to load it at, instead of silently picking one.
+  `ui._pick_ctx(default_ctx, native)` — called from `_pick_model`'s
+  library-load branch, after the eviction confirm, before `desk.switch()`
+  — offers just **64k / 128k / 256k** (`_CTX_OPTIONS`), not the original
+  7-rung ladder: small enough to glance at, big enough range for daily use.
+  Options above `native` (the gguf's `ctx_native`, from
+  `LlamaDesk.models_detail()`) are dropped entirely, never just disabled —
+  Aurora never rope-extends a model past what it was trained for. If
+  `native` itself is under 64k (a tiny model), it's offered alone instead
+  of an empty menu. No free-text custom entry — three options is exactly
+  the point. Pre-selects the largest offered size `<= default_ctx`
+  (`config.yaml`'s `llamadesk.ctx`); the chosen value is used for that one
+  load only, never written back to config (RAM headroom is per-machine,
+  per-model — not something to sync).
+
+### Clickable links in chat output (2026-07-15, R69)
+- **R69. Bare URLs in model/tool output render cyan+underlined and are
+  clickable.** `colors.URL_RE` finds `https?://` URLs (stopping before
+  trailing sentence punctuation/closing brackets); `colors.linkify()` wraps
+  matches in cyan+underline SGR plus an OSC-8 hyperlink escape, and
+  `mdrender.LineRenderer.render()` runs every line through it — so the
+  classic REPL (`--classic`, pipes) gets terminal-native Cmd/Ctrl-clickable
+  links in any OSC-8-aware terminal (iTerm2, Terminal.app, kitty, WezTerm).
+  The full-screen TUI can't reuse that: prompt_toolkit's `ANSI()` parser only
+  understands CSI (`\x1b[`) sequences, and an OSC-8 escape (`\x1b]8;;...`)
+  fed through it renders as garbage. `colors.IN_TUI` (set/cleared around
+  `Tui.run()`) makes `linkify()` a no-op there instead, and
+  `tui._linkify_fragments()` re-detects URLs at the parsed-fragment level,
+  restyling matches `class:link` (bright cyan + underline, defined in the
+  app's `Style.from_dict`) with a mouse handler (`tui._open_url()`, `open` on
+  macOS / `xdg-open` on Linux, `webbrowser` as last resort) that opens the
+  URL on click — same mechanism the collapsible-thinking header already
+  uses for its click-to-expand.
+
+### Faster Esc-Esc gesture; remote context-limit fix; boot banner cleanup (2026-07-15, R70-R72)
+- **R70. The TUI's `Application.ttimeoutlen` is set to 1ms (`tui.py`'s
+  `_build_app`), down from prompt_toolkit's 0.5s default.** Every Escape
+  press — both taps of the double-Esc cancel/quit gesture (R62), not just
+  the first — waits `ttimeoutlen` before prompt_toolkit fires the plain
+  `escape` binding, since it can't yet tell a lone Escape apart from the
+  start of an Alt-sequence (`escape enter` = Alt+Enter submit, `escape m` =
+  Alt+M multiline toggle, both bound here). At the 0.5s default this made
+  the confirm menu feel sluggish on every tap. A locally-generated
+  Alt-sequence arrives at the terminal driver as one byte burst, so even a
+  near-zero timeout still resolves it correctly in practice.
+- **R71. A remote model's context limit no longer comes from the wrong
+  backend.** `OpenAICompatProvider.live_context_limit()` (`providers/
+  openai_compat.py`) and `Engine._provider_health_uncached()`
+  (`engine.py`) both hit llama.cpp's `/props` endpoint keyed only on
+  `_is_lan_host(base_url)` — correct when a LAN host always meant "the
+  local llama.cpp model", but aurora-gateway (R-unify, `b9f80d3`) now
+  routes BOTH the local model and real remote models (e.g. an OpenRouter
+  model like `moonshotai/kimi-k2.7-code`) through the same LAN base_url.
+  Selecting a remote model was silently reporting the LOCAL model's loaded
+  ctx/name from `/props` instead of the remote model's own. Both call
+  sites now gate the `/props` probe on `model == "local"` (the sentinel
+  config already uses elsewhere, e.g. `ui.py`'s model picker) — any other
+  model skips the probe entirely. A remote model's context limit instead
+  checks, in order: `REMOTE_CONTEXT_LIMITS` (a per-model JSON table,
+  `providers/remote_context_limits.json` — a list of `{model, provider,
+  code, context_size}` entries, dict-per-entry so future params don't need
+  another schema change; loaded once into a `model → entry` dict), then
+  `config.yaml`'s provider-level `context_limit`, then a 128k default.
+- **R72. Boot banner: no `v` prefix on the version, and the `/help ·
+  /model · ? help · --man manual` line is gone** (`ui.py` and `tui.py`'s
+  `_banner()`) — that information already lives on the status bar's
+  footer hints, so the banner line was pure duplication.
+
+### Cost estimate for priced remote models (2026-07-15, R73)
+- **R73. The status bar shows a running `$` cost estimate next to the model
+  name, but ONLY when Aurora actually knows that model's per-token
+  price.** `Provider.has_pricing(model) -> bool` (default `False`,
+  `providers/base.py`) is the gate — `Engine.context_stats()` sets
+  `ContextStats.cost_known` from it, and both footers (`tui.py`'s
+  `status()`, `ui.py`'s `_footer()`) render `(${cost:.2f})` right after the
+  model name only when `cost_known` is True; a bare `$0.00` for an unpriced
+  model (local, or a remote model missing pricing) would wrongly imply
+  Aurora knows it's free, so it renders nothing instead.
+  `AnthropicProvider.has_pricing()` checks its hardcoded `MODELS` table (as
+  before, R13). `OpenAICompatProvider.has_pricing()` / `.cost()` read
+  `price_in_per_mtok` / `price_out_per_mtok` from the SAME per-model JSON
+  table as R71's context limits (`providers/remote_context_limits.json`) —
+  a model entry can carry `context_size` without pricing, or vice versa;
+  each is optional independently. Also carries an informational
+  `pricing_url` field (not read by code, just a source-of-truth pointer for
+  whoever maintains the table). Seeded with `kimi-k2.7-code` ($0.253 in /
+  $3.69 out per 1M) and `z-ai/glm-5.2` ($0.367 in / $3.60 out per 1M, 1M
+  context) — prices are OpenRouter's usage-weighted average across
+  providers, not the headline listed price, since that's closer to what
+  aurora-gateway actually pays. The `/model` picker (`ui.py`'s
+  `_pick_model`) shows the same per-M pricing next to context size for any
+  model with known pricing — read from this same JSON table — so cost
+  awareness isn't limited to the footer badge.
+
+### Anthropic provider removed; local/OpenRouter providers split; startup logo removed; clickable model name (2026-07-15, R74)
+- **R74a. OpenRouter-compatible models only, for now** (user's explicit
+  call — R1 is the historical record). `providers/anthropic.py` deleted;
+  `providers/__init__.py`'s `make_provider()` always returns
+  `OpenAICompatProvider`. Every branch that special-cased
+  `provider_kind() == "anthropic"` collapsed to its OpenAI-compat-only
+  path: `engine.py` (user/assistant message shape, `/compact`'s summary +
+  fallback-flatten paths, `resume_from`, `switch_model` — the cross-
+  provider history-flatten-on-switch in R4 is now dead code since there's
+  only one provider kind, removed), `compact.py` (`_stringify`/
+  `flattened_as_user_message` — no more Anthropic content-block branch),
+  `memory.py` (`_draft`'s summarization call), `agent.py`
+  (`_provider_label`'s `_default_base_url` special case, removed —
+  `_provider_label` now just needs `provider.base_url`),
+  `providers/openai_compat.py` (`turn()`'s `isinstance(system, list)`
+  flatten, dead now that `system` is always a plain string). The generic
+  `tool_results_messages()` bulk-flush hook in `agent.py`'s `_flush()`
+  stays — it was never Anthropic-specific, just the only thing that used
+  it, and it's exercised by a provider-agnostic test.
+- **R74b. `config.yaml`'s single `openrouter` provider (routing BOTH local
+  and remote models through the m7 gateway) is split into two providers**:
+  `local` (the m7 gateway, LAN/Tailscale — this user's own infrastructure,
+  not something a fresh clone has access to) and `openrouter` (the real
+  `https://openrouter.ai/api/v1`, direct, with its own `OPENROUTER_API_KEY`
+  — works for anyone with their own OpenRouter key, no dependency on this
+  user's server). Model entries updated to match:
+  `model: local → provider: local`; `kimi-k2.7-code`/`glm-5.2` →
+  `provider: openrouter`. `config.yaml.example` already had this shape
+  (kept as the reference template); `config.yaml` now matches it.
+- **R74c. No more startup logo.** `logo.py` deleted; `_banner()` (`tui.py`,
+  `ui.py`) no longer renders one, just the plain info-line card.
+  `config.yaml`'s `runtime.logo` key and the `Pillow` dependency
+  (`pyproject.toml`) removed — Pillow had no other use.
+- **R74d. The model name on the status bar (line 1) is clickable** — same
+  effect as typing `/model` + Enter (`tui.py`'s `_open_model_picker`,
+  styled `class:status.id` like the session-id/copy buttons). A second
+  click while that SAME menu (`_menu_prompt == "Select model"`, so this
+  never touches an unrelated open menu) is still open closes it without
+  changing the model — `select_menu()` now returns `None` for an explicit
+  dismiss (distinct from an actual pick), and `ui._pick_model` treats
+  `None` as "no change," same spirit as blank-Enter in the classic REPL.
+
+### Version is pinned on GitHub deploy, not computed there (2026-07-15, R75)
+- **R75. `aurora.__version__` is `1.0.<commit-count>`, computed live from
+  `git rev-list --count HEAD` — but that's only meaningful in GitTea, the
+  dev repo the numbering was designed around.** GitHub/Aurora (the public
+  mirror, see "Deployment note") is a SEPARATE git repo with its own
+  unrelated commit history — computing its own commit count there (or in
+  any downstream clone/production install) would silently report a
+  plausible-looking but WRONG version. `aurora/__init__.py` now has a
+  `_PINNED_VERSION` constant (empty in GitTea — empty means "compute
+  live"); `scripts/github-deploy.sh` overwrites that exact line on every
+  deploy to GitTea's real version at that moment (`sed` after the rsync),
+  so GitHub/Aurora and everything downstream of it reports a frozen,
+  correct version instead of a meaningless local commit count. Every
+  GitHub deploy MUST re-run this step — an old pin left in place after
+  GitTea moves on would report a stale version forever.
+
+### Rate-limit errors get an actionable hint, not a raw JSON dump (2026-07-15, R76)
+- **R76. A `429`/rate-limit `ProviderError` (common on a free-tier
+  OpenRouter model like a `:free` variant, shared across everyone using it
+  without their own key on that upstream) no longer surfaces the provider's
+  raw JSON error blob.** `agent.py`'s `run_turn` ProviderError handler
+  (same pattern as the existing context-full and connectivity cases — see
+  §8's comment "every one of these is a place a future change should ADD a
+  case, not replace the pattern") gets a new branch: `"429" in msg` or
+  `"rate"+"limit"` in the message triggers a clean notice ("rate-limited by
+  the provider — this model's free tier is shared; try again shortly, add
+  your own provider key, or /model to switch") instead of falling through
+  to the generic `provider error: {e}` dump.
+
+### Live draft token estimate on the status bar (2026-07-15, R77)
+- **R77. While typing, the status bar shows an approximate token cost for
+  the UNSENT draft, next to context usage** — `ui.estimate_tokens(text)`
+  (~4 chars/token, the common English-text rule of thumb; no tokenizer
+  dependency, no network call, purely a local heuristic — never the real
+  count, which only exists after the provider's actual response) renders
+  as `(+~N draft)` between `ctx used/limit` and the `%`. Wired into both
+  status bars: `tui.py`'s `status()` reads `self.input.buffer.text`
+  directly (skipped in bash mode, while a secret is being entered, or
+  during a blocking `ask()` — none of those are a model-bound prompt
+  draft); `ui.py`'s classic-REPL `_footer()` reads the live buffer via
+  `prompt_toolkit.application.get_app().current_buffer.text` (the
+  `bottom_toolbar` callable has no argument carrying it). Both already
+  redraw on every keystroke via prompt_toolkit's normal buffer-change
+  invalidation, so the estimate updates live with no extra wiring.
+
+### Review batch: Esc-armed hint restored, retry-nudge leak, doc reconciliation (2026-07-16, R78)
+- **R78a. The R62 "armed" status-bar hint actually renders now.** The first
+  Esc of the double-tap gesture was documented (R62, ARCHITECTURE §9) as
+  showing a status-bar hint, but the code showed nothing (a vestigial
+  ternary in `tui.status()` had two identical branches). Line 2 now shows
+  `Esc again to cancel this / leave bash mode / quit` while the 2s window is
+  armed, for all three states, taking precedence over the other line-2
+  content; it falls back to normal when the window expires. Tested
+  (`test_esc_armed_shows_*`, `test_esc_hint_expires_back_to_tooltips`).
+- **R78b. A failed malformed-tool-call retry no longer leaks the corrective
+  nudge into history.** `agent.run_turn`'s R5 retry appends a transient
+  "your previous tool call was malformed" user message; it was popped on
+  the retry's success or a second `MalformedToolCall`, but a `ProviderError`
+  raised during the retry propagated with the nudge still in `messages` —
+  a stray consecutive user message that poisons the next send (most chat
+  APIs reject it). The pop now happens in a `finally`, covering every
+  outcome. Tested (`test_malformed_retry_error_leaves_no_nudge_in_history`).
+- **R78c. `/redact` restored to autocomplete** — it was listed in `/help`
+  but missing from `COMMAND_INFO`, so `/`-completion never offered it.
+- **R78d. `read_file` no longer slurps whole files** — it read the entire
+  file into memory before truncating to `MAX_READ_BYTES`; it now reads only
+  the first `MAX_READ_BYTES + 1` bytes (a multi-GB file cost GBs of RAM for
+  a 200KB result).
+- **R78e. Dead code removed**: `Engine.set_max_iterations` (orphaned since
+  `/max` was torn out with R61); the duplicate `aurora_home` import in
+  `tui._build_app`.
+- **R78f. Doc reconciliation**: R9's `/max` marked removed; R54/R62 updated
+  to the tested behavior that **Esc is a no-op while a menu is open**
+  (explicit pick required — the old Esc-to-safest shortcut no longer
+  exists); the build-plan tree no longer lists the deleted
+  `providers/anthropic.py`; test counts refreshed (165 → 178) and
+  `test_expand_newlines.py` listed; a corrupted section heading restored
+  ("Standalone operation" had been overwritten by a duplicated `/remember`
+  heading, losing its first line); `config.persist_runtime_value`'s
+  docstring now states that YAML comments are lost file-wide on write-back.
+
+### Deep-dive batch 2: drag-select pad offset, diff-preview crash, stream/IO hardening (2026-07-16, R79)
+- **R79a. Drag-select copied the WRONG lines on a short transcript.** Mouse
+  positions arrive in content coordinates, and the rendered content is
+  top-padded when the transcript is shorter than the pane (bottom-anchoring,
+  R38/R49) — but `_sel_text()` indexed the UNPADDED transcript, so every
+  drag-copy before the pane filled up grabbed lines offset by the pad (and
+  the highlight matched the mouse, hiding the mismatch until paste).
+  Selections are now normalized to unpadded text coords at capture
+  (`Tui._unpad` in `sel_begin`/`sel_drag`) and shifted back by the pad only
+  for the render overlay. Tested (`test_drag_select_accounts_for_top_pad`,
+  `test_drag_select_render_overlay_shifts_back_by_pad`).
+- **R79b. `approve.diff_preview` can no longer kill a turn.** It runs inside
+  the agent loop AFTER the assistant message (with its tool_use) is already
+  in history; a `write_file`/`edit_file` aimed at a non-UTF8 (binary) or
+  unreadable file made `read_text()` raise, killing the turn and leaving the
+  dangling tool_use to poison every later request. It now catches everything
+  and returns `[diff unavailable: …]` — the approval challenge still shows,
+  just without a diff. Tested
+  (`test_diff_preview_never_raises_on_binary_target`).
+- **R79c. One garbled SSE line no longer kills the whole stream** —
+  `openai_compat.turn()` skips a `data:` line that fails to parse as JSON
+  instead of raising a raw `JSONDecodeError` mid-turn. Tested
+  (`test_sse_stream_skips_garbled_line`).
+- **R79d. `web_fetch` downloads are capped, not unbounded** — it fetched the
+  entire body into memory before truncating to 20k chars of text; it now
+  streams and stops at 2MB (`_FETCH_CAP`).
+- **R79e. `/resume`'s session listing streams each log** — `list_sessions()`
+  read every session's whole JSONL just to find the first user line; it now
+  reads line-by-line and stops at the first hit (and skips a corrupt line
+  instead of crashing the listing).
+
+### `/model add` — add an OpenRouter model by URL (2026-07-16, R80)
+- **R80. `/model add <url-or-id>` appends an OpenRouter model to
+  `config.yaml` and switches to it.** Accepts the model's OpenRouter page
+  URL (`https://openrouter.ai/<org>/<model>`, `models/` prefix tolerated)
+  or the bare `<org>/<model>` id (`ui._parse_openrouter_model`); anything
+  else prints usage. OpenRouter-only for now — the entry is written under
+  the config's `openrouter` provider (`{provider, model, tools: true}`),
+  and the command errors cleanly if no such provider is configured.
+  - **Key flow**: if `OPENROUTER_API_KEY` isn't available, the same
+    fetch-command-then-hidden-prompt flow as the picker
+    (`ui._prompt_and_store_key`) runs first; skipping it still ADDS the
+    model (config is harmless without a key) but doesn't switch to it,
+    printing the manual `aurora key set` fallback instead.
+  - **Persistence**: `config.persist_model_entry` — the same raw-text
+    round-trip as `persist_runtime_value` (${VARS} survive, YAML comments
+    don't), appending to the LIVE `cfg["models"]` list too (which
+    `Engine.models` aliases), so the picker sees the new entry without a
+    restart. `Engine.add_model` dedupes on the exact (provider, model)
+    pair — re-adding is a no-op that just re-selects.
+  - **Catalog fetch**: `openai_compat.fetch_openrouter_model_info` looks
+    the model up in OpenRouter's public `/api/v1/models` (no key needed) —
+    context size, prompt/completion pricing (converted to $/Mtok), and the
+    catalog description — and `save_remote_model_info` writes it into
+    `remote_context_limits.json` (house format: model/provider/code/
+    pricing_url/description) AND the in-memory table, so the footer's ctx
+    gauge (R71), the `$` cost badge (R73), and the picker's info line work
+    for the just-added model immediately. **Caveat, deliberate**: the API
+    returns the listed route price, not the usage-weighted average the
+    hand-maintained entries use (R73) — close enough for a fresh add,
+    printed as "(listed price)"; refine the JSON by hand if it matters.
+  - **The catalog lookup doubles as validation (2026-07-16 revision)**: it
+    runs FIRST, and a model the reachable catalog doesn't list is REFUSED
+    ("not found on OpenRouter") with nothing written — a typo'd id must
+    fail at the add, not on the first send. Only when the catalog itself is
+    unreachable (offline) does the add proceed, marked "unverified", with
+    ctx/pricing unknown. `fetch_openrouter_model_info` returns
+    `(info, catalog_ok)` so the caller can tell the two apart. Tested
+    (`test_model_add_refuses_nonexistent_model`,
+    `test_model_add_offline_adds_unverified`).
+  - Tested end-to-end (`test_parse_openrouter_model`,
+    `test_add_model_persists_and_dedupes`,
+    `test_save_remote_model_info_updates_json_and_memory`,
+    `test_model_add_command_end_to_end`, `test_model_add_rejects_garbage`).
+
+### `/model remove` — drop a configured model (2026-07-16, R81)
+- **R81. `/model remove <url-or-name>` (alias `rm`) removes a model from
+  `config.yaml`.** Accepts the OpenRouter page URL (same parsing as R80) or
+  the exact configured model name — ANY provider's entry, `local` included
+  (it's just config; re-add by editing config.yaml or `/model add`).
+  `config.remove_model_entries` drops every matching entry from the file
+  and mutates the live `cfg["models"]` list in place (which `Engine.models`
+  aliases), so the picker updates without a restart. Unknown name → a
+  clean "not in config.yaml" notice, nothing written.
+  - **Removing the CURRENT model falls back** to the first remaining model
+    with a usable key (`Engine._default_model`, the same first-boot rule)
+    and switches to it; removing the last configured model leaves
+    `engine.current == {}` with a "no models left — /model add" warning.
+  - **Cached catalog info is deliberately kept** — the model's
+    `remote_context_limits.json` entry (ctx/pricing/description) survives
+    removal, so a later re-add gets its footer gauge/badge instantly.
+  - Tested (`test_remove_model_persists`,
+    `test_remove_current_model_falls_back`,
+    `test_remove_last_model_leaves_no_current`,
+    `test_remove_model_command_accepts_url_and_unknown`).
+
+### Race-condition sweep (2026-07-16, R82)
+- **R82a. A mid-turn endpoint flip can no longer redirect the request.**
+  `OpenAICompatProvider.base_url` is mutated by TWO threads: the worker's
+  `turn()` (via its own `pick_endpoint(cache_ok=False)`) and the UI
+  thread's status renders (`context_stats` → `live_context_limit` →
+  `pick_endpoint(cache_ok=True)`, every ~120s when the limit cache
+  expires). If a UI-side probe flipped `base_url` between the worker's
+  pick and its request/retries, the request (or a retry attempt) went to a
+  different endpoint than the one just probed. `turn()` now PINS the
+  picked endpoint and its client in locals for the whole attempt loop —
+  concurrent flips only affect the NEXT turn.
+- **R82b. The per-endpoint client pool is lock-guarded.**
+  `_client_for(base_url)` (new; the `_client` property delegates to it)
+  guards the `_http` dict with a lock and uses `setdefault` so two threads
+  racing to create the same endpoint's client keep exactly one — before,
+  a UI-thread probe and a worker turn could each build a client and one
+  pool leaked unclosed.
+- **R82c. Happy-Eyeballs winner selection is atomic.** Two racers could
+  both pass the bare `stop.is_set()` check before either called
+  `stop.set()` — both claimed the win and the loser's connected socket
+  leaked (nobody left to close it once the caller returned with the first).
+  A `win_lock` now makes test-and-set atomic; exactly one winner, every
+  loser closes its socket.
+- **R82d. `Engine.send` with no model configured notifies instead of
+  building a blank provider** — possible since `/model remove` (R81) can
+  empty the config; previously it went through a keyless, URL-less provider
+  to a generic "request failed" error. Tested
+  (`test_send_with_no_model_notifies_instead_of_crashing`).
+- **Reviewed and deliberately left as-is**: the worker-thread queue handoff
+  for `ask()`/`select_menu()` (documented design, §6 of ARCHITECTURE.md —
+  including its buffer writes from the worker, which prompt_toolkit
+  tolerates for plain `.text` assignment); the UI thread's periodic /props
+  probe (bounded, 120s-cached, and now harmless to in-flight requests per
+  R82a); `Session.log`'s open-per-event writes (single-writer by design).
 
 ### Defaults
-- Aurora **starts on the free local model**; pinned pair
-  `[local, claude-sonnet-5]`.
+- Aurora **starts on whichever model is first in `config.yaml`'s
+  `models:` list** — no longer necessarily the free local one; the user's
+  own ordering decides.

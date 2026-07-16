@@ -7,7 +7,7 @@ def man_page() -> str:
     B, C, D, G, Y, R = BOLD, CYAN, DIM, GREEN, YELLOW, RESET
     return f"""
 {B}NAME{R}
-    aurora — micro terminal coding agent (Anthropic / OpenRouter / local llama.cpp)
+    aurora — micro terminal coding agent (OpenRouter / local llama.cpp)
 
 {B}SYNOPSIS{R}
     {C}aurora{R} [{Y}--continue{R}] [{Y}--resume ID{R}] [{Y}--classic{R}] [{Y}--debug{R}] [{G}config.yaml{R}]
@@ -46,7 +46,7 @@ def man_page() -> str:
     {Y}--man{R}         This manual.
 
 {B}COMMANDS (inside the REPL){R}
-    {C}/model{R}        Arrow-key menu: Anthropic ($) · OpenRouter ($) · local
+    {C}/model{R}        Arrow-key menu: OpenRouter ($) · local
                   loaded (free) · local library (free, ~1-2 min load,
                   confirms global eviction). Current model marked {G}✔{R} and
                   pre-selected. An entry needing a key you don't have shows
@@ -54,7 +54,17 @@ def man_page() -> str:
                   right there instead of failing later. Leaving the prompt
                   blank (empty or whitespace only) skips the switch entirely
                   — you stay on whichever model was active before.
-    {C}/compact{R}      Flatten history into one message and continue.
+    {C}/model add{R} {G}url{R} Add an OpenRouter model by its page URL
+                  (https://openrouter.ai/<org>/<model>) or bare org/model id:
+                  validates it against the OpenRouter catalog, appends it to
+                  config.yaml, fetches ctx/pricing/description, asks for the
+                  key if missing, and switches to it. OpenRouter-only.
+    {C}/model remove{R} {G}name{R} Remove a configured model (URL or exact name;
+                  {C}rm{R} works too). Removing the current one falls back to
+                  the first remaining model with a usable key.
+    {C}/compact{R}      Summarize history with the current model and carry only
+                  the summary (plain flatten is the fallback when the model
+                  is unreachable).
     {C}/clear{R}        Start fresh (history only; system prompt kept).
     {C}/reset{R}        Full reset: clear history + system prompt, then
                   offer to re-run the bootstrap prompt.
@@ -72,10 +82,12 @@ def man_page() -> str:
     {C}/redact allowlist{R} [{G}clear{R}] Show how many false positives are
                   allowlisted, or clear them all (persisted).
     {C}/status{R}       Backend health: local shows the real loaded model +
-                  context size from /props; Anthropic shows key presence.
+                  context size from /props; a remote model shows key presence.
     {C}/think{R}        Print the last turn's reasoning (thinking models).
     {C}/thinking{R}     Toggle live reasoning: dim stream vs "(thinking…)"
                   marker. Default from {Y}runtime.show_thinking{R} in config.
+    {C}/markdown{R}     Toggle pretty rendering (bold/code/bullets) vs raw text.
+    {C}/multiline{R}    Toggle multiline mode (same as {B}Alt+M{R}; persisted).
     {C}/allowlist{R}    Show the persistent approval allowlist.
     {C}/rewind{R} [{G}id{R}]   Restore the working tree to a checkpoint. One is
                   snapshotted (shadow git under AURORA_HOME) before every
@@ -132,6 +144,8 @@ def man_page() -> str:
         {G}bootstrap.md{R}       default bootstrap prompt ({G}.aurora/bootstrap.md{R}
                            in a project overrides it)
         {G}state.yaml{R}         last-used model, restored on the next start
+        {G}checkpoints/{R}       shadow git repos — {C}/rewind{R}'s pre-mutation
+                           snapshots, one per project directory
 
     {C}aurora key status{R} [{G}ENV_VAR{R}]  Show where a key resolves from
                             (env var / OS keyring / encrypted file / not
@@ -146,8 +160,7 @@ def man_page() -> str:
                             {G}yes{R} to confirm.
 
 {B}ENVIRONMENT{R}
-    {Y}ANTHROPIC_API_KEY{R}   Anthropic key {D}(else keyring → encrypted file → prompt){R}
-    {Y}OPENROUTER_API_KEY{R}  OpenRouter key {D}(same resolution){R}
+    {Y}OPENROUTER_API_KEY{R}  OpenRouter key {D}(else keyring → encrypted file → prompt){R}
     {Y}LLAMA_API_KEY{R}       Bearer key for your local llama-server endpoint
                      {D}(leave unset if your server needs no key){R}
     {Y}LLAMADESK_TOKEN{R}     Token for LlamaDesk model-library switches

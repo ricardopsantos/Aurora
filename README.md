@@ -2,7 +2,7 @@
 
 <img src="images/base_logo.png" alt="Aurora logo" width="120" align="right">
 
-Micro terminal coding agent — Anthropic / OpenRouter / a local llama.cpp
+Micro terminal coding agent — OpenRouter / a local llama.cpp
 server, with a tool loop, approval gates, session logs, and native support
 for the `.agentic_context` protocol. The full specification (requirements,
 build plan, test plan) lives in **[AURORA.md](AURORA.md)** — this file is
@@ -39,12 +39,18 @@ request and redoes the change, no deny → re-explain → re-approve round trip.
 
 ![Approval prompt for writing CONTRIBUTING.md, with "Comment — steer the model instead" selected](images/aurora.steer.png)
 
-**One picker, every model.** `/model` switches between Anthropic (paid),
-OpenRouter (paid), and your local llama.cpp server (free) from the same
-arrow-key menu — current model marked, no key stored yet? it asks once and
-remembers.
+**One picker, every model.** `/model` switches between OpenRouter (paid)
+and your local llama.cpp server (free) from the same arrow-key menu —
+current model marked, no key stored yet? it asks once and remembers.
 
-![Model picker: Anthropic, OpenRouter and local models in one menu](images/aurora.models-picker.png)
+![Model picker: OpenRouter and local models in one menu](images/aurora.models-picker.png)
+
+**Adding a model is as simple as pasting its OpenRouter URL.**
+`/model add https://openrouter.ai/kwaipilot/kat-coder-air-v2.5` (or just the
+bare `org/model` id) appends it to `config.yaml`, fetches its context size,
+pricing and description from OpenRouter's catalog, prompts for your
+`OPENROUTER_API_KEY` if it isn't stored yet, and switches to it — no config
+editing. (For now the automatic model config is OpenRouter-only.)
 
 **Secrets never leave your control.** Every prompt and every tool output
 (even read-only ones like `read_file`/`grep`) is scanned for API keys,
@@ -78,20 +84,18 @@ all — always env/keyring, via `aurora key set`.
 
 ## Keys
 
-Three secrets, all stored via `aurora key set` (env var → OS keyring →
+Secrets, all stored via `aurora key set` (env var → OS keyring →
 encrypted file — never plaintext on disk):
 
 | Key | What it unlocks | Where to get it |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Claude models (paid) | [console.anthropic.com](https://console.anthropic.com) → API Keys (API billing is separate from a Claude subscription) |
-| `LLAMA_API_KEY` | your local llama.cpp server, if it requires one — or, if it's behind a gateway that also proxies to OpenRouter (see below), this one key unlocks both | wherever you configured it (leave unset if your server needs no key) |
-| `OPENROUTER_API_KEY` | OpenRouter models (paid), if pointing straight at `https://openrouter.ai/api/v1` instead of a gateway | [openrouter.ai/keys](https://openrouter.ai/keys) |
+| `LLAMA_API_KEY` | your local llama.cpp server, if it requires one | wherever you configured it (leave unset if your server needs no key) |
+| `OPENROUTER_API_KEY` | OpenRouter models (paid) | [openrouter.ai/keys](https://openrouter.ai/keys) |
 | `LLAMADESK_TOKEN` | `/model` library switches, only if you use the optional LlamaDesk integration | your LlamaDesk instance's config |
 
 ```bash
-aurora key set                    # ANTHROPIC_API_KEY (default)
-aurora key set LLAMA_API_KEY
-aurora key set OPENROUTER_API_KEY # only if NOT going through a gateway (see Local model notes)
+aurora key set                    # LLAMA_API_KEY (default)
+aurora key set OPENROUTER_API_KEY
 aurora key status                 # is a key set, and where from? (no ENV_VAR = every key this config uses)
 aurora key clear [ENV_VAR]        # remove a stored key (--all for every one configured)
 aurora wipe                       # delete AURORA_HOME — logs out of every provider, resets sessions/allowlist/state
@@ -102,8 +106,8 @@ If you'd rather not type a key in, `config.yaml`'s `key_fetch:` block lets
 the value lives) and store its output — approve with `y` and it's stored
 without copy-pasting. See the commented example in `config.yaml`.
 
-No Anthropic key? Aurora still works — only the `claude-*` models are
-unusable; pick a local or OpenRouter model with `/model`.
+No OpenRouter key? Aurora still works — only the paid remote models are
+unusable; pick your local model with `/model`.
 
 ## Run
 
@@ -123,7 +127,9 @@ aurora --man          # full man-style manual
 | plain text (Ctrl+J or `\n` / `\br` newline) | talk to the model; writes/commands ask approval via a numbered/arrow-key menu: Yes / Always allow (remember) / No / Stop / Comment — steer the model instead |
 | `/…` + Tab | slash-command autocomplete (built-ins + skills) |
 | `!` (empty prompt) | persistent bash mode: `>` becomes `$`, every Enter runs a shell command locally (no LLM) until you press Esc or Backspace on an empty line |
-| `/model` | arrow-key menu: Anthropic ($) · OpenRouter ($) · local loaded (free) · local library (free, loads, needs LlamaDesk) — current model marked `✔` and pre-selected; the choice is remembered and restored on the next start. Picking an entry with no key stored prompts for one; leaving it blank skips the switch and keeps the previous model |
+| `/model` | arrow-key menu: OpenRouter ($) · local loaded (free) · local library (free, loads, needs LlamaDesk) — current model marked `✔` and pre-selected; the choice is remembered and restored on the next start. Picking an entry with no key stored prompts for one; leaving it blank skips the switch and keeps the previous model |
+| `/model add <url>` | add an OpenRouter model by its page URL (or bare `org/model` id): appends it to `config.yaml`, fetches ctx/pricing/description from the OpenRouter catalog, asks for the key if missing, and switches to it |
+| `/model remove <name>` | remove a configured model (URL or exact name; `rm` works too) — removing the current one falls back to the first remaining model with a key |
 | `/status` | backend health — local shows the real loaded model + context size |
 | `/think` · `/thinking` | show last turn's reasoning · toggle live dim reasoning stream |
 | `/markdown` | toggle pretty rendering (bold/code/bullets) vs raw text |
@@ -149,10 +155,12 @@ aurora --man          # full man-style manual
 
 The screen is three fixed areas: a scrolling chat/transcript, an input line
 (also where challenges/menus render), and a two-line status bar. Line 1 is
-identity only (model / context used·limit·% / session id — click the session
-id to copy it — / current mode: `prompt mode` or `bash mode` / a `copy last`
-button — last turn's raw response, thinking included — and a `copy all`
-button — the whole chat, questions included, no thinking); line 2 shows
+identity only (model — click it to open `/model` — / context used·limit·%,
+with a live `(+~N draft)` estimate of the unsent text you're typing / session
+id — click the session id to copy it — / current mode: `prompt mode` or
+`bash mode` / a `copy last` button — last turn's raw response, thinking
+included — and a `copy all` button — the whole chat, questions included, no
+thinking); line 2 shows
 clickable key hints — `/ commands · ! bash · `\n` / `\br` newline · Ctrl+J
 newline · ? Help · Esc cancel/clear/exit` in prompt mode, with `! bash`
 swapped for `> prompt` in bash mode (same row otherwise) — replaced by
@@ -188,7 +196,7 @@ Two cases are **not** part of this double-tap rule, on purpose:
   mode, or quitting the app.
 
 The full specification — original requirements R1–R24 plus the as-built
-additions (R25+, currently through R68) — lives in [AURORA.md](AURORA.md).
+additions (R25+, currently through R77) — lives in [AURORA.md](AURORA.md).
 How the pieces fit together (engine/UI boundary, provider abstraction,
 threading, persistence) is in [ARCHITECTURE.md](ARCHITECTURE.md).
 **Rule: README, AURORA.md and ARCHITECTURE.md must stay in sync with the

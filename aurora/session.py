@@ -38,12 +38,16 @@ def list_sessions(limit: int = 20) -> list[tuple[str, str, str]]:
     for p in sorted(sessions_dir().glob("*.jsonl"),
                     key=lambda p: p.stat().st_mtime, reverse=True)[:limit]:
         first = ""
-        for line in p.read_text().splitlines():
-            r = json.loads(line)
-            # skip the bootstrap boilerplate turn — preview the real first task
-            if r.get("event") == "user" and not r.get("bootstrap"):
-                first = (r.get("text", "") or "")[:60]
-                break
+        with open(p) as f:  # stream — don't load a whole (possibly huge) log
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # skip the bootstrap boilerplate turn — preview the real first task
+                if r.get("event") == "user" and not r.get("bootstrap"):
+                    first = (r.get("text", "") or "")[:60]
+                    break
         mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
         out.append((p.stem, mtime, first))
     return out

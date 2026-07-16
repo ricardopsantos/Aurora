@@ -1,7 +1,7 @@
 # Aurora — Architecture
 
 Reference doc for how the pieces fit together. `AURORA.md` is the numbered
-requirements/spec (the *what* and *why*, R1–R68+); this is the *how* — module
+requirements/spec (the *what* and *why*, R1–R77+); this is the *how* — module
 map, data flow, boundaries, and the mechanisms worth understanding before
 touching them. Update this file whenever a change alters one of these shapes,
 not just when adding a requirement.
@@ -54,9 +54,11 @@ UI-agnostic and directly unit-testable with a fake provider + fake callbacks
 2. If the response has tool calls: for each one — approval gate if needed
    (`tools.NEEDS_APPROVAL`), R58 secret scan (see §5), run the tool, R58 scan
    the OUTPUT, then append the (call, output) pair to `round_out`.
-3. Flushes `round_out` as history messages (`_flush()` — one bulk message for
-   Anthropic, one per call for OpenAI-style, since the two APIs require
-   different shapes for parallel tool results).
+3. Flushes `round_out` as history messages (`_flush()` — one message per
+   call via `tool_result_message()`; a provider MAY instead implement the
+   optional `tool_results_messages()` hook to bulk-flush a round as one
+   message, if its API needs that shape for parallel tool results — no
+   current provider does).
 4. Loops until the model stops calling tools (final answer) or a control
    signal fires: cancelled, iteration cap hit and user says stop, approval
    says stop, or a secret challenge says stop.
@@ -77,10 +79,9 @@ for the history of what each one is guarding against.
 
 `base.Provider` is the abstract contract: `turn()` returns a `TurnResult`
 (text, tool_calls, stop_reason, token counts); `assistant_message()` /
-`tool_result_message()` convert Aurora's internal shapes to each API's wire
-format. Two concrete implementations:
+`tool_result_message()` convert Aurora's internal shapes to the API's wire
+format. One concrete implementation:
 
-- **`anthropic.py`** — the Anthropic Messages API.
 - **`openai_compat.py`** — one implementation for THREE backends: OpenRouter,
   a local llama.cpp server, and any other OpenAI-compatible server (LM
   Studio, …). This sharing is why generic-sounding fixes (connect timeouts,
@@ -141,9 +142,9 @@ robustness — each one is load-bearing:
   local/LAN `base_url` can bake in a personal hostname too (a Tailscale
   MagicDNS name). Neither is ever printed: the notice classifies
   `_is_lan_host(base_url)` into "local backend" (generic, no hostname) or the
-  hostname itself for a remote provider (public SaaS domains — openrouter.ai,
-  api.anthropic.com — aren't personal, so showing them is fine and more
-  useful). A `curl`-based connectivity hint follows the same rule: concrete
+  hostname itself for a remote provider (public SaaS domains — openrouter.ai
+  — aren't personal, so showing them is fine and more useful). A `curl`-based
+  connectivity hint follows the same rule: concrete
   for remote, host-free for local. Open-source hygiene: config is user data,
   Aurora never echoes it back.
 
@@ -461,8 +462,9 @@ guard against by raising `RuntimeError` when called from that thread (§6).
 
 **The fix: a second, non-blocking menu path, `Tui._open_ui_menu()`**, reusing
 every piece of `select_menu()`'s RENDERING (`_menu_fragments`, the arrow-key/
-digit-jump/Esc-cancel-to-safest bindings — all keyed off the same
-`self._menu_options is not None` check) but resolving differently:
+digit-jump bindings — all keyed off the same `self._menu_options is not None`
+check; Esc is a no-op while any menu is open, the pick must be explicit) but
+resolving differently:
 - `select_menu()` (worker-thread callers: approvals, R58, `/model`) →
   `_resolve_menu()` puts the chosen key on `self._answers` queue.
 - `_open_ui_menu()` (UI-thread callers: Esc confirms) → sets
@@ -488,7 +490,7 @@ not Esc) and a stale arm must never silently fire on an unrelated later Esc.
 
 ## Where to look next
 
-- **Requirements** (R1–R68+, the numbered spec with dates and rationale):
+- **Requirements** (R1–R77+, the numbered spec with dates and rationale):
   `AURORA.md`.
 - **User-facing feature list**: `README.md` → "Daily use" and "Esc, the
   double-tap control key".

@@ -4,6 +4,7 @@ MalformedToolCall so agent.py can retry-then-degrade (R5)."""
 
 import ipaddress
 import json
+from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -12,6 +13,82 @@ import httpx
 from .base import (MalformedToolCall, Provider, ProviderError, ToolCall,
                    TurnResult, cancellable_sse)
 from .happy_eyeballs import HappyEyeballsTransport
+
+_REMOTE_CONTEXT_LIMITS_PATH = Path(__file__).parent / "remote_context_limits.json"
+
+
+def _load_remote_context_limits() -> dict[str, dict]:
+    """Known per-model info for remote (non-"local") models, editable
+    without a code change. The JSON file is a LIST of model entries (so it
+    reads naturally and stays
+    diff-friendly to append to); each entry is a dict (not a bare int) so
+    future params (pricing, aliases, …) can land here without another
+    schema change. Indexed here by "model" for an O(1) lookup. Only
+    consulted for a model that isn't the "local" sentinel (see
+    context_limit()); anything not listed here falls back to config.yaml's
+    provider-level `context_limit` (or 128k)."""
+    try:
+        entries = json.loads(_REMOTE_CONTEXT_LIMITS_PATH.read_text())
+        return {e["model"]: e for e in entries}
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        return {}
+
+
+REMOTE_CONTEXT_LIMITS = _load_remote_context_limits()
+
+
+def fetch_openrouter_model_info(model_id: str) -> tuple[dict | None, bool]:
+    """Look a model up in OpenRouter's public catalog (`/api/v1/models`, no
+    key needed). Returns (info, catalog_ok): info is
+    {context_size, price_in_per_mtok, price_out_per_mtok, description}, or
+    None when the model ISN'T in the catalog; catalog_ok is False when the
+    catalog itself couldn't be fetched (offline/API error) — so the caller
+    can tell "no such model" (refuse) apart from "can't verify" (proceed,
+    warn). Prices are the API's listed route price ($/token, converted to
+    $/Mtok) — NOT the usage-weighted average the hand-maintained table
+    entries use (close enough for a fresh add; edit
+    remote_context_limits.json to refine)."""
+    def _mtok(v):
+        try:
+            return round(float(v) * 1_000_000, 3)
+        except (TypeError, ValueError):
+            return None
+    try:
+        r = httpx.get("https://openrouter.ai/api/v1/models", timeout=10)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+    except Exception:
+        return None, False
+    for m in data:
+        if m.get("id") == model_id:
+            pricing = m.get("pricing") or {}
+            return {"context_size": m.get("context_length"),
+                    "price_in_per_mtok": _mtok(pricing.get("prompt")),
+                    "price_out_per_mtok": _mtok(pricing.get("completion")),
+                    "description": (m.get("description") or "").strip()}, True
+    return None, True
+
+
+def save_remote_model_info(model_id: str, info: dict) -> None:
+    """Add/refresh one model's entry in remote_context_limits.json AND the
+    in-memory table, so the footer's ctx gauge and $ badge (R71/R73) work
+    for a just-added model without a restart. Only known fields are set."""
+    entry = dict(REMOTE_CONTEXT_LIMITS.get(model_id) or
+                 {"model": model_id, "provider": "openrouter",
+                  "code": model_id.rsplit("/", 1)[-1],
+                  "pricing_url": f"https://openrouter.ai/{model_id}#pricing"})
+    if info.get("context_size"):
+        entry["context_size"] = int(info["context_size"])
+    for k in ("price_in_per_mtok", "price_out_per_mtok", "description"):
+        if info.get(k):
+            entry[k] = info[k]
+    REMOTE_CONTEXT_LIMITS[model_id] = entry
+    try:
+        entries = json.loads(_REMOTE_CONTEXT_LIMITS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        entries = []
+    entries = [e for e in entries if e.get("model") != model_id] + [entry]
+    _REMOTE_CONTEXT_LIMITS_PATH.write_text(json.dumps(entries, indent=2) + "\n")
 
 
 def _is_bare_ip(base_url: str) -> bool:
@@ -53,17 +130,24 @@ class OpenAICompatProvider(Provider):
     def __init__(self, name: str, config: dict, timeout: float = 300):
         super().__init__(name, config, timeout)
         # one connection pool per active endpoint so fail-over doesn't keep
-        # Taxing TLS/TCP setup and a dead pooled connection is never reused.
+        # paying TLS/TCP setup and a dead pooled connection is never reused.
         self._http: dict[str, httpx.Client] = {}
+        import threading
+        self._http_lock = threading.Lock()  # pool dict is touched by BOTH the
+        # worker (turn) and the UI thread (status-render /props probes)
         self._working_url: str | None = None
         self._working_url_at: float = 0.0
 
     @property
     def _client(self) -> httpx.Client:
-        """One persistent connection pool per provider — a multi-tool turn
+        return self._client_for(self.base_url)
+
+    def _client_for(self, base_url: str) -> httpx.Client:
+        """One persistent connection pool per endpoint — a multi-tool turn
         makes many requests, and per-request TLS/TCP setup adds up (more so
         against OpenRouter/remote than localhost)."""
-        cached = self._http.get(self.base_url)
+        with self._http_lock:
+            cached = self._http.get(base_url)
         if cached is not None:
             return cached
         # connect (TCP + TLS handshake) is bounded separately from the
@@ -72,7 +156,7 @@ class OpenAICompatProvider(Provider):
         # PUBLIC API's TLS handshake can be slow over a poor link, and a 5s
         # budget there causes false "unreachable"/handshake-timeout, so
         # remote gets more room.
-        connect = 5 if _is_lan_host(self.base_url) else 20
+        connect = 5 if _is_lan_host(base_url) else 20
         # Happy Eyeballs (RFC 8305): race IPv4/IPv6 and use whichever
         # connects first, so a dead public-IPv6 route (Tailscale up →
         # blackhole) doesn't stall every handshake for the full timeout
@@ -82,9 +166,10 @@ class OpenAICompatProvider(Provider):
         # duplicate request and no duplicated streamed text.
         client = httpx.Client(
             transport=HappyEyeballsTransport(
-                retries=2, verify=not _is_bare_ip(self.base_url)),
+                retries=2, verify=not _is_bare_ip(base_url)),
             timeout=httpx.Timeout(self.timeout, connect=connect))
-        self._http[self.base_url] = client
+        with self._http_lock:
+            client = self._http.setdefault(base_url, client)
         return client
 
     def _probe(self, url: str) -> bool:
@@ -128,12 +213,21 @@ class OpenAICompatProvider(Provider):
         self.base_url = urls[0]
         return urls[0]
 
-    def live_context_limit(self) -> int | None:
+    def live_context_limit(self, model: str = "local") -> int | None:
         """llama.cpp exposes the real loaded -c via /props (R13)."""
         # /props is a llama.cpp endpoint; a PUBLIC API (OpenRouter, …) has no
         # such route, so probing it just wastes a slow request (~6s) on the
         # first status render — and it's on the UI thread, so it freezes the
-        # whole app at startup. Only a local/tailnet llama.cpp server has it.
+        # whole app at startup. Only a local/tailnet llama.cpp server has it
+        # — but a gateway that unifies local + remote behind ONE LAN base_url
+        # (aurora-gateway) means `_is_lan_host` alone no longer implies "the
+        # SELECTED model is the local one": a remote model routed through
+        # that same gateway would otherwise get /props's answer for whatever
+        # is actually loaded locally, not its own real context window. The
+        # "local" sentinel (config's `model: local` entry) is what actually
+        # identifies the local model — check that too.
+        if model != "local":
+            return None
         self.pick_endpoint(cache_ok=True)
         if not _is_lan_host(self.base_url):
             return None
@@ -161,7 +255,24 @@ class OpenAICompatProvider(Provider):
             return None
 
     def context_limit(self, model: str) -> int:
-        return self.live_context_limit() or super().context_limit(model)
+        listed = REMOTE_CONTEXT_LIMITS.get(model, {}).get("context_size")
+        return self.live_context_limit(model) or listed or super().context_limit(model)
+
+    def has_pricing(self, model: str) -> bool:
+        """Whether a real cost estimate is possible — only when the model is
+        listed in remote_context_limits.json WITH price fields (local/
+        unlisted models have no known $/token, and showing a "$0.00" badge
+        for them would misleadingly imply Aurora knows it's free)."""
+        entry = REMOTE_CONTEXT_LIMITS.get(model, {})
+        return "price_in_per_mtok" in entry and "price_out_per_mtok" in entry
+
+    def cost(self, model: str, inp: int, out: int) -> float:
+        entry = REMOTE_CONTEXT_LIMITS.get(model, {})
+        price_in = entry.get("price_in_per_mtok")
+        price_out = entry.get("price_out_per_mtok")
+        if price_in is None or price_out is None:
+            return 0.0
+        return (inp * price_in + out * price_out) / 1_000_000
 
     def _auth_headers(self) -> dict:
         h = {"Content-Type": "application/json"}
@@ -171,10 +282,12 @@ class OpenAICompatProvider(Provider):
 
     def turn(self, model, messages, system, tools, on_text, cancel) -> TurnResult:
         # pick a working endpoint before every turn so we fail over fast
-        # when the LAN/Tailscale path changes between messages.
-        self.pick_endpoint(cache_ok=False)
-        if isinstance(system, list):  # flatten anthropic-style system blocks
-            system = "\n".join(b.get("text", "") for b in system)
+        # when the LAN/Tailscale path changes between messages. PIN it in a
+        # local: `self.base_url` is also flipped by the UI thread's status-
+        # render probes (live_context_limit → pick_endpoint), and a mid-turn
+        # flip must not redirect this request or its retries.
+        base = self.pick_endpoint(cache_ok=False)
+        client = self._client_for(base)
         msgs = ([{"role": "system", "content": system}] if system else []) + messages
         payload = {"model": model, "messages": msgs, "stream": True,
                    "stream_options": {"include_usage": True}}
@@ -196,8 +309,8 @@ class OpenAICompatProvider(Provider):
             pending: dict[int, dict] = {}   # index -> {id, name, args-fragments}
             try:
                 for kind, a, _b in cancellable_sse(
-                        lambda: self._client.stream(
-                            "POST", f"{self.base_url}/chat/completions",
+                        lambda: client.stream(
+                            "POST", f"{base}/chat/completions",
                             headers=self._auth_headers(), json=payload),
                         cancel):
                     if kind == "status":
@@ -215,7 +328,10 @@ class OpenAICompatProvider(Provider):
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
-                    chunk = json.loads(data)
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue   # one garbled SSE line must not kill the stream
                     usage = chunk.get("usage")
                     if usage:
                         result.input_tokens = usage.get("prompt_tokens", 0)

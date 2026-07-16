@@ -8,6 +8,7 @@ methods.
 """
 
 import getpass
+import re
 import subprocess
 import sys
 import threading
@@ -30,7 +31,11 @@ HELP = f"""\
 {BOLD}!{RESET} / {BOLD}!cmd{RESET}              bash: `!` on an empty line enters bash mode ($);
                       each Enter runs a shell command locally, no LLM
                       (Esc or empty backspace exits). Classic REPL: `!cmd`
-{CYAN}/model{RESET}                model picker (Anthropic $ · OpenRouter $ · local library)
+{CYAN}/model{RESET}                model picker (OpenRouter $ · local library)
+{CYAN}/model add <url>{RESET}      add an OpenRouter model (page URL or org/model id)
+                      to config.yaml and switch to it
+{CYAN}/model remove <name>{RESET}  remove a configured model (URL or exact name; `rm`
+                      works too) — removing the current one falls back
 {BOLD}Alt+M{RESET}               toggle multiline mode (Enter inserts a newline;
                       Alt+Enter submits)
 {BOLD}\\n{RESET} / {BOLD}\\br{RESET}              type these in prose to insert a newline
@@ -185,6 +190,11 @@ class TerminalFrontend:
             ("stop", "Stop"),
         ])
 
+    def on_usage(self, input_tokens: int, output_tokens: int) -> None:
+        """Classic REPL ignores per-request usage; token accounting lives
+        in the engine/session log."""
+        pass
+
     def cancelled(self) -> bool:
         return self.cancel_event.is_set()
 
@@ -296,6 +306,25 @@ _FOOTER_HINT = (" / commands · ! bash · \\n/\\br newline"
                 " · Ctrl+J newline · ? Help · Ctrl+C interrupt")
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough, LOCAL token estimate (~4 chars/token, the common English-text
+    rule of thumb) — no tokenizer dependency, no network call, good enough
+    for a live "this draft will cost about N tokens" hint while typing. NOT
+    the real count (that only exists after the provider's actual response);
+    never used for anything but display."""
+    return len(text) // 4
+
+
+def fmt_token_count(n: int) -> str:
+    """Compact token count: 950 → '950', 1000 → '1k', 1500 → '1.5k'."""
+    if n >= 1000:
+        s = f"{n / 1000:.1f}"
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s + "k"
+    return str(n)
+
+
 def _footer(engine: Engine):
     """Two-line status bar under the prompt: model + context (always visible
     while typing) on top, key/command hints below."""
@@ -306,11 +335,19 @@ def _footer(engine: Engine):
             return " aurora\n" + _FOOTER_HINT
         used = f"{s.used / 1000:.1f}k" if s.used >= 1000 else str(s.used)
         limit = f"{s.limit / 1000:.0f}k"
-        cost = f" │ ${s.cost_usd:.2f}" if s.cost_usd else ""
+        cost = f" (${s.cost_usd:.2f})" if s.cost_known else ""
         warn = "  ⚠ context >80% — /compact?" if s.pct >= 80 else ""
         ml = " │ multiline" if engine.multiline else ""
-        return (f" {s.model} │ ctx {used}/{limit} ({s.pct:.0f}%)"
-                f"{cost} │ session {s.session_id}{warn}{ml}\n"
+        draft = ""
+        try:
+            from prompt_toolkit.application import get_app
+            text = get_app().current_buffer.text
+            if text.strip():
+                draft = f" (+~{estimate_tokens(text)} draft)"
+        except Exception:
+            pass
+        return (f" {s.model}{cost} │ ctx {used}/{limit}{draft} ({s.pct:.0f}%)"
+                f" │ session {s.session_id}{warn}{ml}\n"
                 + _FOOTER_HINT)
     return render
 
@@ -421,6 +458,30 @@ def _llamadesk_mark_ok(url: str) -> None:
     _llamadesk_last_fail.pop(url, None)
 
 
+# 64k / 128k / 256k — deliberately just these three (not a longer ladder):
+# small enough menu to glance at, big enough range for daily use.
+_CTX_OPTIONS = [65536, 131072, 262144]
+_CTX_LABELS = {65536: "64k", 131072: "128k", 262144: "256k"}
+
+
+def _pick_ctx(default_ctx: int, native: int | None) -> int:
+    """Menu: 64k/128k/256k, capped to the model's native max — options over
+    native are dropped entirely (never rope-extend past what the model was
+    trained for), not just disabled. If native itself is under 64k (a tiny
+    model), it's offered as the sole option instead of an empty menu.
+    Pre-selects the largest offered size that's <= default_ctx."""
+    options_vals = [c for c in _CTX_OPTIONS if native is None or c <= native]
+    if not options_vals:
+        options_vals = [native]
+    default_index = 0
+    for i, v in enumerate(options_vals):
+        if v <= default_ctx:
+            default_index = i
+    options = [(str(v), _CTX_LABELS.get(v, f"{v // 1000}k")) for v in options_vals]
+    chosen = select("Context size for this load?", options, default_index=default_index)
+    return int(chosen)
+
+
 def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
     desk = _llamadesk(engine)
     loaded = None
@@ -433,14 +494,25 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
             desk = None
             print(f"{YELLOW}· LlamaDesk unreachable: {e}{RESET}")
 
-    from .providers.anthropic import MODELS as ANTHROPIC_MODELS
+    from .providers.openai_compat import REMOTE_CONTEXT_LIMITS
 
-    def _info(ctx: int | None, size: int | None = None) -> str:
+    def _price(price_in: float | None, price_out: float | None) -> str:
+        if price_in is None or price_out is None:
+            return ""
+        if price_in == 0 and price_out == 0:
+            return "free"
+        return f"${price_in:g}/${price_out:g} per M"
+
+    def _info(ctx: int | None, size: int | None = None,
+              price_in: float | None = None, price_out: float | None = None) -> str:
         parts = []
         if size:
             parts.append(f"{size / 1e9:.1f}GB")
         if ctx:
             parts.append(f"{ctx // 1000}k ctx")
+        price = _price(price_in, price_out)
+        if price:
+            parts.append(price)
         return dim(" · ".join(parts)) if parts else ""
 
     details: list[dict] = []
@@ -467,10 +539,21 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
     for m in sorted(engine.list_models(),
                     key=lambda m: str(m.get("model", "")).lower()):
         name = m.get("model", "")
-        paid = name != "local" and (engine.provider_kind(m) == "anthropic" or
-            "openrouter" in str(m.get("provider", "")))
+        is_openrouter = name != "local" and "openrouter" in str(m.get("provider", ""))
+        remote = REMOTE_CONTEXT_LIMITS.get(name, {}) if is_openrouter else {}
+        # a known-$0 OpenRouter model (e.g. a ":free" variant) is genuinely
+        # free, not "paid, happens to cost nothing" — tag it [free] like
+        # local, not [$]. Only an UNKNOWN price defaults to assuming paid.
+        known_free = (remote.get("price_in_per_mtok") == 0
+                     and remote.get("price_out_per_mtok") == 0)
+        paid = is_openrouter and not known_free
         tag = f"{YELLOW}[$]{RESET}" if paid else f"{GREEN}[free]{RESET}"
-        info = _info(ANTHROPIC_MODELS.get(name, (None,))[0]) if paid else ""
+        if is_openrouter:
+            info = _info(remote.get("context_size"),
+                        price_in=remote.get("price_in_per_mtok"),
+                        price_out=remote.get("price_out_per_mtok"))
+        else:
+            info = ""
         if name == "local":  # show what "local" actually is
             live = loaded
             if not live:
@@ -497,6 +580,8 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
 
     options = [(str(i), label) for i, (label, _, _) in enumerate(entries, 1)]
     chosen = select("Select model", options, default_index=current_index)
+    if chosen is None:   # TUI: menu dismissed (e.g. a second click on the
+        return            # status bar's model name) — no change
     idx = int(chosen) - 1
     _, kind, payload = entries[idx]
 
@@ -530,12 +615,9 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
         if not confirm(f"Load '{name}' and evict '{loaded}'?", default_yes=False):
             return
         try:
-            # load at min(model's native ctx, configured target) — never rope-
-            # extend past what the model was trained for
-            ctx = int((engine.cfg.get("llamadesk") or {}).get("ctx", 65536))
+            default_ctx = int((engine.cfg.get("llamadesk") or {}).get("ctx", 65536))
             native = natives.get(name)
-            if native:
-                ctx = min(ctx, native)
+            ctx = _pick_ctx(default_ctx, native)
             print(dim(f"  loading with ctx {ctx}"))
             desk.switch(name, ctx=ctx)
             print("loading", end="", flush=True)
@@ -549,16 +631,108 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
             return
     # point the local provider entry at it
     local = next((m for m in engine.list_models()
-                  if engine.provider_kind(m) != "anthropic"
-                  and "openrouter" not in str(m.get("provider", ""))), None)
+                  if "openrouter" not in str(m.get("provider", ""))), None)
     if local:
         local = dict(local, model=name)
         engine.switch_model(local)
         print(f"{GREEN}→ local:{name}{RESET}")
 
 
+# ── /model add (R80) ───────────────────────────────────────────────────────
+_OPENROUTER_URL_RE = re.compile(r"^https?://openrouter\.ai/(?:models/)?", re.I)
+
+
+def _parse_openrouter_model(arg: str) -> str | None:
+    """An OpenRouter model page URL (https://openrouter.ai/<org>/<model>) or
+    a bare '<org>/<model>' id → the model id, or None when it's neither."""
+    model_id = _OPENROUTER_URL_RE.sub("", arg.strip()).strip("/")
+    if not model_id or "/" not in model_id or any(c.isspace() for c in model_id):
+        return None
+    return model_id
+
+
+def _add_model_cmd(engine: Engine, arg: str) -> None:
+    """`/model add <url-or-id>` (R80): append the model to config.yaml under
+    the `openrouter` provider and switch to it. If OPENROUTER_API_KEY isn't
+    stored yet, offer to enter it first (same flow as picking a keyless
+    entry in the picker)."""
+    model_id = _parse_openrouter_model(arg)
+    if model_id is None:
+        print("· usage: /model add https://openrouter.ai/<org>/<model>  "
+              "(or the bare <org>/<model> id)")
+        return
+    pcfg = engine.cfg["providers"].get("openrouter")
+    if not pcfg:
+        print("· no `openrouter` provider in config.yaml — add one first "
+              "(see config.yaml.example)")
+        return
+    # validate against OpenRouter's catalog FIRST — a typo'd model id must
+    # fail here, not on the first send. The same lookup supplies the
+    # ctx/pricing/description for the footer gauge + $ badge (R71/R73).
+    from .providers.openai_compat import (fetch_openrouter_model_info,
+                                          save_remote_model_info)
+    info, catalog_ok = fetch_openrouter_model_info(model_id)
+    if catalog_ok and info is None:
+        print(f"{RED}✗ {model_id} not found on OpenRouter — check the "
+              f"URL/id (https://openrouter.ai/models){RESET}")
+        return
+    env = pcfg.get("api_key_env")
+    if env and not engine.has_key("openrouter"):
+        _prompt_and_store_key(engine, env)
+        engine.forget_key_check("openrouter")
+    entry, created = engine.add_model(model_id)
+    print(f"· added {model_id} to config.yaml" if created
+          else f"· {model_id} is already configured")
+    if info and any(info.get(k) for k in
+                    ("context_size", "price_in_per_mtok", "price_out_per_mtok")):
+        save_remote_model_info(model_id, info)
+        ctx = info.get("context_size")
+        pi, po = info.get("price_in_per_mtok"), info.get("price_out_per_mtok")
+        bits = []
+        if ctx:
+            bits.append(f"ctx {int(ctx) // 1000}k")
+        if pi is not None and po is not None:
+            bits.append(f"${pi:g}/${po:g} per M (listed price)")
+        print(dim(f"  {' · '.join(bits)}"))
+    elif not catalog_ok:
+        print(dim("  couldn't reach the OpenRouter catalog — model added "
+                  "unverified; ctx/pricing unknown (add them to "
+                  "remote_context_limits.json by hand)"))
+    if engine.has_key("openrouter"):
+        engine.switch_model(entry)
+        print(f"{GREEN}→ {model_id}{RESET}")
+    else:
+        print(f"{YELLOW}· no key stored — added but not selected; set it "
+              f"with: aurora key set {env}{RESET}")
+
+
+def _remove_model_cmd(engine: Engine, arg: str) -> None:
+    """`/model remove <url-or-name>` (R81): drop a model from config.yaml.
+    Accepts the OpenRouter page URL or the exact configured model name (any
+    provider — `local` included). Removing the current model falls back to
+    the first remaining model with a usable key."""
+    model_id = _OPENROUTER_URL_RE.sub("", arg.strip()).strip("/")
+    if not model_id or any(c.isspace() for c in model_id):
+        print("· usage: /model remove <https://openrouter.ai/<org>/<model> "
+              "| model name>")
+        return
+    removed, new_current = engine.remove_model(model_id)
+    if not removed:
+        print(f"· {model_id} is not in config.yaml — /model lists what is")
+        return
+    print(f"· removed {model_id} from config.yaml"
+          + (f" ({removed} entries)" if removed > 1 else ""))
+    if new_current is None:
+        return
+    if new_current:
+        print(f"{GREEN}→ {new_current.get('model')}{RESET}")
+    else:
+        print(f"{YELLOW}· no models left in config.yaml — add one with "
+              f"/model add <url>{RESET}")
+
+
 COMMAND_INFO = {
-    "model":     "model picker — Anthropic $ · OpenRouter $ · local library",
+    "model":     "model picker — OpenRouter $ · local library · add/remove <url>",
     "status":    "is the current model's backend up and ready?",
     "think":     "show last turn's reasoning",
     "thinking":  "toggle the live dim reasoning stream",
@@ -569,7 +743,7 @@ COMMAND_INFO = {
     "copy":      "copy Nth-last response to the clipboard",
     "copy-last": "copy last turn's RAW response (thinking included) to the clipboard",
     "copy-all":  "copy the whole chat (questions + answers) to the clipboard",
-
+    "redact":    "secret detection on|off · allowlist [clear] (persisted)",
     "allowlist": "show the persistent approval allowlist",
     "rewind":    "restore the working tree to a pre-mutation checkpoint",
     "resume":    "pick a past session to continue",
@@ -732,7 +906,13 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
     if cmd == "help":
         print(HELP)
     elif cmd == "model":
-        _pick_model(engine, fe)
+        sub, _, rest = arg.partition(" ")
+        if sub.lower() == "add":
+            _add_model_cmd(engine, rest.strip())
+        elif sub.lower() in ("remove", "rm"):
+            _remove_model_cmd(engine, rest.strip())
+        else:
+            _pick_model(engine, fe)
     elif cmd == "clear":
         engine.clear()
         print("· history cleared")
@@ -842,7 +1022,6 @@ def _banner(engine: Engine) -> None:
     """Clear the screen and show a compact session card at startup."""
     import os
     from . import __version__ as version
-    from . import logo
 
     if sys.stdout.isatty():
         sys.stdout.write("\033[2J\033[H")  # clear + cursor home
@@ -850,31 +1029,14 @@ def _banner(engine: Engine) -> None:
     h = engine.provider_health()
     mark = f"{GREEN}✔{RESET}" if h["ok"] else f"{RED}✘{RESET}"
 
-    info_lines = [f"{CYAN}{BOLD}Aurora{RESET} {dim('v' + version)}",
+    info_lines = [f"{CYAN}{BOLD}Aurora{RESET} {dim(version)}",
                   f"  model    {BOLD}{engine.current.get('model')}{RESET}  "
                   f"{mark} {dim(h['detail'])}",
                   f"  cwd      {os.getcwd()}",
                   f"  session  {engine.session.id}"
                   + (dim(f"  ({len(engine.messages)} messages resumed)")
-                     if engine.messages else ""),
-                  dim("  /help · /model · ? help · --man manual")]
-
-    logo_path = logo.resolve_logo(engine.cfg)
-    logo_lines: list[str] = []
-    logo_w = 0
-    if logo_path:
-        try:
-            logo_lines = logo.render(logo_path, max_rows=10, max_cols=22)
-            logo_w = logo.visible_width(logo_lines[0]) if logo_lines else 0
-        except Exception as e:
-            info_lines.append(dim(f"  logo: {e}"))
-
-    merged: list[str] = []
-    for i in range(max(len(logo_lines), len(info_lines))):
-        left = logo_lines[i] if i < len(logo_lines) else " " * logo_w
-        right = info_lines[i] if i < len(info_lines) else ""
-        merged.append(f"{left}  {right}")
-    print("\n".join(merged))
+                     if engine.messages else "")]
+    print("\n".join(info_lines))
     print()
 
 

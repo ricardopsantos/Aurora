@@ -20,9 +20,10 @@ def read_file(path: str, **_) -> str:
     p = _resolve(path)
     if not p.is_file():
         return f"[error: no such file: {path}]"
-    data = p.read_bytes()[:MAX_READ_BYTES]
-    text = data.decode("utf-8", errors="replace")
-    if p.stat().st_size > MAX_READ_BYTES:
+    with p.open("rb") as f:  # never slurp a huge file just to keep the head
+        data = f.read(MAX_READ_BYTES + 1)
+    text = data[:MAX_READ_BYTES].decode("utf-8", errors="replace")
+    if len(data) > MAX_READ_BYTES:
         text += f"\n[truncated at {MAX_READ_BYTES} bytes]"
     return text
 

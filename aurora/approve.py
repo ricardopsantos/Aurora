@@ -133,7 +133,18 @@ def add_rule(tool: str, args: dict) -> str:
 
 
 def diff_preview(tool: str, args: dict) -> str:
-    """A short unified diff for write/edit; empty for run_command."""
+    """A short unified diff for write/edit; empty for run_command. Must never
+    raise: it runs inside the agent loop AFTER the assistant message (with
+    its tool_use) is already in history — an exception here (binary target,
+    permission error) would kill the turn and leave that tool_use dangling,
+    poisoning every later request."""
+    try:
+        return _diff_preview(tool, args)
+    except Exception as e:
+        return f"[diff unavailable: {e.__class__.__name__}: {e}]"
+
+
+def _diff_preview(tool: str, args: dict) -> str:
     if tool == "write_file":
         path = Path(args["path"]).expanduser()
         old = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []

@@ -41,8 +41,9 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
-from . import bootstrap, ui
-from .colors import BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW, dim
+from . import bootstrap, colors, ui
+from .colors import BOLD, CYAN, DIM, GREEN, RED, RESET, URL_RE, YELLOW, dim
+from .paths import aurora_home
 from .engine import Engine
 
 _SCROLL_STEP = 3          # wheel ticks are per-notch; keep it gentle
@@ -135,6 +136,49 @@ def _overlay(frags, start, end):
     return out
 
 
+def _open_url(url: str) -> None:
+    import shutil
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+    if shutil.which(opener):
+        subprocess.Popen([opener, url],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        import webbrowser
+        webbrowser.open(url)
+
+
+def _url_click_handler(url: str):
+    def handler(mouse_event):
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            _open_url(url)
+            return None
+        return NotImplemented
+    return handler
+
+
+def _linkify_fragments(frags):
+    """Split any bare URL out of each fragment's text and re-style it
+    cyan+underline with a click handler that opens it (R3-style clickable
+    links, chat pane only — see colors.linkify for the classic REPL's OSC-8
+    equivalent, which this deliberately does NOT use; see colors.IN_TUI)."""
+    out = []
+    for f in frags:
+        style, text = f[0], f[1]
+        pos = 0
+        matched = False
+        for m in URL_RE.finditer(text):
+            matched = True
+            if m.start() > pos:
+                out.append((style, text[pos:m.start()], *f[2:]))
+            out.append(("class:link", m.group(0), _url_click_handler(m.group(0))))
+            pos = m.end()
+        if not matched:
+            out.append(f)
+        elif pos < len(text):
+            out.append((style, text[pos:], *f[2:]))
+    return out
+
+
 class _ChatWriter:
     """A file-like stdout: every write lands in the chat pane. The worker
     thread is the only printer; prompt_toolkit renders through its own
@@ -164,12 +208,20 @@ class TuiFrontend(ui.TerminalFrontend):
     def __init__(self, tui, **kw):
         super().__init__(**kw)
         self._tui = tui
+        self._reset_token_counters()
+
+    def _reset_token_counters(self) -> None:
+        self._live_in = 0
+        self._live_out = 0
+        self._stream_len = 0
+        self._think_len = 0
 
     def ask_secret(self, label: str) -> str:
         return self._tui.ask(label, secret=True)
 
     def begin_turn(self) -> None:
         super().begin_turn()
+        self._reset_token_counters()
         self._tui.set_phase("thinking")
 
     def on_request(self) -> None:
@@ -182,16 +234,54 @@ class TuiFrontend(ui.TerminalFrontend):
     def end_turn(self) -> None:
         super().end_turn()
         self._tui.finish_think()
+        tag = self._final_token_tag()
+        if tag:
+            self._tui.append(dim(f" {tag}\n"))
+        self._reset_token_counters()
 
     def on_think(self, chunk: str) -> None:
         self.think_buffer += chunk            # /think still works
+        self._think_len += len(chunk)
         self._tui.think_chunk(chunk, live=self.show_thinking)
 
     def on_text(self, chunk: str) -> None:
         self._tui.finish_think()              # answer starts → close the block
         self._tui.set_phase("generating")
         self._think_marker_shown = False      # never let the marker logic fire
+        self._stream_len += len(chunk)
         super().on_text(chunk)
+
+    def on_usage(self, input_tokens: int, output_tokens: int) -> None:
+        self._live_in += input_tokens
+        self._live_out += output_tokens
+        self._tui.invalidate_status()
+
+    def _estimated_out(self) -> int:
+        # _stream_len and _think_len are already character counts, not text.
+        return (self._stream_len + self._think_len) // 4
+
+    @staticmethod
+    def _fmt(n: int) -> str:
+        return ui.fmt_token_count(n)
+
+    def live_token_tag(self) -> str:
+        """Best-known token counts for the live status bar."""
+        parts = []
+        if self._live_in:
+            parts.append(f"↑{self._fmt(self._live_in)}")
+        out = max(self._live_out, self._estimated_out())
+        if out:
+            parts.append(f"↓{self._fmt(out)}")
+        return " ".join(parts)
+
+    def _final_token_tag(self) -> str:
+        """Final tag appended to the response; uses real usage only."""
+        parts = []
+        if self._live_in:
+            parts.append(f"↑{self._fmt(self._live_in)}")
+        if self._live_out:
+            parts.append(f"↓{self._fmt(self._live_out)}")
+        return " ".join(parts)
 
 
 class Tui:
@@ -342,7 +432,7 @@ class Tui:
 
     def _entry_fragments(self, item, index):
         if isinstance(item, str):
-            return ANSI(item).__pt_formatted_text__()
+            return _linkify_fragments(ANSI(item).__pt_formatted_text__())
         import time
         secs = int(item["dt"] if item["done"]
                    else time.monotonic() - item.get("t0", time.monotonic()))
@@ -386,14 +476,23 @@ class Tui:
             return self._text_cache
 
     # ── drag-select → "copy selected" button (R48) ─────────────────────────
+    def _unpad(self, pos: tuple) -> tuple:
+        """Mouse positions are content coords, and the rendered content is
+        top-padded on a short transcript (`_render_fragments` prepends blank
+        rows) — selections are stored in UNPADDED text coords so `_sel_text`
+        indexes the real transcript, and `_render_fragments` shifts them back
+        by the pad when overlaying."""
+        return (max(0, pos[0] - self._pad()), pos[1])
+
     def sel_begin(self, pos: tuple) -> None:
         self._sel_frozen = None   # a fresh drag drops any pending selection
-        self._sel_anchor, self._sel = pos, None
+        self._sel_anchor, self._sel = self._unpad(pos), None
         self.app.invalidate()
 
     def sel_drag(self, pos: tuple):
         if self._sel_anchor is None:
             return NotImplemented
+        pos = self._unpad(pos)
         self._sel = (min(self._sel_anchor, pos), max(self._sel_anchor, pos))
         self.app.invalidate()
         return None
@@ -458,7 +557,11 @@ class Tui:
         if pad:
             frags = [("", "\n" * pad)] + frags
         sel = self._sel or self._sel_frozen
-        return frags if sel is None else _overlay(frags, *sel)
+        if sel is None:
+            return frags
+        # selections are stored unpadded (see _unpad) — shift back for render
+        (y0, x0), (y1, x1) = sel
+        return _overlay(frags, (y0 + pad, x0), (y1 + pad, x1))
 
     # ── scrolling ─────────────────────────────────────────────────────────
     def scroll_by(self, n: int) -> None:
@@ -483,6 +586,12 @@ class Tui:
         if phase != self._phase:
             self._phase = phase
             self.app.invalidate()
+
+    def invalidate_status(self) -> None:
+        try:
+            self.app.invalidate()
+        except Exception:
+            pass
 
     # ── question mode (blocking asks from the worker thread) ─────────────
     def ask(self, prompt: str = "", secret: bool = False) -> str:
@@ -520,13 +629,17 @@ class Tui:
             self.app.invalidate()
 
     def select_menu(self, prompt: str, options: list[tuple[str, str]],
-                    default_index: int | None = None) -> str:
+                    default_index: int | None = None) -> str | None:
         """Arrow-key menu, rendered in place of the input prompt (see `ask`
         for the same blocking-from-worker-thread contract). `default_index`
         only sets which row starts highlighted (e.g. the current model in
         `/model`) — Enter always requires the user to actually press it on
         that row, so this carries none of the classic REPL's blank-Enter
-        safety concern (see `ui.select`)."""
+        safety concern (see `ui.select`). Returns `None` if the menu was
+        explicitly dismissed instead of picked (e.g. a second click on the
+        status bar's model name while the `/model` menu is open) — callers
+        that care must treat `None` as "no change", same spirit as the
+        classic REPL's blank-Enter-keeps-current behavior."""
         if (self._ui_thread is not None
                 and threading.current_thread() is self._ui_thread):
             raise RuntimeError(
@@ -561,22 +674,32 @@ class Tui:
         layered ONTO the row's base style (selected/option) rather than
         replacing it, so a plain label (no escapes — the common case: approve/
         confirm menus) keeps exactly its old look."""
-        if self._menu_options is None:
-            return []
-        frags = [("class:menu.prompt", self._menu_prompt + "\n")]
-        for i, (_, label) in enumerate(self._menu_options):
-            selected = i == self._menu_index
-            row_style = "class:menu.selected" if selected else "class:menu.option"
-            frags.append((row_style, f" ❯ {i + 1}. " if selected else f"   {i + 1}. "))
-            for style, text, *_rest in ANSI(label).__pt_formatted_text__():
-                frags.append((f"{row_style} {style}".strip(), text))
-            frags.append((row_style, "\n"))
-        frags.append(("class:menu.hint", " ↑/↓ move · Enter select · number to jump"))
-        return frags
+        try:
+            if not self._menu_options:
+                return []
+            frags = [("class:menu.prompt",
+                      (self._menu_prompt or "select") + "\n")]
+            for i, (_, label) in enumerate(self._menu_options):
+                selected = i == self._menu_index
+                row_style = ("class:menu.selected" if selected
+                             else "class:menu.option")
+                frags.append((row_style,
+                              f" ❯ {i + 1}. " if selected else f"   {i + 1}. "))
+                for style, text, *_rest in ANSI(label).__pt_formatted_text__():
+                    frags.append((f"{row_style} {style}".strip(), text))
+                frags.append((row_style, "\n"))
+            frags.append(("class:menu.hint",
+                          " ↑/↓ move · Enter select · number to jump"))
+            return frags
+        except Exception:
+            return [("class:menu.prompt", "\n")]
 
     def _menu_height(self) -> int:
         # prompt + one row per option + hint row
-        return (len(self._menu_options) + 2) if self._menu_options else 0
+        try:
+            return (len(self._menu_options) + 2) if self._menu_options else 0
+        except Exception:
+            return 0
 
     def _copy_session_id(self, session_id: str):
         """Click handler for the session id in the status bar — copies it to
@@ -640,6 +763,27 @@ class Tui:
         return (self.input.document.text == "" and self._question is None
                 and not self._secret and self._menu_options is None
                 and not self._exit_confirm)
+
+    def _open_model_picker(self):
+        """Click handler for the model name on the status bar — same as
+        typing `/model` and hitting Enter: opens the model-selection menu.
+        A second tap while that same menu is already open closes it instead
+        (same "no change" outcome as a blank Enter in the classic REPL) —
+        specifically the model picker, not just any open menu, so this click
+        target only ever affects its own menu."""
+        def handler(mouse_event):
+            if mouse_event.event_type != MouseEventType.MOUSE_UP:
+                return
+            if self._menu_options is not None:
+                if self._menu_prompt == "Select model":
+                    self._answers.put(None)   # unblocks select_menu(); its
+                    # own finally clears menu state + invalidates
+                return
+            if self._click_guard():
+                self.append(f"\n{CYAN}{BOLD}> {RESET}/model\n")
+                self.scroll_end()
+                self._inbox.put("/model")
+        return handler
 
     def _open_commands(self):
         """Click handler for the "/ commands" hint — toggle: with the
@@ -837,11 +981,13 @@ class Tui:
             wrap_lines=True, style="class:chat")
 
         from prompt_toolkit.history import FileHistory
-        from .paths import aurora_home
         def _prompt():
             # during a blocking ask, the challenge itself is the prompt —
             # the cursor lands right after "…[c]omment: " (no bottom-bar hop).
-            # A select() menu is NOT here — it renders in its own window above.
+            # A select() menu is NOT here — it renders in its own window above
+            # and the input line is collapsed to height 0.
+            if self._menu_options is not None:
+                return []
             if self._question is not None:
                 return ANSI(self._question).__pt_formatted_text__()
             if self._bash_mode:                  # `!` mode: $ instead of >
@@ -856,28 +1002,30 @@ class Tui:
             # blank gap between a challenge prompt and the chat above it.
             # Wrap-aware: a long challenge prompt on the first line (R50)
             # must not clip when it wraps at narrow widths.
-            if not hasattr(self, "input"):
-                return Dimension(min=1, max=1, preferred=1)
-            if self._menu_options is not None:
-                # a select() menu owns the screen — collapse the input line so
-                # its "> " prompt isn't left dangling under the choices
-                return Dimension.exact(0)
             try:
+                if not hasattr(self, "input"):
+                    return Dimension(min=1, max=1, preferred=1)
+                if self._menu_options is not None:
+                    # a select() menu owns the screen — collapse the input
+                    # line so its "> " prompt isn't left dangling under the
+                    # choices. Height 0 can upset prompt_toolkit's renderer,
+                    # so keep a single invisible row and hide the prompt.
+                    return Dimension.exact(1)
                 cols = max(20, self.app.output.get_size().columns)
+                if self._question is not None:
+                    prompt_lines = _ansi.sub("", self._question).split("\n")
+                else:
+                    prompt_lines = [""]
+                extra = len(prompt_lines) - 1    # embedded newlines
+                plen = len(prompt_lines[-1]) if self._question else 2
+                rows = extra
+                for i, line in enumerate(self.input.document.lines):
+                    w = len(line) + (plen if i == 0 else 0)
+                    rows += max(1, -(-w // cols))  # ceil-div, min 1 per line
+                n = min(max(rows, 1), 8)
+                return Dimension(min=n, max=n, preferred=n)
             except Exception:
-                cols = 80
-            if self._question is not None:
-                prompt_lines = _ansi.sub("", self._question).split("\n")
-            else:
-                prompt_lines = [""]
-            extra = len(prompt_lines) - 1        # embedded newlines in the prompt
-            plen = len(prompt_lines[-1]) if self._question else 2
-            rows = extra
-            for i, line in enumerate(self.input.document.lines):
-                w = len(line) + (plen if i == 0 else 0)
-                rows += max(1, -(-w // cols))     # ceil-div, min 1 per line
-            n = min(max(rows, 1), 8)
-            return Dimension(min=n, max=n, preferred=n)
+                return Dimension(min=1, max=1, preferred=1)
 
         self.input = TextArea(
             multiline=True, wrap_lines=True,
@@ -1078,16 +1226,25 @@ class Tui:
             try:
                 s = self.engine.context_stats()
                 used = f"{s.used / 1000:.1f}k" if s.used >= 1000 else str(s.used)
-                cost = f" │ ${s.cost_usd:.2f}" if s.cost_usd else ""
+                cost = f" (${s.cost_usd:.2f})" if s.cost_known else ""
                 warn = "  ⚠ context >80% — /compact?" if s.pct >= 80 else ""
                 ml = " │ multiline" if self.engine.multiline else ""
                 sid = str(s.session_id)
                 # session id is its own fragment so a click can copy it
                 mode_txt = "bash mode" if self._bash_mode else "prompt mode"
-                frags = [("class:status",
-                          f" {s.model} │ ctx {used}/{s.limit / 1000:.0f}k "
-                          f"({s.pct:.0f}%){cost} │ {mode_txt} │ "),
-                         ("class:status.id", f"session {sid}",
+                draft_tokens = ""
+                if (not self._bash_mode and not self._secret
+                        and self._question is None):
+                    text = self.input.buffer.text
+                    if text.strip():
+                        draft_tokens = f"↑{ui.estimate_tokens(text)}"
+                draft_part = f" - {draft_tokens}" if draft_tokens else ""
+                frags = [("class:status", " "),
+                         ("class:status.id", s.model, self._open_model_picker()),
+                         ("class:status",
+                          f"{cost} │ ctx {used}/{s.limit / 1000:.0f}k "
+                          f"- {s.pct:.0f}%{draft_part} │ {mode_txt} │ "),
+                         ("class:status.id", "session id",
                           self._copy_session_id(sid)),
                          ("class:status", " │ "),
                          ("class:status.id", "copy last",
@@ -1113,8 +1270,14 @@ class Tui:
             msg, ts = self._sel_notice
             esc_pending = self._esc_armed is not None \
                 and time.monotonic() - self._esc_armed_at < 2
-            if self._exit_confirm:
-                pass   # no status-bar tip here — the double-Esc gesture speaks for itself
+            if esc_pending and self._menu_options is None:
+                # R62: the first Esc arms the gesture — say what a second
+                # press within the window will open a confirm for
+                what = {"cancel": "cancel this", "bash": "leave bash mode",
+                        "exit": "quit"}.get(self._esc_armed, "confirm")
+                frags.append(("class:status.busy", f" Esc again to {what}"))
+            elif self._exit_confirm:
+                pass   # armed window expired — the gesture speaks for itself
             elif self._question is not None or self._menu_options is not None:
                 frags.append(("class:status.busy", " select one"))
             elif msg and time.monotonic() - ts < 4:
@@ -1123,10 +1286,11 @@ class Tui:
             elif self._busy:
                 frame = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[self._spin % 10]
                 secs = int(time.time() - self._busy_since)
-                cancel_hint = "Tap ESC twice to cancel" if esc_pending else "Tap ESC twice to cancel"
+                toks = self.fe.live_token_tag()
+                tok_bit = f" │ {toks}" if toks else ""
                 frags.append(("class:status.busy",
                               f" {frame} {self._phase or 'working'}… "
-                              f"{secs}s ({cancel_hint})"))
+                              f"{secs}s (Tap ESC twice to cancel){tok_bit}"))
             else:
                 # split out of ui._FOOTER_HINT so "/ commands", the bash
                 # toggle, and "? Help" are clickable — same effect as typing
@@ -1219,6 +1383,7 @@ class Tui:
             "menu.hint":     "fg:#4a5c5c",
             "think.header":  "fg:#4a5c5c",
             "think.body":    "fg:#4a5c5c",
+            "link":          "fg:ansibrightcyan underline",
             # the /command + model completion dropdown: prompt_toolkit's
             # default is a light-GREY bar (bg:#aaaaaa) — retheme it dark so it
             # matches the status bar instead of looking like a stray grey box
@@ -1235,6 +1400,17 @@ class Tui:
             layout=Layout(root, focused_element=self.input),
             key_bindings=kb, style=style,
             mouse_support=True, full_screen=True)
+        # prompt_toolkit's default ttimeoutlen (0.5s) is how long it waits
+        # after a lone Escape to see if more bytes follow (an Alt-sequence,
+        # or one of our own "escape enter"/"escape m" bindings) before
+        # firing the plain "escape" binding — so EVERY Esc tap in the
+        # double-tap cancel/quit gesture ate this delay on top of the
+        # intentional 2s confirm window, including the second tap that
+        # opens the actual confirm menu. A locally-generated Alt-sequence
+        # (both bytes from one physical keypress) is delivered to the
+        # terminal driver's read() as a single burst, so even a near-zero
+        # timeout still resolves it correctly in practice.
+        self.app.ttimeoutlen = 0.001
 
     # ── worker: the session thread (all command/turn code runs here) ─────
     def _worker(self):
@@ -1280,36 +1456,18 @@ class Tui:
     def _banner(self):
         import os
         from . import __version__ as version
-        from . import logo
 
         engine = self.engine
         h = engine.provider_health()
         mark = f"{GREEN}✔{RESET}" if h["ok"] else f"{RED}✘{RESET}"
-        info_lines = [f"{CYAN}{BOLD}Aurora{RESET} {dim('v' + version)}",
+        info_lines = [f"{CYAN}{BOLD}Aurora{RESET} {dim(version)}",
                       f"  model    {BOLD}{engine.current.get('model')}{RESET}  "
                       f"{mark} {dim(h['detail'])}",
                       f"  cwd      {os.getcwd()}",
                       f"  session  {engine.session.id}"
                       + (dim(f"  ({len(engine.messages)} messages resumed)")
-                         if engine.messages else ""),
-                      dim("  /help · /model · ? help · --man manual"), ""]
-
-        logo_path = logo.resolve_logo(engine.cfg)
-        logo_lines: list[str] = []
-        logo_w = 0
-        if logo_path:
-            try:
-                logo_lines = logo.render(logo_path, max_rows=10, max_cols=22)
-                logo_w = logo.visible_width(logo_lines[0]) if logo_lines else 0
-            except Exception as e:
-                info_lines.append(dim(f"  logo: {e}"))
-
-        merged: list[str] = []
-        for i in range(max(len(logo_lines), len(info_lines))):
-            left = logo_lines[i] if i < len(logo_lines) else " " * logo_w
-            right = info_lines[i] if i < len(info_lines) else ""
-            merged.append(f"{left}  {right}")
-        self.append("\n".join(merged) + "\n")
+                         if engine.messages else ""), ""]
+        self.append("\n".join(info_lines) + "\n")
 
     # ── run ───────────────────────────────────────────────────────────────
     def run(self):
@@ -1318,6 +1476,7 @@ class Tui:
 
         real_stdout, real_input = sys.stdout, builtins.input
         real_select = ui.select
+        colors.IN_TUI = True
         sys.stdout = _ChatWriter(self)
         builtins.input = lambda prompt="": self.ask(str(prompt))
         ui.select = self.select_menu
@@ -1337,11 +1496,45 @@ class Tui:
                     except Exception:
                         pass
         threading.Thread(target=_ticker, daemon=True).start()
+
+        def _pre_run_hook():
+            """Install a logging exception handler so uncaught event-loop
+            errors (often swallowed by prompt_toolkit's alternate-screen
+            dialog) are persisted with full tracebacks for debugging."""
+            import asyncio
+            import datetime
+            import traceback
+            loop = asyncio.get_event_loop()
+            original = loop.get_exception_handler()
+
+            def _log_and_forward(loop_, context):
+                try:
+                    log_path = aurora_home() / "tui_crash.log"
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"\n--- {datetime.datetime.now().isoformat()} ---\n")
+                        msg = context.get("message", "")
+                        if msg:
+                            f.write(msg + "\n")
+                        exc = context.get("exception")
+                        if exc:
+                            traceback.print_exception(
+                                type(exc), exc, exc.__traceback__, file=f)
+                except Exception:
+                    pass
+                if original is not None:
+                    original(loop_, context)
+                else:
+                    loop_.default_exception_handler(context)
+
+            loop.set_exception_handler(_log_and_forward)
+
         try:
-            self.app.run()
+            self.app.run(pre_run=_pre_run_hook)
         finally:
             sys.stdout, builtins.input = real_stdout, real_input
             ui.select = real_select
+            colors.IN_TUI = False
         print(f"\nResume this session with:\n  aurora --resume {self.engine.session.id}")
         print("bye")
 

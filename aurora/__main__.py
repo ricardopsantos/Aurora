@@ -67,7 +67,7 @@ def _key_set(argv: list[str]) -> None:
     import subprocess
     from . import keystore
 
-    env = argv[0] if argv else "ANTHROPIC_API_KEY"
+    env = argv[0] if argv else "LLAMA_API_KEY"
     val = ""
     cmd = _fetch_command(env)
     if cmd:

@@ -103,7 +103,7 @@ def _mk_provider():
     from aurora.providers.openai_compat import OpenAICompatProvider
     prov = OpenAICompatProvider("openrouter",
                                 {"base_url": "https://openrouter.ai/api/v1"}, 300)
-    prov.__dict__["_http"] = object()   # never build/use a real client
+    prov._client_for = lambda base: object()   # never build/use a real client
     return prov
 
 
@@ -424,7 +424,7 @@ def test_malformed_retry_leaves_no_nudge_in_history():
     msgs = [{"role": "user", "content": "hi"}]
     agent.run_turn(MalformThenOK(), "m", msgs, "s", _cb(), 5, True, False)
     # only the original user + the recovered assistant — no leaked nudge,
-    # no two-user-in-a-row (which Anthropic would 400 on)
+    # no two-user-in-a-row (which most chat APIs 400 on)
     roles = [m["role"] for m in msgs]
     assert roles == ["user", "assistant"]
 
@@ -494,6 +494,32 @@ def test_unreachable_message_never_leaks_a_local_hostname():
     notices = [e[1] for e in log if e[0] == "notify"]
     assert any("local backend unreachable" in m for m in notices)
     assert not any("someone-box" in m.lower() or "my-private-name" in m for m in notices)
+
+
+class _RateLimitedProvider:
+    """Raises a 429 ProviderError, like a free-tier OpenRouter model shared
+    across too many concurrent users on its upstream."""
+    def __init__(self, name, base_url=""):
+        self.name = name
+        self.base_url = base_url
+    def turn(self, *a, **k):
+        from aurora.providers.base import ProviderError
+        raise ProviderError(
+            'openrouter HTTP 429: {"error": {"message": "Provider returned '
+            'error", "code": 429, "metadata": {"raw": "qwen/qwen3-coder:free '
+            'is temporarily rate-limited upstream..."}}}')
+
+
+def test_rate_limit_gets_actionable_hint_not_raw_json():
+    # a 429 must not dump the raw provider JSON blob at the user — give the
+    # same kind of targeted, human-readable hint as context-full/connectivity
+    log = []
+    agent.run_turn(_RateLimitedProvider("openrouter"),
+                   "m", [{"role": "user", "content": "hi"}], "s",
+                   _cb(log=log), 5, True, False)
+    notices = [e[1] for e in log if e[0] == "notify"]
+    assert any("rate-limited" in m for m in notices)
+    assert not any('"metadata"' in m for m in notices)  # raw JSON gone
 
 
 def test_remote_provider_gets_a_longer_connect_timeout():
@@ -605,11 +631,11 @@ def test_bootstrap_from_input_requires_md_or_txt(tmp_path):
 _CFG = """
 providers:
   local: {type: openai, base_url: "http://x"}
-  anth:  {type: anthropic, api_key_env: MISSING_KEY_XYZ}
+  remote: {type: openai, base_url: "http://y", api_key_env: MISSING_KEY_XYZ}
 models:
   - {model: m-one, provider: local}
   - {model: m-two, provider: local}
-  - {model: claude, provider: anth}
+  - {model: remote-model, provider: remote}
 """
 
 
@@ -762,57 +788,45 @@ def test_llamadesk_unreachable_is_cached_briefly(monkeypatch):
 
 
 # ── R68: context-size picker on a library load ──────────────────────────────
-def test_pick_ctx_ladder_capped_at_native(monkeypatch):
+def test_pick_ctx_offers_64_128_256(monkeypatch):
     from aurora import ui
-    # native=100000 sits between 65536 and 131072 on the ladder — 131072 must
-    # be filtered out (over the model's real max) and 100000 itself added
-    monkeypatch.setattr("builtins.input", lambda *a, **k: "")  # blank = default
-    ctx = ui._pick_ctx(default_ctx=65536, native=100_000)
-    assert ctx == 65536   # default rung, unaffected by the native cap here
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "131072")
+    ctx = ui._pick_ctx(default_ctx=65536, native=None)
+    assert ctx == 131_072
 
 
-def test_pick_ctx_native_always_offered_even_off_ladder(monkeypatch):
+def test_pick_ctx_drops_options_over_native(monkeypatch):
     from aurora import ui
-    # native=100000 isn't on _CTX_LADDER — picking option "100000" (its own
-    # key) must still resolve, proving it was added as a real menu entry
-    monkeypatch.setattr("builtins.input", lambda *a, **k: "100000")
+    # native=100000 sits between 64k and 128k — 128k/256k must be dropped
+    # entirely (never rope-extend past what the model was trained for),
+    # leaving only 64k offered
+    seen = {}
+    def fake_select(prompt, options, default_index=None):
+        seen["options"] = options
+        return options[0][0]
+    monkeypatch.setattr(ui, "select", fake_select)
     ctx = ui._pick_ctx(default_ctx=65536, native=100_000)
-    assert ctx == 100_000
+    assert ctx == 65536
+    assert seen["options"] == [("65536", "64k")]
+
+
+def test_pick_ctx_native_below_64k_offers_native_alone(monkeypatch):
+    from aurora import ui
+    # a tiny model's native ctx is under even the smallest rung — offer it
+    # directly instead of an empty menu
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")
+    ctx = ui._pick_ctx(default_ctx=65536, native=8192)
+    assert ctx == 8192
 
 
 def test_pick_ctx_default_targets_native_cap_not_configured_value(monkeypatch):
     from aurora import ui
-    # configured default (65536) is ABOVE this model's native (32768) — the
-    # pre-selected rung must track the capped target, not the raw config value
+    # configured default (65536) is ABOVE this model's native (32768) — with
+    # only 64k offered (128k/256k dropped), the pre-selected rung must still
+    # resolve to the one valid option, not crash on an out-of-range index
     monkeypatch.setattr("builtins.input", lambda *a, **k: "")
     ctx = ui._pick_ctx(default_ctx=65536, native=32_768)
     assert ctx == 32_768
-
-
-def test_pick_ctx_custom_rejects_over_native(monkeypatch):
-    from aurora import ui
-    answers = iter(["custom", "999999", "16384"])   # too big, then valid
-    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
-    ctx = ui._pick_ctx(default_ctx=65536, native=32_768)
-    assert ctx == 16_384
-
-
-def test_pick_ctx_custom_rejects_non_numeric_and_zero(monkeypatch):
-    from aurora import ui
-    answers = iter(["custom", "abc", "0", "-5", "8192"])
-    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
-    ctx = ui._pick_ctx(default_ctx=65536, native=None)
-    assert ctx == 8192
-
-
-def test_pick_ctx_no_native_offers_full_ladder_unbounded(monkeypatch):
-    from aurora import ui
-    # native=None (older LlamaDesk server): every ladder rung is offered,
-    # and a custom value has no upper bound
-    answers = iter(["custom", "300000"])
-    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
-    ctx = ui._pick_ctx(default_ctx=65536, native=None)
-    assert ctx == 300_000
 
 
 class _FakeDesk:
@@ -847,14 +861,15 @@ def test_pick_model_library_load_prompts_for_ctx_and_passes_it_through(
     e.cfg["llamadesk"] = {"ctx": 65536}
     switch_calls = []
     desk = _FakeDesk(
-        models_detail=[{"name": "big-model.gguf", "ctx_native": 32_768,
+        models_detail=[{"name": "big-model.gguf", "ctx_native": 131_072,
                         "size_bytes": 1}],
         loaded="m-one", switch_calls=switch_calls)
     monkeypatch.setattr(ui, "_llamadesk", lambda engine: desk)
     # menu order: pick "local:big-model.gguf" from the model list (matched by
-    # label substring — its options are numbered, not named), then ctx=16384.
+    # label substring — its options are numbered, not named), then ctx=128k
+    # (native=131072 caps out 256k, leaving 64k/128k — pick the second).
     # Eviction confirm is mocked directly below, so it consumes no input.
-    inputs = iter(["local:big-model.gguf", "16384"])
+    inputs = iter(["local:big-model.gguf", "131072"])
 
     def fake_select(prompt, options, default_index=None):
         raw = next(inputs)
@@ -869,15 +884,15 @@ def test_pick_model_library_load_prompts_for_ctx_and_passes_it_through(
     monkeypatch.setattr(ui, "select", fake_select)
     monkeypatch.setattr(ui, "confirm", lambda *a, **k: True)
     ui._pick_model(e, ui.TerminalFrontend())
-    assert switch_calls == [("big-model.gguf", 16_384)]
+    assert switch_calls == [("big-model.gguf", 131_072)]
     assert e.current["model"] == "big-model.gguf"
 
 
 def test_last_model_without_key_falls_back_to_default(tmp_path, monkeypatch):
     e = _mk_engine(tmp_path, monkeypatch)
-    e.switch_model({"model": "claude", "provider": "anth"})
+    e.switch_model({"model": "remote-model", "provider": "remote"})
     e2 = _mk_engine(tmp_path, monkeypatch)
-    assert e2.current["model"] == "m-one"   # anth key missing → default
+    assert e2.current["model"] == "m-one"   # remote key missing → default
 
 
 # ── R58: secret detection in the USER PROMPT (Engine.send) ─────────────────
@@ -991,3 +1006,243 @@ def test_secret_allowlist_persists_across_restarts(tmp_path, monkeypatch):
     e2.clear_secret_allowlist()
     e3 = Engine(str(cfg_path))
     assert e3.secret_allowlist == set()
+
+
+class MalformThenError:
+    """Malformed first call; the RETRY fails with a ProviderError."""
+    def turn(self, *a, **k):
+        from aurora.providers.base import MalformedToolCall, ProviderError
+        if not getattr(self, "n", 0):
+            self.n = 1
+            raise MalformedToolCall("bad")
+        raise ProviderError("boom")
+    def assistant_message(self, r): return {"role": "assistant", "content": r.text}
+    def tool_result_message(self, c, o): return {"role": "tool", "content": o}
+
+
+def test_malformed_retry_error_leaves_no_nudge_in_history():
+    import pytest
+    from aurora.providers.base import ProviderError
+    msgs = [{"role": "user", "content": "hi"}]
+    with pytest.raises(ProviderError):
+        agent.run_turn(MalformThenError(), "m", msgs, "s", _cb(), 5, True, False)
+    # the corrective nudge must not survive a failed retry — it would sit in
+    # history as a second consecutive user message and poison the next send
+    assert [m["role"] for m in msgs] == ["user"]
+
+
+def test_diff_preview_never_raises_on_binary_target(tmp_path):
+    # a write over a non-UTF8 file used to raise UnicodeDecodeError from
+    # inside the agent loop, AFTER the assistant tool_use was in history —
+    # killing the turn and poisoning every later request
+    p = tmp_path / "blob.bin"
+    p.write_bytes(b"\xff\xfe\x00garbage\x9c")
+    out = approve.diff_preview("write_file", {"path": str(p), "content": "x"})
+    assert isinstance(out, str) and "diff unavailable" in out
+    out = approve.diff_preview("edit_file", {"path": str(p), "old": "a", "new": "b"})
+    assert isinstance(out, str) and "diff unavailable" in out
+
+
+def test_sse_stream_skips_garbled_line(monkeypatch):
+    from aurora.providers import openai_compat as oc
+    prov = oc.OpenAICompatProvider("x", {"base_url": "http://127.0.0.1:9"}, 5)
+    monkeypatch.setattr(prov, "pick_endpoint", lambda cache_ok=True: prov.base_url)
+
+    def fake_sse(open_stream, cancel, poll=0.15):
+        yield ("status", 200, None)
+        yield ("line", "data: {truncated-garbage", None)     # must be skipped
+        yield ("line", 'data: {"choices":[{"delta":{"content":"hi"}}]}', None)
+        yield ("line", "data: [DONE]", None)
+
+    monkeypatch.setattr(oc, "cancellable_sse", fake_sse)
+    got = []
+    r = prov.turn("m", [{"role": "user", "content": "q"}], "", None,
+                  got.append, lambda: False)
+    assert r.text == "hi" and got == ["hi"]
+
+
+# ── /model add (R80) ───────────────────────────────────────────────────────
+def test_parse_openrouter_model():
+    from aurora import ui
+    assert ui._parse_openrouter_model(
+        "https://openrouter.ai/kwaipilot/kat-coder-air-v2.5") == "kwaipilot/kat-coder-air-v2.5"
+    assert ui._parse_openrouter_model(
+        "https://openrouter.ai/models/kwaipilot/kat-coder-air-v2.5/") == "kwaipilot/kat-coder-air-v2.5"
+    assert ui._parse_openrouter_model("kwaipilot/kat-coder-air-v2.5") == "kwaipilot/kat-coder-air-v2.5"
+    assert ui._parse_openrouter_model("no-slash-id") is None
+    assert ui._parse_openrouter_model("two words/here x") is None
+    assert ui._parse_openrouter_model("") is None
+
+
+_OR_CFG = """
+providers:
+  openrouter:
+    type: openai
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+models:
+  - provider: openrouter
+    model: existing/model
+    tools: true
+"""
+
+
+def _mk_or_engine(tmp_path, monkeypatch):
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_OR_CFG)
+    from aurora.engine import Engine
+    return Engine(str(cfg)), cfg
+
+
+def test_add_model_persists_and_dedupes(tmp_path, monkeypatch):
+    import yaml
+    e, cfg = _mk_or_engine(tmp_path, monkeypatch)
+    entry, created = e.add_model("kwaipilot/kat-coder-air-v2.5")
+    assert created and entry in e.models
+    on_disk = yaml.safe_load(cfg.read_text())["models"]
+    assert {"provider": "openrouter", "model": "kwaipilot/kat-coder-air-v2.5",
+            "tools": True} in on_disk
+    # adding again: no duplicate, nothing rewritten
+    entry2, created2 = e.add_model("kwaipilot/kat-coder-air-v2.5")
+    assert not created2 and entry2 is entry
+    assert len(yaml.safe_load(cfg.read_text())["models"]) == len(on_disk)
+
+
+def test_save_remote_model_info_updates_json_and_memory(tmp_path, monkeypatch):
+    import json as _json
+    from aurora.providers import openai_compat as oc
+    path = tmp_path / "limits.json"
+    path.write_text("[]")
+    monkeypatch.setattr(oc, "_REMOTE_CONTEXT_LIMITS_PATH", path)
+    monkeypatch.setattr(oc, "REMOTE_CONTEXT_LIMITS", {})
+    oc.save_remote_model_info("kwaipilot/kat-coder-air-v2.5",
+                              {"context_size": 262144,
+                               "price_in_per_mtok": 0.044,
+                               "price_out_per_mtok": 0.599,
+                               "description": "Agentic coding model."})
+    entry = _json.loads(path.read_text())[0]
+    assert entry["model"] == "kwaipilot/kat-coder-air-v2.5"
+    assert entry["provider"] == "openrouter"
+    assert entry["code"] == "kat-coder-air-v2.5"
+    assert entry["context_size"] == 262144
+    assert entry["price_in_per_mtok"] == 0.044
+    assert entry["description"] == "Agentic coding model."
+    assert "openrouter.ai/kwaipilot/kat-coder-air-v2.5#pricing" in entry["pricing_url"]
+    # in-memory table sees it too (footer $ badge works without a restart)
+    assert oc.REMOTE_CONTEXT_LIMITS["kwaipilot/kat-coder-air-v2.5"]["context_size"] == 262144
+
+
+def test_model_add_command_end_to_end(tmp_path, monkeypatch, capsys):
+    import yaml
+    from aurora import ui
+    from aurora.providers import openai_compat as oc
+    e, cfg = _mk_or_engine(tmp_path, monkeypatch)
+    monkeypatch.setattr(oc, "fetch_openrouter_model_info",
+                        lambda mid: ({"context_size": 262144,
+                                      "price_in_per_mtok": 0.044,
+                                      "price_out_per_mtok": 0.599,
+                                      "description": "d"}, True))
+    saved = {}
+    monkeypatch.setattr(oc, "save_remote_model_info",
+                        lambda mid, info: saved.update({mid: info}))
+    ui._handle_command(e, None,
+                       "/model add https://openrouter.ai/kwaipilot/kat-coder-air-v2.5")
+    out = capsys.readouterr().out
+    assert "added kwaipilot/kat-coder-air-v2.5" in out
+    assert "ctx 262k" in out and "$0.044/$0.599" in out
+    assert e.current["model"] == "kwaipilot/kat-coder-air-v2.5"   # switched
+    assert "kwaipilot/kat-coder-air-v2.5" in saved
+    on_disk = [m["model"] for m in yaml.safe_load(cfg.read_text())["models"]]
+    assert "kwaipilot/kat-coder-air-v2.5" in on_disk
+
+
+def test_model_add_rejects_garbage(tmp_path, monkeypatch, capsys):
+    from aurora import ui
+    e, cfg = _mk_or_engine(tmp_path, monkeypatch)
+    ui._handle_command(e, None, "/model add not-a-model")
+    assert "usage: /model add" in capsys.readouterr().out
+    assert e.current["model"] == "existing/model"
+
+
+# ── /model remove (R81) ────────────────────────────────────────────────────
+def test_remove_model_persists(tmp_path, monkeypatch):
+    import yaml
+    from aurora import ui
+    e, cfg = _mk_or_engine(tmp_path, monkeypatch)
+    e.add_model("kwaipilot/kat-coder-air-v2.5")
+    removed, new_current = e.remove_model("kwaipilot/kat-coder-air-v2.5")
+    assert removed == 1 and new_current is None      # wasn't the current model
+    names = [m["model"] for m in yaml.safe_load(cfg.read_text())["models"]]
+    assert names == ["existing/model"]
+    assert [m["model"] for m in e.models] == ["existing/model"]  # live list too
+
+
+def test_remove_current_model_falls_back(tmp_path, monkeypatch):
+    e, cfg = _mk_or_engine(tmp_path, monkeypatch)
+    entry, _ = e.add_model("kwaipilot/kat-coder-air-v2.5")
+    e.switch_model(entry)
+    removed, new_current = e.remove_model("kwaipilot/kat-coder-air-v2.5")
+    assert removed == 1
+    assert new_current["model"] == "existing/model"
+    assert e.current["model"] == "existing/model"
+
+
+def test_remove_last_model_leaves_no_current(tmp_path, monkeypatch):
+    e, cfg = _mk_or_engine(tmp_path, monkeypatch)
+    removed, new_current = e.remove_model("existing/model")
+    assert removed == 1 and new_current == {} and e.current == {}
+
+
+def test_remove_model_command_accepts_url_and_unknown(tmp_path, monkeypatch, capsys):
+    from aurora import ui
+    e, cfg = _mk_or_engine(tmp_path, monkeypatch)
+    e.add_model("kwaipilot/kat-coder-air-v2.5")
+    ui._handle_command(e, None,
+                       "/model remove https://openrouter.ai/kwaipilot/kat-coder-air-v2.5")
+    out = capsys.readouterr().out
+    assert "removed kwaipilot/kat-coder-air-v2.5" in out
+    ui._handle_command(e, None, "/model rm nobody/nothing")
+    assert "not in config.yaml" in capsys.readouterr().out
+
+
+def test_model_add_refuses_nonexistent_model(tmp_path, monkeypatch, capsys):
+    import yaml
+    from aurora import ui
+    from aurora.providers import openai_compat as oc
+    e, cfg = _mk_or_engine(tmp_path, monkeypatch)
+    # catalog reachable, model not in it → refuse, nothing added
+    monkeypatch.setattr(oc, "fetch_openrouter_model_info", lambda mid: (None, True))
+    ui._handle_command(e, None, "/model add nobody/does-not-exist")
+    out = capsys.readouterr().out
+    assert "not found on OpenRouter" in out
+    names = [m["model"] for m in yaml.safe_load(cfg.read_text())["models"]]
+    assert names == ["existing/model"]
+    assert e.current["model"] == "existing/model"
+
+
+def test_model_add_offline_adds_unverified(tmp_path, monkeypatch, capsys):
+    import yaml
+    from aurora import ui
+    from aurora.providers import openai_compat as oc
+    e, cfg = _mk_or_engine(tmp_path, monkeypatch)
+    # catalog unreachable → can't verify, add anyway with a warning
+    monkeypatch.setattr(oc, "fetch_openrouter_model_info", lambda mid: (None, False))
+    ui._handle_command(e, None, "/model add kwaipilot/kat-coder-air-v2.5")
+    out = capsys.readouterr().out
+    assert "added kwaipilot/kat-coder-air-v2.5" in out
+    assert "unverified" in out
+    names = [m["model"] for m in yaml.safe_load(cfg.read_text())["models"]]
+    assert "kwaipilot/kat-coder-air-v2.5" in names
+
+
+def test_send_with_no_model_notifies_instead_of_crashing(tmp_path, monkeypatch):
+    e, cfg = _mk_or_engine(tmp_path, monkeypatch)
+    e.remove_model("existing/model")           # last model gone (R81)
+    notes = []
+    class _FE:
+        def notify(self, m): notes.append(m)
+    e.send("hello", _FE())
+    assert any("no model selected" in m for m in notes)
+    assert e.messages == []                     # nothing appended, no crash

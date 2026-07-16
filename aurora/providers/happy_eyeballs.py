@@ -57,6 +57,9 @@ def happy_eyeballs_connect(host: str, port: int, timeout: float | None,
     # instant it lands — we never block waiting on a slower/stalled family.
     results: Queue = Queue()
     stop = threading.Event()
+    win_lock = threading.Lock()   # winner selection must be atomic — a bare
+    # is_set()/set() pair lets two connects both "win" and leaks the loser's
+    # socket (nobody is left to close it once the caller has returned)
 
     def attempt(fam: int, sa: tuple, delay: float) -> None:
         if stop.wait(delay):                  # someone already won during stagger
@@ -72,11 +75,14 @@ def happy_eyeballs_connect(host: str, port: int, timeout: float | None,
             s.close()
             results.put(("err", e))
             return
-        if stop.is_set():                     # lost the race after connecting
+        with win_lock:
+            won = not stop.is_set()
+            if won:
+                stop.set()
+        if not won:                           # lost the race after connecting
             s.close()
             results.put(("skip", None))
             return
-        stop.set()
         results.put(("ok", s))
 
     for i, (fam, sa) in enumerate(addrs):

@@ -159,3 +159,10 @@ class Provider(ABC):
 
     def context_limit(self, model: str) -> int:
         return int(self.config.get("context_limit", 0)) or 128_000
+
+    def has_pricing(self, model: str) -> bool:
+        """Whether cost() returns a real $ estimate for this model — the
+        footer only shows a cost badge when this is True (see
+        engine.py's context_stats()). Providers with no known per-token
+        price (e.g. a local model) default to False."""
+        return False

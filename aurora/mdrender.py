@@ -8,7 +8,7 @@ untouched, so pipes see exactly what the model wrote."""
 
 import re
 
-from .colors import BOLD, CYAN, DIM, RESET
+from .colors import BOLD, CYAN, DIM, RESET, linkify
 
 _CODE = re.compile(r"`([^`]+)`")
 _BOLD = re.compile(r"\*\*([^*]+)\*\*")
@@ -36,4 +36,4 @@ class LineRenderer:
         line = _BOLD.sub(f"{BOLD}\\1{RESET}", line)
         line = _CODE.sub(f"{CYAN}\\1{RESET}", line)
         line = _BULLET.sub(r"\1• ", line)
-        return line
+        return linkify(line)

@@ -107,9 +107,7 @@ def _draft(engine, transcript: str, groups: list[str],
     if guidance:
         ask += (f"\n\nYou proposed:\n{previous}\n\nThe user said: {guidance}\n"
                 "Re-emit ONLY that finding, same block format, adjusted.")
-    kind = engine.provider_kind()
-    msg = ([{"role": "user", "content": [{"type": "text", "text": ask}]}]
-           if kind == "anthropic" else [{"role": "user", "content": ask}])
+    msg = [{"role": "user", "content": ask}]
     provider = engine._provider_for(engine.current, interactive=True)
     result = provider.turn(engine.current.get("model", ""), msg,
                            "", None, lambda _s: None, lambda: False)

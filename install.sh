@@ -32,5 +32,5 @@ esac
 
 echo
 echo "Done. Next:"
-echo "  aurora key set            # store the Anthropic key (keyring/encrypted)"
+echo "  aurora key set            # store your OpenRouter/local key (keyring/encrypted)"
 echo "  aurora                    # run (auto-detects .agentic_context/)"

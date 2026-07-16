@@ -3,9 +3,6 @@
 # encrypted file → prompt); never put them here.
 
 providers:
-  anthropic:
-    type: anthropic
-    api_key_env: ANTHROPIC_API_KEY
   openrouter:
     type: openai
     base_url: https://openrouter.ai/api/v1
@@ -26,15 +23,6 @@ models:
   - provider: openrouter
     model: moonshotai/kimi-k2.7-code
     tools: true
-  - provider: anthropic
-    model: claude-sonnet-5
-    tools: true
-  - provider: anthropic
-    model: claude-opus-4-8
-    tools: true
-  - provider: anthropic
-    model: claude-haiku-4-5-20251001
-    tools: true
 
 runtime:
   max_iterations: 10
@@ -44,8 +32,6 @@ runtime:
   # .env-style credentials) and challenge before sending/logging. /redact
   # on|off toggles + persists here.
   redact_secrets: true
-  # Startup logo rendered on the left of the banner (relative to this file)
-  logo: images/base.png
 
 # Optional: LlamaDesk (github.com/<you>/llamadesk or your own instance) is a
 # companion model-library switcher for a local llama.cpp server — lets
