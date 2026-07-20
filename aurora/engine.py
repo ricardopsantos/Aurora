@@ -281,8 +281,12 @@ class Engine:
         if self.messages and self.messages[-1] is user_msg:
             self.messages.pop()
 
-        # token/cost accounting for the footer
-        self._used = turn.input_tokens + turn.output_tokens
+        # token/cost accounting for the footer. A turn that errored before
+        # any request completed reports 0/0 — keep the previous gauge value
+        # rather than showing "ctx 0" while the (popped-user-msg) history
+        # still holds the earlier conversation
+        if turn.input_tokens or turn.output_tokens:
+            self._used = turn.input_tokens + turn.output_tokens
         if hasattr(provider, "cost"):
             # billed_input sums EVERY iteration's prompt — a multi-tool turn
             # pays for the context on each round, not just the last one

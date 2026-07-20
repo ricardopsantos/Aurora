@@ -25,50 +25,52 @@ report a short brief before touching anything.
 /bootstrap set bootstrap.example.md project    # just this project (.aurora/bootstrap.md)
 ```
 
-## Why Aurora exists
-
-1. **To learn.** The best way to understand how agents like Claude Code
-   really work is to build one from scratch — the tool loop, streaming,
-   approvals, context management, all of it.
-2. **An agent with taste, on your own hardware.** Aurora speaks to the
-   local llama.cpp server as a first-class citizen (free, private), with
-   paid models one keystroke away — and being your own agent means having
-   things the big ones don't.
-3. **Example — steer at the approval prompt.** When the agent asks to
-   change a bunch of text, you don't have to just allow or deny: type a
-   note right there ("also rename that variable while you're at it") and
-   it's appended to the agent's context on the spot — it immediately
-   redoes that exact change with your correction folded in. One line at
-   the challenge instead of deny → explain → re-approve. Loved it, never
-   saw it anywhere else.
-
 ## Features
 
-**Steer instead of deny-and-redo.** At any approval prompt, pick "Comment"
-and type a note instead of just yes/no — Aurora folds it into the same
-request and redoes the change, no deny → re-explain → re-approve round trip.
+**Privacy & security at the core**
+- Every prompt and every tool output (even read-only ones like
+  `read_file`/`grep`) is scanned for API keys, tokens, and credentials
+  before it reaches the model or the session log. A match challenges you:
+  redact it, keep it, allow it going forward, or stop.
+- API keys never touch disk in plaintext — OS keyring or encrypted storage
+  only.
+
+![Secret challenge: a detected AWS key, GitHub token, Bearer token and UUID with redact/keep/stop options](images/aurora.secrets_detection.png)
+
+**Approval-gated, steerable edits**
+- Every file write, edit or shell command shows a diff preview and asks
+  first; trusted patterns can be allowlisted.
+- Don't just allow or deny — pick "Comment" and type a note instead;
+  Aurora folds it into the same request and redoes the change, no
+  deny → re-explain → re-approve round trip.
+- A shadow git snapshot is taken before every approved change, so
+  `/rewind` can undo any step — even the rewind itself.
 
 ![Approval prompt for writing CONTRIBUTING.md, with "Comment — steer the model instead" selected](images/aurora.steer.png)
 
-**One picker, every model.** `/model` switches between OpenRouter (paid)
-and your local llama.cpp server (free) from the same arrow-key menu —
-current model marked, no key stored yet? it asks once and remembers.
+**Any model, zero friction**
+- `/model` switches between OpenRouter (paid) and your local llama.cpp
+  server (free) from the same arrow-key menu — current model marked, no
+  key stored yet? it asks once and remembers.
+- Adding one is as simple as pasting its OpenRouter URL:
+  `/model add https://openrouter.ai/kwaipilot/kat-coder-air-v2.5` (or just
+  the bare `org/model` id) validates it against the OpenRouter catalog,
+  fetches its context size, pricing and description, and asks for your
+  `OPENROUTER_API_KEY` if it isn't stored yet — no config editing.
+  `/model remove` drops one just as easily. (Automatic model config is
+  OpenRouter-only for now.)
 
 ![Model picker: OpenRouter and local models in one menu](images/aurora.models-picker.png)
 
-**Adding a model is as simple as pasting its OpenRouter URL.**
-`/model add https://openrouter.ai/kwaipilot/kat-coder-air-v2.5` (or just the
-bare `org/model` id) appends it to `config.yaml`, fetches its context size,
-pricing and description from OpenRouter's catalog, prompts for your
-`OPENROUTER_API_KEY` if it isn't stored yet, and switches to it — no config
-editing. (For now the automatic model config is OpenRouter-only.)
-
-**Secrets never leave your control.** Every prompt and every tool output
-(even read-only ones like `read_file`/`grep`) is scanned for API keys,
-tokens, and credentials before it reaches the model or the session log. A
-match challenges you: redact it, keep it, allow it going forward, or stop.
-
-![Secret challenge: a detected AWS key, GitHub token, Bearer token and UUID with redact/keep/stop options](images/aurora.secrets_detection.png)
+**Built for daily terminal use**
+- Full-screen TUI: scrollable chat with streaming markdown, timed
+  collapsible thinking blocks, mouse support and drag-to-copy — with a
+  classic REPL fallback for plain terminals.
+- Resume past conversations, export them as markdown, `/compact` long ones
+  into a summary, or `/remember` what mattered into a persistent
+  cross-session memory.
+- Reusable prompt-driven skills, plus a per-project bootstrap prompt so
+  the agent starts every session already knowing the codebase.
 
 ## Install (macOS or Linux)
 

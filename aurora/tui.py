@@ -1451,7 +1451,13 @@ class Tui:
                 self._busy, self._phase = False, ""
                 self._esc_armed = None
                 self.app.invalidate()
-        self.app.loop.call_soon_threadsafe(self.app.exit)
+        # app.loop only exists once app.run() has started on the UI thread —
+        # a '/quit' typed as the very first input can race that startup and
+        # find None here, killing the worker and leaving the app running
+        if self.app.loop is not None:
+            self.app.loop.call_soon_threadsafe(self.app.exit)
+        else:
+            self.app.exit()
 
     def _banner(self):
         import os

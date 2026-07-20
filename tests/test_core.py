@@ -1246,3 +1246,21 @@ def test_send_with_no_model_notifies_instead_of_crashing(tmp_path, monkeypatch):
     e.send("hello", _FE())
     assert any("no model selected" in m for m in notes)
     assert e.messages == []                     # nothing appended, no crash
+
+
+# ── keystore: non-interactive lookup must never prompt ────────────────────
+def test_get_key_noninteractive_never_prompts_for_passphrase(tmp_path, monkeypatch):
+    """With an encrypted key file present but no cached passphrase, a
+    non-interactive get_key (footer/picker path) must return None, not block
+    on a hidden passphrase prompt."""
+    from aurora import keystore
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path))
+    monkeypatch.delenv("ENCSTORED_VAR", raising=False)
+    monkeypatch.setattr(keystore, "_keyring_get", lambda n: None)
+    (tmp_path / "keys.enc").write_bytes(b"garbage")   # file exists, locked
+    keystore._passphrase_cache.clear()
+    prompts = []
+    monkeypatch.setattr(keystore, "_prompter",
+                        lambda label: prompts.append(label) or "")
+    assert keystore.get_key("ENCSTORED_VAR", interactive=False) is None
+    assert prompts == []                                # never asked

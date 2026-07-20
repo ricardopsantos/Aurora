@@ -1002,6 +1002,8 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
             sid = rows[int(raw) - 1][0]
             n = engine.resume_from(sid)
             print(f"· resumed {sid} ({n} turns)")
+        elif raw:
+            print("· no such session — enter a number from the list, or empty to cancel")
     elif cmd == "export":
         out = f"aurora-session-{engine.session.id}.md"
         with open(out, "w") as f:

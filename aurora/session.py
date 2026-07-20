@@ -24,7 +24,17 @@ class Session:
     def records(self) -> list[dict]:
         if not self.log_path.exists():
             return []
-        return [json.loads(l) for l in self.log_path.read_text().splitlines() if l.strip()]
+        out = []
+        for line in self.log_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                # one corrupt/truncated line (killed mid-write, disk full)
+                # must not kill resume/export of the whole session
+                continue
+        return out
 
 
 def latest_session_id() -> str | None:

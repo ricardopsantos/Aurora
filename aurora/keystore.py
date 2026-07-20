@@ -78,11 +78,18 @@ def _encfile_save(passphrase: str, data: dict) -> None:
     p.chmod(0o600)
 
 
-def _encfile_get(name: str) -> str | None:
+def _encfile_get(name: str, interactive: bool = True) -> str | None:
     if not (aurora_home() / _ENC_FILE).exists():
         return None
     pw = _passphrase_cache.get("pw")
     if pw is None:
+        if not interactive:
+            # a non-interactive lookup (footer renders, the /model picker's
+            # has_key checks) must NEVER block on a passphrase prompt — with
+            # an encrypted store present and nothing cached, the honest
+            # answer is "can't tell right now", not a hidden getpass that
+            # freezes the UI on a prompt nobody sees
+            return None
         entered = _prompter("Aurora key-store passphrase: ")
         if not entered:
             return None
@@ -103,7 +110,7 @@ def get_key(env_var: str, interactive: bool = True) -> str | None:
     val = _keyring_get(env_var)
     if val:
         return val
-    val = _encfile_get(env_var)
+    val = _encfile_get(env_var, interactive=interactive)
     if val:
         return val
     if not interactive:

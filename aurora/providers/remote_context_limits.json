@@ -1,5 +1,15 @@
 [
   {
+    "model": "moonshotai/kimi-k3",
+    "provider": "openrouter",
+    "code": "kimi-k3",
+    "context_size": 256000,
+    "price_in_per_mtok": 0.443,
+    "price_out_per_mtok": 15.00,
+    "pricing_url": "https://openrouter.ai/moonshotai/kimi-k3#pricing",
+    "description": "Kimi K3 is a 2.8T parameter open-weight multimodal reasoning model from Moonshot AI. It is suited for complex coding, knowledge work, and long-horizon agentic workflows, and is particularly strong at navigating large repositories, using tools, debugging, and iterating against images, logs, tests, and runtime feedback. Its architecture uses KDA and Attention Residuals for computational efficiency."
+  },
+  {
     "model": "moonshotai/kimi-k2.7-code",
     "provider": "openrouter",
     "code": "kimi-k2.7-code",

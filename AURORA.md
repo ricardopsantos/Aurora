@@ -873,7 +873,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
 - No Aurora code changed for this — `openai_compat.py` already supported a
   `base_url` list with try-each-in-order failover for any `type: openai`
   provider (not special-cased to a "local" config key). What changed is
-  **how `config.yaml` is deployed**: on m7, `~/scripts/misc/llama/aurora-gateway.py`
+  **how `config.yaml` is deployed**: on m7, `~/scripts/llama/aurora-gateway.py`
   (a small Flask service, systemd unit `aurora-gateway`, run behind Caddy on
   the existing `:18182` LAN/Tailscale endpoints) now sits in front of
   llama-server. It inspects the `model` field of each `/v1/chat/completions`

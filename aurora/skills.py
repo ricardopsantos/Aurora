@@ -6,6 +6,7 @@ AURORA_HOME/skills/. A skill is any executable file, or a *.py run with the
 venv's python. The first line's trailing comment (after `#`) is its blurb."""
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -56,11 +57,18 @@ def run(name: str, args: str, config_base: str | None = None) -> str:
     path = sk[name]
     cmd = ([sys.executable, str(path)] if path.suffix == ".py"
            and not os.access(path, os.X_OK) else [str(path)])
-    cmd += args.split() if args else []
+    try:
+        cmd += shlex.split(args) if args else []
+    except ValueError as e:   # unbalanced quotes etc.
+        return f"[skill args error: {e}]"
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:
         return "[skill timeout after 300s]"
+    except OSError as e:
+        # an executable skill with a bad/missing interpreter (Exec format
+        # error, ENOENT shebang) must come back as text, not kill the turn
+        return f"[skill error: {e}]"
     out = (r.stdout or "") + (r.stderr or "")
     return (out.strip() or "[no output]") + (
         f"\n[exit {r.returncode}]" if r.returncode else "")

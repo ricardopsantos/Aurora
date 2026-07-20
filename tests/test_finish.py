@@ -174,3 +174,63 @@ def test_tool_output_truncated(tmp_path):
     out = tools.run_tool("read_file", {"path": str(big)})
     assert len(out) < 70_000
     assert "truncated" in out
+
+
+# ── regression: bugfix pass ────────────────────────────────────────────────
+def test_skill_run_survives_exec_format_error(tmp_path):
+    # an executable .py without a shebang must return text, not raise OSError
+    sk = tmp_path / "skills"
+    sk.mkdir()
+    bad = sk / "bad.py"
+    bad.write_text("print(1)\n")
+    bad.chmod(0o755)
+    assert "skill error" in skills.run("bad", "", str(tmp_path))
+
+
+def test_skill_run_passes_quoted_args_as_one(tmp_path):
+    sk = tmp_path / "skills"
+    sk.mkdir()
+    echo = sk / "echo.py"
+    echo.write_text("# echo args\nimport sys\nprint(repr(sys.argv[1:]))\n")
+    out = skills.run("echo", 'hello "two words"', str(tmp_path))
+    assert "'two words'" in out            # one argv entry, not two fragments
+
+
+def test_records_skips_corrupt_lines(engine):
+    s = Session("corruptsession1")
+    s.log("user", text="good", model="m")
+    with open(s.log_path, "a") as f:       # truncated write / disk-full line
+        f.write("{not json\n")
+    s.log("assistant", text="also good", model="m")
+    rows = s.records()
+    assert [r["event"] for r in rows] == ["user", "assistant"]
+
+
+def test_failed_turn_keeps_previous_context_gauge(engine, monkeypatch):
+    # a ProviderError turn must not reset _used to 0 while history is kept
+    from aurora.providers.base import ProviderError
+    engine.messages = [{"role": "user", "content": "old"},
+                       {"role": "assistant", "content": "older"}]
+    engine._used = 500
+
+    class _DeadProvider:
+        api_key = "k"
+        extra_body = {}
+        on_think = None
+
+        def turn(self, *a, **k):
+            raise ProviderError("backend unreachable")
+
+    monkeypatch.setattr(engine, "_provider_for", lambda *a, **k: _DeadProvider())
+
+    class _FE:
+        def on_text(self, c): pass
+        def on_tool_start(self, n, a): pass
+        def on_tool_result(self, n, o): pass
+        def approve(self, t, a, d): return "n", ""
+        def ask_continue(self, i): return False
+        def notify(self, m): pass
+        def cancelled(self): return False
+    engine.send("hi", _FE())
+    assert engine._used == 500
+    assert engine.messages[-1]["role"] == "assistant"   # dangling user popped
