@@ -3,7 +3,7 @@
 Aurora is a micro terminal coding agent (macOS + Linux, synced via git).
 
 > **Canonical spec is [`AURORA.md`](AURORA.md).** It holds the full numbered
-> requirements (R1–R77+), build plan, and test plan, written before the code
+> requirements (R1–R90), build plan, and test plan, written before the code
 > and kept in sync with behaviour. This file is a stable high-level index; when
 > the two disagree, AURORA.md wins. Any behaviour change updates AURORA.md (and
 > README.md) in the same commit.
@@ -19,9 +19,13 @@ Aurora is a micro terminal coding agent (macOS + Linux, synced via git).
   web). Approval gate on writes & commands (`y`/`n`/`a`, persistent allowlist),
   diff preview before writes, a per-turn iteration cap, `!cmd` bash passthrough,
   and `/name` skills.
-- **Context & memory (R12+).** agentic_context protocol: bootstraps
-  `.agentic_context/` in the cwd (AGENTS.md rules+personality, the three
-  indexes, `[CORE]` docs) so the user shapes Aurora through context, not code.
+- **Context & memory (R12+).** agentic_context protocol: bootstraps the
+  project's context folder (AGENTS.md rules+personality, the three indexes,
+  `[CORE]` docs) so the user shapes Aurora through context, not code. The
+  folder is found by its CONTENTS, never its name (R88/R90c) — the nearest
+  ancestor, walking up from the cwd, holding a subfolder with both
+  `KNOWLEDGE/SKILL.md` and `MEMORY/SKILL.md`; `.agentic_context` is the
+  convention, not a requirement.
 - **TUI & UX.** Esc is the single control key (menu → cancel → exit-ask →
   clear); no accidental-exit keys; robust request cancellation (reader thread +
   socket shutdown) so Esc/Ctrl+C interrupt even during prefill.

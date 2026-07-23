@@ -39,12 +39,45 @@ PATTERNS: list[tuple[str, re.Pattern]] = [
     ("Private key block",
      re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?"
                 r"-----END [A-Z ]*PRIVATE KEY-----")),
-    # .env-style assignment: KEY=value where KEY names a credential
+    # .env-style assignment: KEY=value where KEY names a credential.
+    # R95d: the name prefix is OPTIONAL. It used to be mandatory
+    # (`[A-Za-z_][A-Za-z0-9_]*`), which quietly excluded the most canonical
+    # spellings of all — a bare `API_KEY=`, `SECRET=`, `TOKEN=` or
+    # `PASSWORD=` at the start of a line matched nothing, so the commonest
+    # shape in a .env file or an `env` dump sailed through R58 untouched.
+    # `PWD` is the exception that KEEPS a mandatory prefix: bare `PWD=` is
+    # the shell's own working-directory variable, present in every `env`
+    # dump and never a credential, while `DB_PWD=` is. The other names are
+    # credentials on their own.
     ("Env credential",
-     re.compile(r"(?im)^[ \t]*[A-Za-z_][A-Za-z0-9_]*"
-                r"(?:API[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD|PWD)"
-                r"[A-Za-z0-9_]*[ \t]*=[ \t]*\S+")),
+     re.compile(r"(?im)^[ \t]*(?:"
+                r"[A-Za-z0-9_]*(?:API[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD)"
+                r"[A-Za-z0-9_]*"
+                r"|[A-Za-z0-9_]+PWD[A-Za-z0-9_]*"
+                r")[ \t]*=[ \t]*\S+")),
 ]
+
+# R96g: a cheap literal prerequisite per pattern — if NONE of a pattern's
+# literals appear anywhere in the text, the regex cannot possibly match, so
+# skip `finditer` entirely. `in` on a plain str is a C-level substring search
+# (effectively memchr), far cheaper than running even a fast regex engine
+# over the same text. Every pattern here does need SOME literal substring —
+# `GUID/UUID` and `Env credential` don't (their "prefix" is a dash pattern /
+# any of five different variable-name shapes), so those two are exempt
+# (`None`) and always scanned. A guard tuple only needs to be a SUPERSET of
+# what the regex requires — "gh" instead of the five real prefixes below
+# would still be correct, just filter less; the tighter list only wins more.
+_LITERAL_GUARD: dict[str, tuple[str, ...] | None] = {
+    "GUID/UUID": None,
+    "AWS access key": ("AKIA", "ASIA"),
+    "GitHub token": ("ghp_", "gho_", "ghu_", "ghs_", "ghr_"),
+    "Slack token": ("xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"),
+    "Stripe key": ("_live_",),          # covers both sk_live_ and pk_live_
+    "OpenAI-style key": ("sk-",),
+    "Bearer token": ("Bearer",),
+    "Private key block": ("-----BEGIN",),
+    "Env credential": None,
+}
 
 
 @dataclass(frozen=True)
@@ -114,17 +147,28 @@ def scan(text: str, allowlist: set[str] | None = None) -> list[Match]:
     if not text:
         return []
     found: list[Match] = []
-    claimed: list[tuple[int, int]] = []
+    # Claimed spans as a per-character bitmap, NOT a list of (start, end)
+    # pairs: the list made every candidate re-scan every previous claim, so a
+    # match-dense block (a fixtures file of UUIDs, a big .env, a token-heavy
+    # log) cost O(matches²) on the worker thread, on by default. The mask is
+    # O(span) to claim and O(span) to test — the whole scan is linear (R90e).
+    claimed = bytearray(len(text))
 
     def _overlaps(s: int, e: int) -> bool:
-        return any(s < ce and cs < e for cs, ce in claimed)
+        return b"\x01" in claimed[s:e]
+
+    def _claim(s: int, e: int) -> None:
+        claimed[s:e] = b"\x01" * (e - s)
 
     for name, pat in PATTERNS:
+        guard = _LITERAL_GUARD.get(name)
+        if guard is not None and not any(lit in text for lit in guard):
+            continue
         for m in pat.finditer(text):
             s, e = m.span()
             if _overlaps(s, e):
                 continue   # overlaps an earlier match — skip, don't double-count
-            claimed.append((s, e))
+            _claim(s, e)
             found.append(Match(name, s, e, m.group(0)))
 
     for m in _CANDIDATE_RE.finditer(text):
@@ -143,7 +187,7 @@ def scan(text: str, allowlist: set[str] | None = None) -> list[Match]:
             continue   # real tokens are mixed-case+digit; kills long slugs/paths
         if _shannon_entropy(token) < _ENTROPY_THRESHOLD:
             continue
-        claimed.append((s, e))
+        _claim(s, e)
         found.append(Match("High-entropy token", s, e, token))
 
     found.sort(key=lambda mm: mm.start)
@@ -153,11 +197,25 @@ def scan(text: str, allowlist: set[str] | None = None) -> list[Match]:
 
 
 def redact(text: str, matches: list[Match]) -> str:
-    """Replace every matched span with <secret>, right-to-left so earlier
-    spans' indices stay valid as later ones are substituted."""
-    for m in sorted(matches, key=lambda mm: mm.start, reverse=True):
-        text = text[:m.start] + "<secret>" + text[m.end:]
-    return text
+    """Replace every matched span with <secret>.
+
+    R96d: was right-to-left `text = text[:m.start] + "<secret>" + text[m.end:]`
+    per match — every substitution rebuilds and copies the ENTIRE string, so
+    redacting a match-dense blob (a big .env, a token-heavy log — exactly the
+    R58 case) was O(matches × len(text)). A single left-to-right pass that
+    accumulates the untouched-between-matches slices and `"".join()`s once at
+    the end has the same "earlier spans stay valid" property (each slice is
+    read before any substitution happens) and is linear."""
+    if not matches:
+        return text
+    out: list[str] = []
+    pos = 0
+    for m in sorted(matches, key=lambda mm: mm.start):
+        out.append(text[pos:m.start])
+        out.append("<secret>")
+        pos = m.end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def preview(matches: list[Match], max_items: int = 5) -> str:

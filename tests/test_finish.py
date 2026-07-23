@@ -20,6 +20,11 @@ def _make_context(root):
     (ac / "MEMORY").mkdir()
     (ac / "SKILLS").mkdir()
     (ac / "AGENTS.md").write_text("# Rules\n- be terse\n")
+    # what makes a folder THE context root (R88/R90c): both SKILL.md files.
+    # Detection is by contents, never by the folder's name.
+    (ac / "KNOWLEDGE" / "SKILL.md").write_text("# Knowledge\n")
+    (ac / "MEMORY" / "SKILL.md").write_text("# Memory\n")
+    (ac / "SKILLS" / "SKILL.md").write_text("# Skills\n")
     (ac / "KNOWLEDGE" / "INDEX.md").write_text(
         "# KNOWLEDGE\n"
         "- `core/Main.md` — [CORE] always-load doc. (~10 tok)\n"
@@ -92,6 +97,20 @@ def test_compact_folds_history(engine):
     body = engine.messages[0]["content"]
     assert "question" in body and "answer" in body
     assert engine.compact_history() == 1  # idempotent-ish: folds again
+
+
+def test_compact_resets_context_gauge(engine):
+    # a near-full gauge from a prior big turn must drop after /compact —
+    # otherwise the footer keeps showing the pre-compact usage (and the
+    # >80% "/compact?" hint never clears even though the fold happened)
+    engine.messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    engine._used = 100_000
+    engine.compact_history()
+    assert engine._used < 100_000
+    assert engine.context_stats().pct < 80
 
 
 def test_resume_rebuilds_history(engine):
@@ -234,3 +253,55 @@ def test_failed_turn_keeps_previous_context_gauge(engine, monkeypatch):
     engine.send("hi", _FE())
     assert engine._used == 500
     assert engine.messages[-1]["role"] == "assistant"   # dangling user popped
+
+
+# ── R90c: ONE detector, by contents, walking up ────────────────────────────
+def test_bootstrap_finds_a_differently_named_context_folder(tmp_path):
+    """The folder is identified by WHAT IT CONTAINS — KNOWLEDGE/SKILL.md and
+    MEMORY/SKILL.md — never by the name `.agentic_context` (R88/R90c)."""
+    ac = _make_context(tmp_path)
+    renamed = tmp_path / "project_context"     # not hidden, not the convention
+    ac.rename(renamed)
+    prompt = context.bootstrap(tmp_path)
+    assert "be terse" in prompt and context.active()
+    assert context.find_context_root(tmp_path) == renamed
+
+
+def test_bootstrap_walks_up_from_a_subdirectory(tmp_path):
+    _make_context(tmp_path)
+    deep = tmp_path / "src" / "pkg" / "sub"
+    deep.mkdir(parents=True)
+    assert "CORE-BODY-MARKER" in context.bootstrap(deep)
+
+
+def test_a_folder_missing_either_skill_md_is_not_a_context_root(tmp_path):
+    half = tmp_path / "not_a_context"
+    (half / "KNOWLEDGE").mkdir(parents=True)
+    (half / "MEMORY").mkdir(parents=True)
+    (half / "KNOWLEDGE" / "SKILL.md").write_text("x")   # MEMORY/SKILL.md absent
+    assert context.find_context_root(tmp_path) is None
+    assert context.bootstrap(tmp_path) == ""
+
+
+def test_memory_and_context_share_one_detector(tmp_path):
+    """/remember, /agentic_report, the status-bar link and the bootstrap must
+    never disagree about whether a context is present (R90c)."""
+    from aurora import memory
+    assert memory.find_context_root is context.find_context_root
+    root = _make_context(tmp_path)
+    assert memory.find_context_root(tmp_path) == root == context.detect(tmp_path)
+
+
+def test_session_records_stream_without_loading_the_file(tmp_path, monkeypatch):
+    """R90g: a session log is unbounded (nothing is auto-deleted), so
+    resume/export iterate it instead of read_text()-ing the whole thing."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    s = Session("streamy")
+    for i in range(50):
+        s.log("user", text=f"m{i}")
+    with open(s.log_path, "a") as f:
+        f.write("{not json\n")           # a corrupt line must not be fatal
+    it = s.iter_records()
+    assert next(it)["text"] == "m0"      # yields before consuming the file
+    assert len(list(it)) == 49
+    assert len(s.records()) == 50

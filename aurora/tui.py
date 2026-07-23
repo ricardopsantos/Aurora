@@ -41,7 +41,7 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
-from . import bootstrap, colors, ui
+from . import bootstrap, colors, memory, ui
 from .colors import BOLD, CYAN, DIM, GREEN, RED, RESET, URL_RE, YELLOW, dim
 from .paths import aurora_home
 from .engine import Engine
@@ -105,21 +105,45 @@ class _ChatControl(FormattedTextControl):
         return super().mouse_handler(mouse_event)
 
 
+def _span(text, y, x):
+    """(line, col) reached after `text`, from (y, x)."""
+    nl = text.count("\n")
+    if nl:
+        return y + nl, len(text) - text.rfind("\n") - 1
+    return y, x + len(text)
+
+
 def _overlay(frags, start, end):
     """Re-style the (start..end) content range (tuple-compared (line, col)
     positions) in reverse video. Splits only the fragments the selection
-    crosses; everything fully outside passes through untouched."""
-    out = []
+    crosses; everything fully outside passes through untouched.
+
+    R96c: "passes through untouched" is now a list SLICE rather than an
+    append per fragment. This runs on every frame while a selection is live
+    or frozen — and a drag invalidates on every mouse-move — so the old
+    per-fragment Python loop over the whole transcript cost 21ms/frame at
+    102k fragments and got worse as the session grew. A fragment's position
+    is only knowable from everything before it, so the walk to find the
+    first crossing fragment is still linear; but walking is just a
+    `count("\\n")` each, and it no longer builds a list as it goes.
+    """
+    n = len(frags)
     y, x = 0, 0
-    for f in frags:
+    i = 0
+    while i < n:                       # walk to the first crossed fragment
+        ey, ex = _span(frags[i][1], y, x)
+        if (ey, ex) > start:
+            break
+        y, x = ey, ex
+        i += 1
+    if i == n:
+        return list(frags)             # selection is past the content
+
+    mid = []
+    j = i
+    while j < n and (y, x) < end:      # rebuild only what the range crosses
+        f = frags[j]
         style, text = f[0], f[1]
-        nl = text.count("\n")
-        ey, ex = (y + nl, len(text) - text.rfind("\n") - 1) if nl \
-            else (y, x + len(text))
-        if (ey, ex) <= start or (y, x) >= end:   # fully outside
-            out.append(f)
-            y, x = ey, ex
-            continue
         segs, cur, cin = [], [], False
         for ch in text:
             ins = start <= (y, x) < end
@@ -131,9 +155,10 @@ def _overlay(frags, start, end):
             y, x = (y + 1, 0) if ch == "\n" else (y, x + 1)
         if cur:
             segs.append((cin, "".join(cur)))
-        out += [((style + " reverse") if ins else style, s, *f[2:])
-                for ins, s in segs]
-    return out
+        mid += [((style + " reverse") if inside else style, s, *f[2:])
+                for inside, s in segs]
+        j += 1
+    return frags[:i] + mid + frags[j:]
 
 
 def _open_url(url: str) -> None:
@@ -290,7 +315,12 @@ class Tui:
         self._debug = debug          # --debug: tint chat green, status bar pink
         self._chat: list = []        # str | think dict
         self._cache: list = []       # per-entry (fragments, nlines) | None
-        self._text_cache = None
+        self._text_cache = None      # flattened fragments for the whole chat
+        self._offsets: list = []     # R96b: _offsets[i] = (fragment index,
+        # line count) where entry i starts inside _text_cache — lets a rebuild
+        # truncate to any dirty entry in O(1) instead of re-flattening
+        self._dirty_from: int | None = None   # lowest entry needing a re-parse
+        self._clock_key = None       # R95j: displayed second of live think rows
         self._nlines = 0
         self._follow = True          # stick to the tail until the user scrolls
         self._scroll_y = 0
@@ -327,8 +357,13 @@ class Tui:
         self._sel_notice: tuple = ("", 0.0)      # ("copied …", monotonic ts)
         self._open_think = False     # a live (undone) think row exists
         self._saved_draft = ""       # input text preserved across challenges
-        self._help_text = ANSI(ui.HELP).__pt_formatted_text__()
         self._help_visible = False
+        # computed once — the project layout doesn't change mid-session, and
+        # find_context_root() walks the filesystem, too costly to redo on
+        # every status-bar render tick
+        self._agentic_root = memory.find_context_root(".")
+        self._help_text = ANSI(ui.help_text(
+            self._agentic_root is not None)).__pt_formatted_text__()
 
         self.fe = TuiFrontend(
             self,
@@ -343,11 +378,21 @@ class Tui:
     # transcript on every append is O(n²) over the session. Small consecutive
     # strings merge into one entry so the entry list stays short. `_cache[i]`
     # is (frags, nlines) or None when entry i needs a re-parse.
+    #
+    # R96b: the per-entry cache alone was not enough. The FLATTENED list was
+    # thrown away on every append too, so each frame re-concatenated every
+    # fragment in the session — 34ms/frame at 4MB of scrollback, growing for
+    # as long as the session runs. Appends always land on the LAST entry, so
+    # `_dirty_from` records the lowest changed index and the rebuild resumes
+    # from there; the flatten is now proportional to what actually changed.
     _MERGE_LIMIT = 4096
 
     def _dirty(self, i: int) -> None:
+        """Mark entry i for a re-parse and remember the lowest dirty index —
+        the next render re-flattens only from there (R96b)."""
         self._cache[i] = None
-        self._text_cache = None
+        self._dirty_from = i if self._dirty_from is None \
+            else min(self._dirty_from, i)
 
     def append(self, s: str) -> None:
         with self._lock:
@@ -362,7 +407,7 @@ class Tui:
             else:
                 self._chat.append(s)
                 self._cache.append(None)
-                self._text_cache = None
+                self._dirty(len(self._chat) - 1)
         try:
             self.app.invalidate()
         except Exception:
@@ -380,7 +425,7 @@ class Tui:
             self._chat.append({"kind": "think", "text": "", "open": live,
                                "done": False, "t0": time.monotonic(), "dt": 0})
             self._cache.append(None)
-            self._text_cache = None
+            self._dirty(len(self._chat) - 1)
             self._open_think = True
         self.app.invalidate()
 
@@ -452,27 +497,71 @@ class Tui:
             frags = [("class:think.header", f"✻ {state}"), ("", "\n")]
         return frags
 
+    def _live_clock_key(self):
+        """The whole-second value each live think row currently displays.
+
+        A live row's header carries a running clock, so its fragments really
+        do go stale — but only once per SECOND, while `_fragments` runs on
+        every render: the 0.5s ticker, every keystroke, every mouse move,
+        every status invalidate. Rebuilding the entire transcript on all of
+        them (R95j) is work proportional to the whole scrollback for a clock
+        that mostly hasn't changed. Keying on the displayed second rebuilds
+        exactly when the display would differ.
+        """
+        import time
+        now = time.monotonic()
+        return tuple(int(now - item.get("t0", now))
+                     for item in self._chat
+                     if isinstance(item, dict) and not item["done"])
+
+    def _rebuild_locked(self) -> None:
+        """Re-flatten `_text_cache` from the lowest dirty entry onward (R96b).
+
+        `_offsets[i]` is (fragment index, line count) at the point entry i
+        begins, so truncating to a dirty index is a `del` on the tail rather
+        than a full re-concatenation. Callers hold `self._lock`; the list is
+        mutated in place, which is safe because every reader of
+        `_text_cache` (`_render_fragments`, `_sel_text`) runs on the UI
+        thread — the worker only ever marks entries dirty.
+        """
+        start = 0 if self._text_cache is None else max(self._dirty_from or 0, 0)
+        self._dirty_from = None
+        if start == 0:
+            self._text_cache, self._offsets, total = [], [], 0
+        elif start >= len(self._offsets):
+            # nothing already-flattened changed (the common case: a brand new
+            # entry was appended) — resume at the end of what we have
+            start, total = len(self._offsets), self._nlines
+        else:
+            fo, total = self._offsets[start]
+            del self._text_cache[fo:]
+            del self._offsets[start:]
+        out = self._text_cache
+        for i in range(start, len(self._chat)):
+            self._offsets.append((len(out), total))
+            cached = self._cache[i]
+            if cached is None:
+                frags = self._entry_fragments(self._chat[i], i)
+                nl = sum(f[1].count("\n") for f in frags)
+                cached = self._cache[i] = (frags, nl)
+            out += cached[0]
+            total += cached[1]
+        self._nlines = total
+
     def _fragments(self):
         with self._lock:
-            # a live think row's header carries a running clock — as long as
-            # one exists, rebuild every render (the 0.5s ticker drives it)
             if self._open_think:
-                self._text_cache = None
-            if self._text_cache is None:
-                out: list = []
-                total = 0
-                for i, item in enumerate(self._chat):
-                    cached = self._cache[i]
-                    if isinstance(item, dict) and not item["done"]:
-                        cached = None        # live clock — never trust cache
-                    if cached is None:
-                        frags = self._entry_fragments(item, i)
-                        nl = sum(f[1].count("\n") for f in frags)
-                        cached = self._cache[i] = (frags, nl)
-                    out += cached[0]
-                    total += cached[1]
-                self._nlines = total
-                self._text_cache = out
+                key = self._live_clock_key()
+                if key != self._clock_key:
+                    # the displayed second moved — re-parse only the live
+                    # rows (they are normally just the tail one), not the
+                    # whole transcript
+                    self._clock_key = key
+                    for i, item in enumerate(self._chat):
+                        if isinstance(item, dict) and not item["done"]:
+                            self._dirty(i)
+            if self._dirty_from is not None or self._text_cache is None:
+                self._rebuild_locked()
             return self._text_cache
 
     # ── drag-select → "copy selected" button (R48) ─────────────────────────
@@ -598,8 +687,9 @@ class Tui:
         # The UI (event-loop) thread is the one that DELIVERS answers, so an
         # ask() from it (e.g. via the builtins.input monkeypatch) can never
         # be answered — it deadlocks silently. Fail loudly instead. Any other
-        # thread is fine: the worker, or the nested turn thread _run_turn
-        # spawns (a key prompt mid-turn arrives from there).
+        # thread is fine: the worker calls engine.send() directly (R96f — no
+        # nested per-turn thread in the TUI), so a mid-turn key prompt
+        # arrives from the worker thread itself.
         if (self._ui_thread is not None
                 and threading.current_thread() is self._ui_thread):
             raise RuntimeError(
@@ -751,6 +841,19 @@ class Tui:
                     self._sel_notice = (f"whole chat copied — {how}",
                                         time.monotonic())
                 self.app.invalidate()
+        return handler
+
+    def _agentic_report_click(self):
+        """Click handler for the "agentic report" status-bar link — only
+        rendered when `self._agentic_root` was detected at startup (see
+        __init__). Same as typing `/agentic_report`: routes through the
+        inbox so the Stats/Index choice (a blocking select()) runs on the
+        worker thread, not the UI thread."""
+        def handler(mouse_event):
+            if mouse_event.event_type == MouseEventType.MOUSE_UP and self._click_guard():
+                self.append(f"\n{CYAN}{BOLD}> {RESET}/agentic_report\n")
+                self.scroll_end()
+                self._inbox.put("/agentic_report")
         return handler
 
     def _click_guard(self) -> bool:
@@ -936,7 +1039,14 @@ class Tui:
             self._esc_armed, self._esc_armed_at = kind, now
 
         if self._menu_options is not None:
-            pass  # a challenge/confirm menu is open — require an explicit pick
+            if self._menu_prompt == "Select model":
+                # the model picker alone allows a bare Esc to cancel — it's a
+                # picker over the CURRENT model, not a challenge that must be
+                # answered, so backing out with no change is a valid outcome.
+                # Every other select()/confirm menu still requires an
+                # explicit pick (see test_menu_esc_is_noop_while_open).
+                self._answers.put(None)
+            # else: a challenge/confirm menu is open — require an explicit pick
         elif self._bash_mode:
             if _armed("bash"):
                 self._esc_armed = None
@@ -1159,8 +1269,18 @@ class Tui:
         @kb.add("up")
         def _(event):
             # select()-mode menu → move the pointer; completion menu open →
-            # navigate it; on the first input row → recall history (REPL
-            # muscle memory); otherwise move the cursor
+            # navigate it; an EMPTY prompt → recall history (REPL muscle
+            # memory); otherwise move the cursor within the draft.
+            #
+            # R98: this used to key off cursor_position_row == 0 alone, so
+            # up-arrow on line 2 of an unrelated multi-line draft (say, a
+            # pasted error log) that happened to put the cursor back on row
+            # 0 would jump straight into command history, discarding the
+            # user's place in their own draft. History recall is now gated
+            # on the DRAFT being empty, not on which row the cursor sits
+            # on — an in-progress multi-line draft never gets clobbered by
+            # a stray up-arrow, and going up from row 2 to row 1 of that
+            # draft behaves like every other multi-line text field.
             if self._menu_options is not None:
                 self._menu_index = (self._menu_index - 1) % len(self._menu_options)
                 self.app.invalidate()
@@ -1168,13 +1288,15 @@ class Tui:
             buf = self.input.buffer
             if buf.complete_state:
                 buf.complete_previous()
-            elif buf.document.cursor_position_row == 0:
+            elif not buf.text:
                 buf.history_backward()
             else:
                 buf.cursor_up()
 
         @kb.add("down")
         def _(event):
+            # R98: same fix as "up", symmetrically — gated on an EMPTY
+            # draft, not on which row the cursor is on.
             if self._menu_options is not None:
                 self._menu_index = (self._menu_index + 1) % len(self._menu_options)
                 self.app.invalidate()
@@ -1182,7 +1304,7 @@ class Tui:
             buf = self.input.buffer
             if buf.complete_state:
                 buf.complete_next()
-            elif buf.document.cursor_position_row == buf.document.line_count - 1:
+            elif not buf.text:
                 buf.history_forward()
             else:
                 buf.cursor_down()
@@ -1256,6 +1378,10 @@ class Tui:
                     frags.append(("class:status", " │ "))
                     frags.append(("class:status.id", "copy selected",
                                   self._copy_selected()))
+                if self._agentic_root is not None:
+                    frags.append(("class:status", " │ "))
+                    frags.append(("class:status.id", "agentic report",
+                                  self._agentic_report_click()))
                 if ml:
                     frags.append(("class:status", ml))
                 if warn:
@@ -1279,7 +1405,9 @@ class Tui:
             elif self._exit_confirm:
                 pass   # armed window expired — the gesture speaks for itself
             elif self._question is not None or self._menu_options is not None:
-                frags.append(("class:status.busy", " select one"))
+                hint = (" select one, or ESC to cancel"
+                        if self._menu_prompt == "Select model" else " select one")
+                frags.append(("class:status.busy", hint))
             elif msg and time.monotonic() - ts < 4:
                 frags.append(("class:status.busy", f" ✂ {msg}",
                               self._dismiss_notice_click()))
@@ -1421,12 +1549,15 @@ class Tui:
         bp_text, bp_source = bootstrap.load(".")
         if bp_text and not engine.messages:
             first = next((l for l in bp_text.splitlines() if l.strip()), "")
+            bp_url = bootstrap.source_url(".")
             self.append(f"{YELLOW}bootstrap prompt{RESET} [{bp_source}] "
                         + dim(f"{len(bp_text)} chars") + "\n"
                         + dim(f"  “{ui._short(first, 70)}”") + "\n")
-            if ui.confirm("Run the bootstrap prompt?"):
+            choice = ui._bootstrap_run_choice(bp_url)
+            if choice in ("run", "download"):
                 self._busy, self._busy_since, self._phase = True, _t.time(), "working"
-                ui._run_bootstrap(engine, fe)
+                ui._run_bootstrap(engine, fe, redownload=(choice == "download"),
+                                 sync=True)
                 self._busy, self._phase = False, ""
                 self._esc_armed = None
 
@@ -1444,7 +1575,10 @@ class Tui:
                     if not ui._handle_command(engine, fe, line):
                         break
                 else:
-                    ui._run_turn(engine, fe, line)
+                    # R96f: no thread wrapper — _worker is already off the
+                    # main thread, and cancellation here is Esc-Esc's
+                    # cancel_event, not Ctrl+C (see ui._run_turn's docstring)
+                    ui._send_turn(engine, fe, line)
             except BaseException as e:            # never kill the session loop
                 print(f"\n{RED}✗ {e.__class__.__name__}: {e}{RESET}")
             finally:

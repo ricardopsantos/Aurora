@@ -32,6 +32,19 @@ runtime:
   # .env-style credentials) and challenge before sending/logging. /redact
   # on|off toggles + persists here.
   redact_secrets: true
+  # R91: mark the system prompt as cacheable (cache_control breakpoint) so
+  # the bootstrap preamble isn't re-billed on every tool iteration of every
+  # turn. Per-model default: on for remote models, off for `model: local`
+  # (llama.cpp keeps its own prefix cache); a model entry's `cache: true`
+  # /`false` overrides. /cache on|off toggles + persists here, /cost shows
+  # the hits.
+  prompt_cache: true
+  # R93: offer the todo_write task-list tool. Turn off for a small local
+  # model that gains less from a plan than it loses to one more tool.
+  todo_tool: true
+  # R94: run a round's read-only tool calls (reads/greps/fetches) at once
+  # instead of one after another. Approvals and output order are unaffected.
+  parallel_tools: true
 
 # Optional: LlamaDesk (github.com/<you>/llamadesk or your own instance) is a
 # companion model-library switcher for a local llama.cpp server — lets

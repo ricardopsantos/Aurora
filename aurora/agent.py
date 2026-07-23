@@ -84,7 +84,19 @@ class Turn:
     """Outcome of one user turn, for logging + token accounting."""
     input_tokens: int = 0     # last request's prompt size (context gauge)
     billed_input: int = 0     # SUM of prompt tokens across iterations (cost)
-    output_tokens: int = 0
+    output_tokens: int = 0    # SUM of completions across iterations (cost)
+    # last request's completion size. What actually still occupies the
+    # context window is the LAST prompt plus the LAST reply — every earlier
+    # round's output is already counted inside the next round's prompt, so
+    # summing them into the gauge double-counts and overstates usage on any
+    # multi-tool turn (R90d). Cost keeps using the sums above.
+    last_output_tokens: int = 0
+    # R91: SUM of prompt tokens the provider served from its cache across the
+    # turn's iterations — the visible payoff of the cache breakpoint, shown by
+    # /cost. Not subtracted from billed_input: providers price a cache read
+    # cheaper but not free, and the discount isn't reported uniformly, so the
+    # cost estimate stays a deliberate UPPER bound.
+    cached_input: int = 0
     iterations: int = 0
     degraded: bool = False
     events: list = field(default_factory=list)
@@ -176,6 +188,8 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
         turn.input_tokens = result.input_tokens or turn.input_tokens
         turn.billed_input += result.input_tokens  # every iteration is billed
         turn.output_tokens += result.output_tokens
+        turn.last_output_tokens = result.output_tokens or turn.last_output_tokens
+        turn.cached_input += getattr(result, "cached_input_tokens", 0) or 0
         if cb.on_usage is not None:
             cb.on_usage(result.input_tokens, result.output_tokens)
 
@@ -224,6 +238,28 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                       for c in result.tool_calls}
         repeated = this_round & last_calls
         last_calls = this_round
+
+        # R94: a round's read-only calls (reads/greps/fetches — no approval,
+        # no shared state, see tools.PARALLEL_SAFE) are independent, so run
+        # them CONCURRENTLY here and consume the results in order below. The
+        # model asked for all of them in one message; making it wait for four
+        # sequential 2s web fetches is latency nobody chose. Everything
+        # user-facing — tool starts, approvals, secret challenges, the
+        # transcript, history order — stays strictly sequential.
+        # Caveat, accepted: a later "stop"/deny/cancel means some reads in
+        # this batch already ran. They have no side effects, so the only cost
+        # is work thrown away; their results are still answered `[skipped: …]`
+        # so history stays valid. The cap ask (above) runs BEFORE this, so
+        # stopping there prefetches nothing.
+        prefetched: dict[int, str] = {}
+        if tools.PARALLEL_ENABLED and not cb.cancelled():
+            batch = [(i, c.name, c.arguments)
+                     for i, c in enumerate(result.tool_calls)
+                     if c.name in tools.PARALLEL_SAFE]
+            if len(batch) > 1:
+                for i, name, args in batch:
+                    cb.on_tool_start(name, args)   # announce before running
+                prefetched = tools.run_tools_parallel(batch)
 
         for idx, call in enumerate(result.tool_calls):
             def _finish(out: str) -> None:
@@ -280,8 +316,12 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
             # allowlisted) — /rewind restores to this point
             if call.name in tools.NEEDS_APPROVAL and cb.checkpoint is not None:
                 cb.checkpoint(call.name)
-            cb.on_tool_start(call.name, call.arguments)
-            out = tools.run_tool(call.name, call.arguments)
+            if idx in prefetched:
+                out = prefetched[idx]   # already ran (and announced) in the
+                # R94 parallel batch above
+            else:
+                cb.on_tool_start(call.name, call.arguments)
+                out = tools.run_tool(call.name, call.arguments)
             # R58: scan tool output for secrets BEFORE the model (or the
             # display/log, which store the same string) ever sees it — covers
             # every tool uniformly, including read-only ones (read_file, grep)

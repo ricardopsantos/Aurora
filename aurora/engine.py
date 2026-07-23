@@ -15,7 +15,8 @@ import platform
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import agent, compact, config, context, keystore, rewind, tools
+from . import (agent, compact, config, context, keystore, rewind, todo,
+               tokens, tools)
 from . import secrets as secretscan
 from .config import load_config, persist_runtime_value
 from .frontend import Frontend
@@ -67,7 +68,11 @@ class Engine:
         self.max_iterations = int(self.runtime.get("max_iterations", 5))
         self.web = bool(self.runtime.get("web_search", True))
         self.timeout = float(self.runtime.get("timeout", 300))
+        tools.set_command_timeout(self.timeout)  # run_command honours it too (R90g)
+        tools.set_todo_enabled(self.runtime.get("todo_tool", True))       # R93
+        tools.set_parallel_tools(self.runtime.get("parallel_tools", True))  # R94
         self.redact_secrets = bool(self.runtime.get("redact_secrets", True))
+        self.prompt_cache = bool(self.runtime.get("prompt_cache", True))  # R91
         # R58: hashes of confirmed false positives (secrets.hash_value) —
         # never the raw values, so config.yaml stays safe to commit/share
         self.secret_allowlist: set[str] = set(self.runtime.get("secret_allowlist", []))
@@ -80,6 +85,19 @@ class Engine:
         self._provider = None
         self._provider_key = None
         self._limit_cache: dict = {}
+        # R95i: keys whose limit refresh is already in flight, so a burst of
+        # renders spawns ONE probe thread, not one per frame.
+        self._limit_pending: set = set()
+        # R96i: guards the check-then-add below. `.add()`/`.discard()` alone
+        # ARE atomic under the GIL — but "if key not in pending: pending.add
+        # (key)" is two operations, and two near-simultaneous callers (a UI
+        # render + the classic footer, say) can both observe "not pending"
+        # before either adds it, spawning two probe threads for one key. The
+        # lock only wraps that check-then-add, never the network call
+        # itself (which stays on the background thread, unguarded) — this
+        # must never become something the UI thread can block on.
+        import threading
+        self._limit_pending_lock = threading.Lock()
         # starting model: last one used on this machine, else the first
         # configured model that already has a usable key (never nags for a
         # key on a model nobody selected — see _default_model)
@@ -212,6 +230,27 @@ class Engine:
             self.current = {}
         return removed, new
 
+    def cache_enabled(self, model_entry: dict | None = None) -> bool:
+        """R91: should the system prompt carry a cache breakpoint for this
+        model? `runtime.prompt_cache` is the global switch; a model entry may
+        opt out (or in) with its own `cache:` flag, exactly like `tools:`.
+
+        Default per model: ON for a remote model, OFF for the `local`
+        sentinel — llama.cpp keeps its own KV-cache prefix locally, there is
+        nothing to bill and nothing to mark, and a structured (list-of-blocks)
+        system message is a needless compatibility risk against whatever
+        server happens to be loaded."""
+        e = model_entry or self.current
+        if not self.prompt_cache:
+            return False
+        if "cache" in e:
+            return bool(e["cache"])
+        return e.get("model") != "local"
+
+    def set_prompt_cache(self, on: bool) -> None:
+        self.prompt_cache = on
+        persist_runtime_value(self.cfg, "prompt_cache", on)
+
     def valid_models(self) -> list[dict]:
         """Configured models whose provider has a key available (no prompt)."""
         return [m for m in self.models if self._has_key(m.get("provider"))]
@@ -230,6 +269,7 @@ class Engine:
         provider = self._provider_for(self.current, interactive=True)
         provider.extra_body = self.current.get("extra_body") or {}
         provider.on_think = getattr(fe, "on_think", None)
+        provider.cache_prompt = self.cache_enabled()
         model = self.current.get("model", "")
         tools_enabled = self.current.get("tools", True)
 
@@ -270,8 +310,15 @@ class Engine:
                               if self.redact_secrets else None,
             secret_allowlist=self.secret_allowlist,
         )
+        before = len(self.messages)
         turn = agent.run_turn(provider, model, self.messages, self.system, cb,
                               self.max_iterations, tools_enabled, self.web)
+        # R95e: did this turn actually produce anything? The user message is
+        # popped below when it didn't, which leaves messages[-1] pointing at
+        # the PREVIOUS turn's assistant reply — logging that as a fresh
+        # `assistant` event re-records an old answer, inflating /cost's turn
+        # count (R92) and duplicating it in the markdown export.
+        produced = len(self.messages) > before
 
         # a turn that produced NOTHING (provider error / interrupt before any
         # assistant output) leaves the user message dangling — the next send
@@ -285,18 +332,31 @@ class Engine:
         # any request completed reports 0/0 — keep the previous gauge value
         # rather than showing "ctx 0" while the (popped-user-msg) history
         # still holds the earlier conversation
+        # ...and it is the LAST request's prompt + the LAST reply, never the
+        # summed output: each earlier round's reply is already inside the
+        # next round's prompt, so summing them overstates the gauge on every
+        # multi-tool turn (R90d). turn.output_tokens (the sum) stays the
+        # basis for COST below — that really is billed per round.
         if turn.input_tokens or turn.output_tokens:
-            self._used = turn.input_tokens + turn.output_tokens
+            self._used = turn.input_tokens + turn.last_output_tokens
         if hasattr(provider, "cost"):
             # billed_input sums EVERY iteration's prompt — a multi-tool turn
             # pays for the context on each round, not just the last one
             self._cost += provider.cost(model, turn.billed_input, turn.output_tokens)
         # capture the final assistant text for /copy + session log
+        if not produced:
+            return   # nothing to log — see R95e above
         last = self.messages[-1] if self.messages else {}
         text = _assistant_text(last)
         self.session.log("assistant", text=text, model=model,
                          input_tokens=turn.input_tokens,
-                         output_tokens=turn.output_tokens, degraded=turn.degraded)
+                         output_tokens=turn.output_tokens,
+                         # what /cost reads (R92): billed_input is the real
+                         # cost basis for a multi-iteration turn, input_tokens
+                         # alone is only the last round's prompt
+                         billed_input=turn.billed_input,
+                         cached_input=turn.cached_input,
+                         degraded=turn.degraded)
 
     def last_response(self) -> str:
         for m in reversed(self.messages):
@@ -310,27 +370,76 @@ class Engine:
 
     # ── context management ──────────────────────────────────────────────
     def context_stats(self) -> ContextStats:
-        provider = self._provider_for(self.current)
         model = self.current.get("model", "")
-        # cache the limit per model — the footer renders often and the local
-        # provider's limit lookup is a live /props call
-        key = (self._provider_key, model)
-        cached = self._limit_cache.get(key)
-        # 120s TTL: LlamaDesk can reload the SAME model at a different ctx
-        # (its context dropdown), so a live n_ctx must not be cached forever
-        import time as _time
-        if cached and _time.time() - cached[1] < 120:
-            limit = cached[0]
-        else:
-            limit = provider.context_limit(model)
-            self._limit_cache[key] = (limit, _time.time())
+        if not model:
+            # no model configured (possible after /model remove of the last
+            # entry, R81) — don't build a keyless, URL-less provider on every
+            # status render just to ask it for a limit it can't know (R90g)
+            return ContextStats("", self._used, 0, self._cost, self.session.id)
+        provider = self._provider_for(self.current)
+        limit = self._context_limit_nonblocking(provider, model)
         known = bool(getattr(provider, "has_pricing", None)) and provider.has_pricing(model)
         return ContextStats(model, self._used, limit, self._cost,
                             self.session.id, cost_known=known)
 
+    def _context_limit_nonblocking(self, provider, model: str) -> int:
+        """The context limit for the gauge, WITHOUT ever blocking the caller
+        (R95i).
+
+        `context_stats()` is called by the TUI's `status()` — i.e. on the UI
+        event-loop thread, on every render. For the `local` model the limit
+        lookup is a live `/props` call behind an endpoint probe, so a backend
+        that is down froze the whole app for ~6s each time the cache expired.
+        `live_context_limit` already carried a comment about this class of
+        freeze; only the remote half had been fixed.
+
+        So: serve the cache immediately and refresh it on a daemon thread.
+        The 120s TTL is unchanged (LlamaDesk can reload the same model at a
+        different ctx, so a live n_ctx must not be cached forever) — only the
+        waiting moved off the render path. A failed refresh caches the static
+        fallback, so a down backend backs off for the TTL instead of spawning
+        a probe per render.
+        """
+        import threading
+        import time as _time
+        key = (self._provider_key, model)
+        cached = self._limit_cache.get(key)
+        if cached and _time.time() - cached[1] < 120:
+            return cached[0]
+
+        with self._limit_pending_lock:
+            already_pending = key in self._limit_pending
+            if not already_pending:
+                self._limit_pending.add(key)
+
+        if not already_pending:
+
+            def _refresh() -> None:
+                try:
+                    live = provider.context_limit(model)
+                except Exception:
+                    live = 0
+                try:
+                    fallback = provider.static_context_limit(model)
+                except Exception:
+                    fallback = 0
+                self._limit_cache[key] = (live or fallback or 128_000,
+                                          _time.time())
+                self._limit_pending.discard(key)
+
+            threading.Thread(target=_refresh, daemon=True).start()
+
+        if cached:
+            return cached[0]   # stale beats blocking
+        try:
+            return provider.static_context_limit(model)
+        except Exception:
+            return 128_000
+
     def clear(self) -> None:
         self.messages = []
         self._used = 0
+        todo.clear()   # R93: the task list belongs to the conversation
         self.session.log("clear")
 
     def reset(self, cwd: str = ".") -> None:
@@ -368,6 +477,11 @@ class Engine:
             self.messages = [{"role": "user", "content": body}]
         else:
             self.messages = [compact.flattened_as_user_message(self.messages)]
+        # the gauge reflects the LAST turn's billed prompt size, which no
+        # longer exists once history is folded — re-estimate from what
+        # actually survives so it (and the >80% /compact hint) drop with it
+        self._used = tokens.estimate_tokens(
+            str(self.messages[0].get("content", "")))
         self.session.log("compact", folded=n, summarized=bool(summary))
         return n
 
@@ -483,7 +597,7 @@ class Engine:
         past = Session(session_id)
         restored = 0
         msgs: list[dict] = []
-        for r in past.records():
+        for r in past.iter_records():
             ev, text = r.get("event"), r.get("text", "")
             if ev not in ("user", "assistant") or not text:
                 continue
@@ -493,6 +607,16 @@ class Engine:
         if restored:
             self.messages = msgs
             self.session = past  # keep appending to the same log
+            # the gauge would otherwise read 0 on a resumed session until the
+            # first new turn, while a full history is already loaded (R90g).
+            # Estimated, not exact: the real count only comes back with the
+            # next provider response.
+            # R96k: sum the lengths instead of materializing the whole
+            # history as one joined string just to take len(...) // 4 — same
+            # answer (a plain "".join adds no separator chars), without the
+            # transient full-history copy on a long resumed session.
+            total_chars = sum(len(str(m.get("content", ""))) for m in msgs)
+            self._used = total_chars // 4
         return restored
 
 

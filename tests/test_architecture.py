@@ -39,12 +39,21 @@ def test_engine_never_imports_ui_toolkit():
 
 
 def test_engine_never_imports_concrete_ui_module():
+    """Catches RELATIVE imports too (R90a). `from .ui import x` parses as
+    module='ui', level=1 — an endswith('.ui') check on `module` alone never
+    matched it, and exactly that import (engine.py reaching for
+    ui.estimate_tokens) sat in the engine unnoticed while this test passed."""
     for path in _engine_files():
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module:
-                assert not node.module.endswith((".ui", ".clipboard")), \
-                    f"{path.name} imports a concrete UI module ({node.module})"
+            if isinstance(node, ast.ImportFrom):
+                dotted = "." * (node.level or 0) + (node.module or "")
+                assert not dotted.endswith((".ui", ".clipboard")), \
+                    f"{path.name}:{node.lineno} imports a concrete UI module ({dotted})"
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert not alias.name.endswith((".ui", ".clipboard")), \
+                        f"{path.name}:{node.lineno} imports a concrete UI module"
 
 
 def test_engine_does_no_terminal_io():

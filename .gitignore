@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 sessions/
 .DS_Store
 config.yaml

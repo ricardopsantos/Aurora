@@ -73,13 +73,31 @@
   the system prompt so Aurora runs it herself; her writes pass the normal
   approval gate. `open_context_doc` lazy-loads docs on summary match.
 - **R13.** Live footer, updated every turn:
-  `model │ tokens used/max (%) │ $cost │ session-id`. Anthropic: exact `usage`
-  from responses + static limit table + price table. Local: `usage` from
-  llama.cpp + live `n_ctx` from `/props`. No cost shown for local (free).
+  `model │ tokens used/max (%) │ $cost │ session-id`. Token counts are the
+  provider's own `usage` from the response. The context LIMIT comes from
+  llama.cpp's live `n_ctx` via `/props` for the `local` model, and from the
+  per-model table (`providers/remote_context_limits.json`) → config's
+  provider-level `context_limit` → a 128k default for any remote model
+  (R71). Cost renders only when that model's per-token price is actually
+  known (R73) — never a bare `$0.00` implying "free". *(This requirement
+  originally described Anthropic's static limit/price tables; that provider
+  was removed 2026-07-15, R74 — rewritten 2026-07-22 to the OpenAI-compat
+  reality, no behaviour change.)*
 - **R14.** **`/compact`** summarizes history into one message and continues;
   **`/clear`** starts fresh; automatic warning at ~80% context.
-- **R15.** Anthropic **prompt caching** (`cache_control` on the system prompt)
-  — the bootstrap docs are resent every turn; caching cuts that cost ~90%.
+- **R15.** *(Built pre-2026-07-15: Anthropic **prompt caching** —
+  `cache_control` on the system prompt, so the bootstrap docs resent every
+  turn cost ~90% less. See git history for the original spec.)* **REMOVED
+  2026-07-22.** It was an Anthropic-API-specific mechanism and died with the
+  provider (R74a); nothing implements it today, so the requirement is
+  retired rather than left standing as a phantom. The underlying cost is
+  real and unaddressed: the system prompt (base + `AGENTS.md` + three
+  indexes + every `[CORE]` doc) is re-sent on every request, including every
+  tool iteration of a turn, and `billed_input` bills each one (R37). If this
+  comes back it is a NEW requirement against OpenAI-compatible caching
+  (OpenRouter `cache_control` breakpoints), not a revival of this one —
+  historical numbering preserved, not reused for something else.
+  **That new requirement landed the same day: see R91.**
 
 ### UX
 - **R16.** Streaming output, plain text (byte-faithful for copy).
@@ -148,7 +166,8 @@ aurora/
   frontend.py      # the engine ⇄ UI Protocol (streaming, approvals, secrets)
   agent.py         # tool loop: cap w/ continue-blocks, s/c/n-reason approvals,
                    #   loop-nudge on repeated calls, Esc cancel
-  tools.py         # the nine tools (R6) + 60k-char output cap
+  tools.py         # the tools (R6) + 60k-char output cap + the R94
+                   #   parallel-safe read-only set
   approve.py       # gate + persistent pattern allowlist + diff preview
   context.py       # agentic_context bootstrap + open_context_doc tool
   llamadesk.py     # optional local library: models(+native ctx/size), status, switch, wait
@@ -161,14 +180,16 @@ aurora/
   clipboard.py     # OSC52 + pbcopy/wl-copy/xclip
   keystore.py      # env → keyring → Fernet file → prompt (+ key_fetch, injectable prompter)
   skills.py        # /skills · /name args (repo skills/ + AURORA_HOME/skills/)
-  session.py       # JSONL logging + --continue/resume/export
+  session.py       # JSONL logging + --continue/resume/export (streamed)
   websearch.py     # web_search (ddgs) + web_fetch
   paths.py         # AURORA_HOME resolution
+  tokens.py        # local token estimate/format (engine-side, R90a)
+  todo.py          # the model's own task list (R93) + todo_write tool
 install.sh         # venv + editable install + PATH symlink + data-dir marker
 config.yaml        # committed: providers, models(+extra_body), runtime, llamadesk, key_fetch
 tests/             # test_core, test_finish, test_architecture, test_memory,
                    #   test_rewind, test_secrets, test_tui,
-                   #   test_expand_newlines (178 tests)
+                   #   test_expand_newlines, test_bootstrap_network (263 tests)
 ```
 
 Phases (each ended runnable) — **all seven DONE**:
@@ -182,10 +203,12 @@ Phases (each ended runnable) — **all seven DONE**:
 
 ## 3. Test plan
 
-Automated — **178 tests passing** (`tests/test_core.py`, `tests/test_finish.py`,
+Automated — **263 tests passing** (`tests/test_core.py`, `tests/test_finish.py`,
 `tests/test_architecture.py`, `tests/test_memory.py`, `tests/test_rewind.py`,
-`tests/test_secrets.py`, `tests/test_tui.py`, `tests/test_expand_newlines.py`;
-pytest, no network — providers mocked):
+`tests/test_secrets.py`, `tests/test_tui.py`, `tests/test_expand_newlines.py`,
+`tests/test_bootstrap_network.py`; pytest, no network — providers mocked, with
+the single deliberate exception of test_bootstrap_network (R86), which skips
+rather than fails when offline):
 - config: env expansion, missing-key errors, `/max` persistence
 - allowlist: pattern matching (command prefixes, path globs), persistence round-trip
 - tools: read/write/edit/grep against a tmpdir; edit_file rejects non-unique anchors
@@ -790,13 +813,9 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
     queue — the UI thread can call that back on itself with no blocking
     involved at all.
 
-### `/remember` temporarily hidden from discovery (2026-07-12)
-- **`/remember` (R52) is being reworked** and is hidden from `/` autocomplete
-  and the README's command table while that's in progress — removed from
-  `COMMAND_INFO` in `ui.py`. The command ITSELF still works if typed manually
-  (`elif cmd == "remember":` in `_handle_command` is untouched) — only
-  discovery is disabled, not the feature. Re-add its `COMMAND_INFO` entry
-  (and the README row) once the rework lands.
+### `/remember` temporarily hidden from discovery (2026-07-12) — superseded by R87
+- **`/remember` (R52) was reworked** and is back in `/` autocomplete and the
+  README's command table — see R87 below for the landed rework.
 
 ### `aurora key clear` / `aurora wipe` — logging out (2026-07-12, R60)
 - **R60. `aurora key clear <VAR>` / `--all`** removes a stored key from every
@@ -1335,6 +1354,987 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   and ricardopsantos.org/aurora) now shows Aurora at boot offering to run
   this prompt — banner, bootstrap ask menu, collapsed input, two-line
   status bar, rendered in the TUI's real colors/layout.
+
+### `/compact` gauge fix (2026-07-22, R84)
+- **R84. The context-usage gauge and its `>80% — /compact?` hint now drop
+  immediately after `/compact`.** `Engine.compact_history()` folded the
+  message history but never reset `Engine._used`, which the footer's
+  `context_stats().pct` reads directly — so the gauge (and the derived
+  80% warning, driven by the same `pct`) kept showing the pre-compact
+  value until the next real turn overwrote it. Fixed by re-estimating
+  `_used` from the folded summary's token count right after the fold.
+
+### Model picker: ESC to cancel (2026-07-22, R85)
+- **R85. The model-picker `select()` menu (`/model`) can be dismissed with
+  a bare Esc.** Every other `select()`/confirm menu in the TUI still
+  requires an explicit pick (arrow keys + Enter, or a number key) — Esc is
+  a no-op while they're open, by design. The model picker is the one
+  exception: it's a picker over the CURRENT model, so backing out with no
+  change is a valid outcome, same as a second click on the status bar's
+  model name (`_open_model_picker`). `TuiFrontend._on_escape` special-cases
+  `self._menu_prompt == "Select model"` to push `None` onto the answers
+  queue instead of doing nothing; `ui._pick_model`'s existing `chosen is
+  None` branch already treated that as "no change." The status-bar tip
+  during that menu also now reads "select one, or ESC to cancel" instead of
+  the generic "select one" shown for every other menu.
+
+### `/bootstrap set` accepts a URL; startup offers cached-vs-redownload (2026-07-22, R86)
+- **R86. `/bootstrap set <url>`** downloads the URL's contents (plain GET,
+  no HTML stripping — bootstrap prompts are markdown/plain text, e.g. a
+  GitHub raw link) and caches them the same way a local file/paste would,
+  via `bootstrap.fetch_url()`/`bootstrap.is_url()`. The URL itself is
+  remembered in a `bootstrap.md.source` sidecar file
+  (`bootstrap.save(..., source_url=...)`) next to the cached prompt —
+  project vs global sidecar mirrors whichever `bootstrap.md` it belongs to.
+  Overwriting a URL-sourced prompt with a plain paste/file drops the stale
+  sidecar; `/bootstrap clear` removes it too.
+- **Startup now asks a 3-way choice when the active bootstrap prompt is
+  URL-sourced:** run the cached copy (default), re-download and run, or
+  skip — instead of silently doing either every session.
+  `ui._bootstrap_run_choice(url)` returns the plain "run"/"skip" yes-no
+  choice when there's no URL, or the 3-way `select()` when there is;
+  `_run_bootstrap(engine, fe, redownload=True)` re-fetches via
+  `bootstrap.refresh_from_source()` (re-downloads, re-persists to the same
+  path, keeps the sidecar) before running, falling back to the cached copy
+  if the re-fetch fails. Shared by both the classic REPL (`ui.run`) and the
+  TUI worker (`TuiFrontend._worker`) — the TUI's `ui.select`/`ui.confirm`
+  monkeypatch means the same helper renders correctly in both frontends.
+  `/bootstrap show` also displays the origin URL when one is set.
+- **Tested against a real URL, not just a mocked `fetch_url`:**
+  `tests/test_bootstrap_network.py` is the one deliberate exception to the
+  rest of the suite's no-network rule — it downloads the AgenticContext
+  repo's `MAIN_PROMPT.md`
+  (`https://raw.githubusercontent.com/ricardopsantos/AgenticContext/refs/heads/main/MAIN_PROMPT.md`)
+  for real via `set`/`refresh_from_source`, skipping (not failing) if the
+  network isn't reachable.
+
+### `/remember` scoped save + ~/AURORA_PFCS fallback (2026-07-22, R87; fallback path revised same day)
+- **R87. `/remember [all|last [k]]`** controls how much of the session
+  `memory.py` checks before saving: no argument or `last` checks just the
+  last question/reply pair, `last k` the last `k` pairs, `all` the whole
+  session (the original R52 scope, still what "save everything" means
+  when explicitly asked for). `memory._last_k_messages` slices `engine.
+  messages` at the k-th-last user-role message and keeps everything after
+  it, so a multi-iteration tool-call reply is kept whole. A malformed
+  argument (e.g. `last abc`) prints usage instead of guessing. Restored to
+  `/` autocomplete and the README table (superseding the 2026-07-12
+  hide-while-reworking note above).
+- **`~/AURORA_PFCS/MEMORY/` fallback when there's no real `.agentic_context`
+  (originally `AURORA_MEMORY/` at the project root; revised same day).**
+  `find_context_root` now requires BOTH a `KNOWLEDGE/` and a `MEMORY/`
+  subfolder to count — a bare `MEMORY/` alone no longer qualifies. When
+  neither is found walking up from cwd, `/remember` writes findings flat
+  into `memory._fallback_root()` (`Path.home() / "AURORA_PFCS" / "MEMORY"`)
+  instead of refusing outright — deliberately a FIXED, machine-wide
+  location, not per-project, since there's no project root to anchor a
+  per-project fallback to when the whole point is that none was found.
+  Same house `.md` format (title/`> summary:`/discovered/context/body) via
+  `render_finding(..., flat=True)`, but no group subfolders and no
+  INDEX.md/rebuild-index.sh step (that tooling is specific to
+  `.agentic_context`) — the notify message says so explicitly.
+
+### `find_context_root` detects by contents, never by folder name (2026-07-22, R88)
+- **R88. `memory.find_context_root` no longer hardcodes `.agentic_context`
+  as a literal path segment.** It walks up from cwd and, at each ancestor,
+  checks every immediate subfolder for BOTH a `KNOWLEDGE/SKILL.md` and a
+  `MEMORY/SKILL.md` — whichever subfolder has both, regardless of its own
+  name, is the context root. `.agentic_context` remains the convention
+  (and what this repo itself uses), but a differently-named folder with
+  the same shape is now found too. Requiring the `SKILL.md` files (not
+  just the `KNOWLEDGE`/`MEMORY` dirs) rules out an unrelated folder that
+  happens to have similarly-named subfolders with no actual content.
+
+### `/agentic_report` command + status-bar link (2026-07-22, R89)
+- **R89. `/agentic_report`** (`ui._agentic_report_cmd`): asks "Stats" or
+  "Index" via the normal `select()` menu. **Stats** runs the context
+  folder's own `scripts/stats.sh` (size/count stats for
+  KNOWLEDGE/MEMORY/SKILLS — `memory.run_stats`) as-is. **Index**
+  pretty-prints `KNOWLEDGE/INDEX.md` and `MEMORY/INDEX.md` through
+  `mdrender.LineRenderer` (the same markdown→ANSI renderer chat replies
+  use) instead of dumping raw markdown.
+- **Only exists as far as the user is concerned when a context protocol
+  folder is detected** (`memory.find_context_root(".")`, by contents —
+  R88): hidden from `/` autocomplete (`SlashCompleter.__init__` computes
+  `self._has_agentic_context` once per completer lifetime, not per
+  keystroke) and from `/help`/`?` (`ui.help_text(has_agentic_context)`
+  appends the `/agentic_report` line only when true). Typing it manually
+  when nothing is detected still works and just says so — same
+  discoverability-only pattern as `/remember`'s 2026-07-12 hide (R52's
+  note above).
+- **The TUI's line-1 status bar shows a clickable, underlined "agentic
+  report" link** — same `class:status.id` style as "session id"/"copy
+  last"/"copy all" — under the same detection, cached once as
+  `self._agentic_root` in `Tui.__init__` (not re-walked on every render
+  tick). Clicking it (`_agentic_report_click`) queues `/agentic_report`
+  onto the worker's inbox exactly like the model-picker click queues
+  `/model` — the Stats/Index choice is a blocking `select()`, which must
+  never run on the UI thread.
+
+### Deep-dive batch 3: boundary guard, tool reach, gauge, scan cost (2026-07-22, R90)
+From a full requirements-vs-code review of the whole project.
+- **R90a. The engine/UI boundary is enforced against RELATIVE imports too.**
+  `engine.py`'s `compact_history` did `from .ui import estimate_tokens`,
+  pulling `prompt_toolkit` into the engine half and breaking R25 — and
+  `test_architecture.py` passed the whole time, because it checked
+  `node.module.endswith(".ui")` and a relative `from .ui import x` parses as
+  `module="ui", level=1`, which never matches. The guard now rebuilds the
+  dotted name from `level` (and also checks plain `import` statements), and
+  the two token helpers moved out of `ui.py` into a new engine-side
+  **`aurora/tokens.py`** (`estimate_tokens`, `fmt_token_count`), re-exported
+  from `ui` since the TUI and tests already reach for them as `ui.<name>`.
+  A silently-broken invariant test is worse than no test: this one is
+  load-bearing for the "swap the UI, keep the engine" promise.
+- **R90b. The read/search tools can actually reach what they're told to.**
+  - `grep` runs with **`-E`** (extended regex), not the default BRE. Models
+    write ERE by habit (`(foo|bar)`, `a+`, `x?`); under BRE those are
+    literals, so the search returned `[no matches]` — a SILENT wrong answer,
+    the worst failure mode for an agent, which then concludes the code
+    doesn't exist.
+  - `read_file` takes optional **`offset`/`limit` (1-based line range)**,
+    streamed, never slurping the file. The truncation notice already told
+    the model to "read a specific range" after a big file; there was no
+    parameter to do it with, so its only recourse was re-reading the same
+    head. The notice now names the parameters.
+- **R90c. ONE context-root detector, shared by every surface.** R88 made
+  `memory.find_context_root` name-agnostic (by contents: an immediate
+  subfolder with BOTH `KNOWLEDGE/SKILL.md` and `MEMORY/SKILL.md`, hidden or
+  not, nearest first walking up) but `context.py` — the module that does the
+  actual **bootstrap** and backs `open_context_doc` — still hardcoded
+  `.agentic_context` as a literal path segment AND only looked in the cwd,
+  never walking up. A differently-named folder was found by `/remember` and
+  `/agentic_report` yet never bootstrapped; a subdirectory of a project
+  bootstrapped nothing at all. The detector now lives in `context.py`,
+  `context.detect()` is that function, and `memory.find_context_root` is a
+  re-export of it — one implementation, one answer.
+  - Call sites unified on the **CWD** as well: the `/`-autocomplete and
+    `/help` gates keyed on the config's `_base_dir`, which is the Aurora
+    checkout — it has its own context folder, so `/agentic_report` was
+    offered in every project and then reported "nothing detected" when run.
+- **R90d. The context gauge counts what's actually in the window.** It read
+  `input_tokens + output_tokens`, where `input_tokens` is the LAST request's
+  prompt but `output_tokens` is the SUM of completions across every
+  iteration (R37's cost accounting). Each earlier round's reply is already
+  inside the next round's prompt, so summing them double-counted and
+  overstated the gauge — and with it the ≥80% `/compact` hint — on every
+  multi-tool turn. `Turn.last_output_tokens` (new) feeds the gauge;
+  `output_tokens`/`billed_input` still feed cost, which really is billed per
+  round.
+- **R90e. `secrets.scan` is linear again.** Overlap tracking was a list of
+  `(start, end)` spans that every later candidate re-scanned — O(matches²)
+  on a match-dense block (a fixtures file of UUIDs, a big `.env`, a
+  token-heavy log), on the worker thread, on by default. It's now a
+  per-character `bytearray` mask: O(span) to claim, O(span) to test.
+  Behaviour is identical — first claim on a span still wins, spans never
+  overlap (they'd misalign `redact`'s right-to-left substitution).
+- **R90f. Smaller reach/robustness fixes.**
+  - `run_command` takes an optional **`cwd`** (the model had to prefix every
+    call with its own `cd … && …`, which breaks the moment a path needs
+    quoting) and honours **`runtime.timeout`** instead of a hardcoded 300s a
+    user couldn't reach.
+  - `edit_file` takes **`replace_all`** — renaming a symbol that appears 20×
+    was 20 uniquely-anchored calls. The unique-anchor guard is unchanged by
+    default and its error message now names the escape hatch.
+  - `Session.iter_records()` **streams** the JSONL; `export_markdown` and
+    `resume_from` use it. A session log is unbounded by design (R20, nothing
+    is auto-deleted) and both used to hold the whole file in memory on top
+    of the parsed records. A corrupt line is still skipped, never fatal.
+  - `resume_from` **re-estimates the context gauge** from the restored
+    history — it read 0 until the first new turn while a full conversation
+    was already loaded.
+  - `context_stats()` **returns early when no model is configured**
+    (possible since `/model remove`, R81) instead of building a keyless,
+    URL-less provider on every status render.
+
+### Prompt caching, provider-agnostic (2026-07-22, R91)
+- **R91. The system prompt is marked as a cache breakpoint so it isn't
+  re-billed on every request.** The successor to the retired R15 (which was
+  Anthropic-API-specific and died with that provider), rebuilt on the
+  OpenAI-compatible mechanism so it works for whatever `openai_compat`
+  talks to.
+  - **Why it matters here specifically:** Aurora's system prompt is not a
+    one-liner — it's the base preamble + `AGENTS.md` + all three `INDEX.md`
+    files + every `[CORE]` doc (~6k tokens in this repo). It is re-sent on
+    every request, and a turn makes one request per tool iteration, each
+    billing the full prompt (R37). A five-tool turn paid for that preamble
+    five times.
+  - **Mechanism**: `openai_compat._system_message(system, cache)` sends the
+    system message as a content block carrying
+    `cache_control: {"type": "ephemeral"}` instead of a plain string. This
+    covers both halves of the OpenAI-compatible world: OpenAI/DeepSeek-style
+    backends cache long prefixes automatically and ignore the marker;
+    Anthropic-family models routed through OpenRouter cache ONLY at an
+    explicit breakpoint. The system prompt is the right (and only sensible)
+    breakpoint — it's the one part byte-identical across a whole session.
+  - **Under `_CACHE_MIN_CHARS` (4k chars ≈ 1k tokens) the marker is not
+    sent at all** and the payload is byte-identical to the pre-R91 shape.
+    Anthropic won't cache below ~1024 tokens anyway, and a cache WRITE costs
+    more than a plain read — marking a short prompt is a pure loss.
+  - **Per-model, defaulting sensibly**: `Engine.cache_enabled()` — global
+    `runtime.prompt_cache` (default on, `/cache on|off` persists it), then a
+    model entry's own `cache:` flag if present (same shape as `tools:`),
+    else ON for a remote model and **OFF for the `local` sentinel**:
+    llama.cpp keeps its own KV prefix cache locally, there is nothing to
+    bill and nothing to mark, and sending it a structured system message is
+    needless compatibility risk.
+  - **Plumbed as an attribute** (`provider.cache_prompt`), set per turn by
+    `Engine.send` exactly like `extra_body`/`on_think` — the `Provider.turn`
+    signature is unchanged, so no front end, subclass or test fake had to
+    move.
+  - **The payoff is visible, not assumed**: `usage.prompt_tokens_details.
+    cached_tokens` is read into `TurnResult.cached_input_tokens`, summed
+    across a turn into `Turn.cached_input`, logged per turn, and reported by
+    `/cost` (R92). It is **not** subtracted from `billed_input` — a cache
+    read is cheaper but not free and the discount isn't reported uniformly,
+    so the cost estimate stays a deliberate UPPER bound rather than a
+    confidently wrong lower one.
+
+### `/cost` — per-model token and $ breakdown (2026-07-22, R92)
+- **R92. `/cost [all]`** shows turns / billed input / output / cached tokens
+  / estimated $ per model, for the current session or (`all`) every session
+  logged on this machine.
+  - **A pure read over data Aurora already writes.** Every `assistant` event
+    in the session JSONL has carried `model`/`input_tokens`/`output_tokens`
+    since R20; `session.usage_by_model()` just aggregates them. No new
+    bookkeeping, no state to keep in sync, and it works on sessions that
+    ended weeks ago.
+  - `send()` now also logs **`billed_input`** (the sum across a turn's
+    iterations — the real cost basis, R37) and **`cached_input`** (R91).
+    Older logs lack both: `billed` falls back to `input_tokens`, `cached`
+    to 0, so historic sessions still report, just less precisely.
+  - Pricing comes from the same per-model table as the footer badge, via
+    the new `openai_compat.price_for(model)` — the one place the table is
+    read without a live provider instance. A model with no entry prints
+    "no price" rather than a `$0.00` that would imply it was free (the same
+    honesty rule as R73's badge).
+  - The report labels itself an estimate and an upper bound (cached tokens
+    bill cheaper than shown) — it is a spending *gauge*, never an invoice.
+
+### `todo_write` — a task list for multi-step work (2026-07-22, R93)
+- **R93. The model can keep a visible task list** (`aurora/todo.py`,
+  tool `todo_write`, shown by `/todo`).
+  - **Why**: the loop nudge (R27) and the iteration cap (R9) both exist
+    because models drift on multi-step work — re-running a call, or
+    wandering off the original request three tools deep. Both are *brakes*.
+    A task list is the cheap structural fix from the other side: the model
+    writes the plan down, then re-reads its own list every time it calls the
+    tool again, so "what was I doing" is answerable from the conversation
+    instead of re-derived from the transcript.
+  - **Deliberately dumb**: a list of `{task, status}` (pending/in_progress/
+    done) in memory for the session, **rewritten wholesale** by each call —
+    no ids, no partial updates, no persistence, no file on disk. Fewer ways
+    for the model to get it wrong, and nothing to migrate later. `/clear`
+    resets it with the rest of the conversation (it belongs to the
+    conversation, not the machine).
+  - Sloppy input is tolerated rather than rejected — a bare string, a
+    `content` key instead of `task`, an unknown status — because small local
+    models produce all three and a hard error there just burns an iteration.
+    An empty list clears.
+  - `render()` is the single representation: the same text goes back to the
+    model as the tool result and is what `/todo` prints, so the two can't
+    drift.
+  - `runtime.todo_tool` (default true) removes it from the tool list
+    entirely — for a small local model that loses more to one extra tool
+    than it gains from a plan. Engine-side module: no UI imports.
+
+### Read-only tools run in parallel (2026-07-22, R94)
+- **R94. A round's read-only tool calls run CONCURRENTLY.** When the model
+  asks for four files (or three greps and a fetch) in one message, those
+  calls are independent — running them one after another is latency nobody
+  chose. `agent.run_turn` prefetches them through
+  `tools.run_tools_parallel` (a `ThreadPoolExecutor`, ≤8 workers) and the
+  sequential loop then consumes the results.
+  - **`tools.PARALLEL_SAFE` is an explicit allowlist**, deliberately NOT
+    "everything outside `NEEDS_APPROVAL`": the real test is "read-only AND
+    no shared state", which `todo_write` (R93) fails despite being ungated.
+    Members: `read_file`, `list_dir`, `grep`, `open_context_doc`,
+    `web_search`, `web_fetch` — all of them only read the filesystem or the
+    network, so ordering between them is unobservable.
+  - **Everything the user sees stays sequential and in the model's original
+    order**: tool starts (announced in order at dispatch), approvals, secret
+    challenges (R58), transcript entries, and the history messages. Only the
+    *waiting* overlaps. `run_tool` already converts every exception into a
+    `[tool error: …]` string (R42), so a worker can neither raise nor
+    corrupt shared state.
+  - Only fires with **≥2** eligible calls in a round; `runtime.parallel_tools`
+    (default true) disables it.
+  - **Accepted caveat**: a later deny/stop/cancel in the same round means
+    some reads already ran. They have no side effects, so the only cost is
+    discarded work, and their results are still answered `[skipped: …]` so
+    history stays valid. The iteration-cap ask runs BEFORE the prefetch, so
+    stopping there prefetches nothing.
+
+### Deep-dive batch 4: guards that didn't guard (2026-07-22, R95)
+Four independent findings from an audit pass, one shape: a mechanism that
+looks like it is protecting something, reports success, and isn't.
+
+- **R95a. The approval diff shows what the edit will ACTUALLY do.**
+  `approve.diff_preview` previewed `text.replace(old, new, 1)` — a hardcoded
+  count of 1 — while `tools.edit_file(replace_all=True)` (R90g) replaces
+  every occurrence. On a 3-occurrence file the human approved a one-line
+  diff and got three lines changed. The preview now passes `-1` when
+  `replace_all` is set. R8's premise is that the diff IS the change; a
+  preview that under-reports is worse than no preview, because it buys
+  consent for something else.
+- **R95b. `grep` reports errors as errors, not as "[no matches]".**
+  `grep` exits 0 for a match, 1 for no match, and **≥2 for a real error** —
+  the runner checked neither the exit code nor stderr and returned
+  `[no matches]` for an unbalanced regex or a bad path. That is exactly the
+  R90b failure mode wearing a different hat: the model reads "no matches",
+  concludes the code does not exist, and moves on instead of fixing its
+  pattern. Errors now surface as `[grep error: …]`; a genuine miss is still
+  `[no matches]`, and stdout always wins (a partial result with a
+  permission-denied warning is a result, not an error).
+- **R95c. A timed-out command dies with its whole process group.**
+  `subprocess.run(shell=True, timeout=…)` kills only the shell. Every child
+  it spawned survived, reparented to init, and kept running for the rest of
+  the session — a timed-out build, dev server or test run burning CPU
+  invisibly. `run_command` now uses `Popen(start_new_session=True)` and
+  SIGKILLs the group.
+  - **The pgid is read immediately after spawn, not at timeout.** The case
+    that matters most is a command that backgrounds something and exits
+    (`(build &)`): the grandchild keeps the stdout pipe open, so
+    `communicate()` blocks the full timeout on a shell that is already
+    gone — and `os.getpgid()` then raises `ProcessLookupError`, losing the
+    handle on the very orphan we came to kill. Looking it up late fixed the
+    easy case and missed the real one.
+  - Partial output is kept (from `TimeoutExpired.stdout`, which carries what
+    was read before the deadline) and printed above the timeout line — a
+    truncated build log is far more useful than a bare `[timeout]`.
+- **R95d. R58 detects the canonical credential spellings.** The Env-credential
+  pattern required at least one character BEFORE the credential word, so
+  `MY_API_KEY=` matched but a bare `API_KEY=`, `SECRET=`, `TOKEN=`,
+  `PASSWORD=` or `PASSWD=` — the normal shape in a `.env` file or an `env`
+  dump, and the commonest of all — matched nothing. The prefix is now
+  optional.
+  - **`PWD` keeps its mandatory prefix**, deliberately: bare `PWD=` is the
+    shell's own working-directory variable, present in every `env` dump and
+    never a credential, while `DB_PWD=` is. Widening a detector is only
+    correct if the new matches are real; this one exception is what keeps
+    the change from trading a false negative for a daily false positive.
+
+### Deep-dive batch 4, part 2: accounting, reach, and the render path (2026-07-22, R95e–j)
+The rest of the same audit. R95e–g are correctness; R95h–j are the
+performance half, all three of the same shape — work repeated on a path that
+runs far more often than the thing it is recomputing changes.
+
+- **R95e. A turn that produced nothing logs nothing.** `Engine.send` pops the
+  dangling user message when a turn dies before any assistant output (so
+  history never stacks two consecutive user turns), which leaves
+  `messages[-1]` pointing at the **previous** turn's reply — and that got
+  logged as a fresh `assistant` event. A provider outage therefore re-recorded
+  the last good answer, inflating `/cost`'s turn count (R92) and duplicating
+  the answer in the markdown export. `send` now tracks whether the turn
+  appended anything and returns early when it didn't.
+- **R95f. `read_file`'s range stops at the byte cap.** With `offset` and no
+  `limit` the loop accumulated every remaining line and truncated only at the
+  end — on a multi-GB file that is exactly the slurp the streaming loop was
+  written to avoid. It now breaks at `MAX_READ_BYTES` and reports
+  `more follow`, which was already the honest label for stopping early.
+- **R95g. File allowlist rules survive path spelling.** `run_command` rules
+  normalize their tokens (quotes stripped, `~` expanded) so equivalent
+  spellings collapse onto one rule; `write_file`/`edit_file` did a raw
+  `fnmatch` on whatever the model passed, so `~/notes.md` and its expansion
+  were two different rules and "always allow" re-prompted on the other
+  spelling. Both sides now normalize, which also keeps pre-R95g raw rules
+  working. Expanded but **not** resolved — resolving would follow symlinks
+  and collapse the `*` in a glob, and a rule is allowed to be a glob.
+- **R95h. The endpoint probe respects its own cache.** `turn()` called
+  `pick_endpoint(cache_ok=False)`, forcing a probe. But `turn()` runs once per
+  agent ITERATION, not once per user message, so a 10-round tool turn paid ten
+  extra probe round trips — invisible on localhost, real over a tailnet. It now
+  honours the 10s TTL: a human turnaround exceeds it, so failover between
+  messages is unchanged, and a connection failure still expires the cache
+  explicitly (`_working_url_at = 0.0`). `_probe` also reuses the endpoint's
+  pooled client instead of building a fresh one (and so a fresh TCP+TLS
+  handshake) per probe.
+- **R95i. The status bar never blocks on a socket.** `context_stats()` is
+  called from the TUI's `status()` — the UI event-loop thread, every render.
+  For the `local` model it ran a live `/props` lookup behind an endpoint
+  probe, so a backend that was down froze the entire app for ~6s each time
+  the 120s cache expired. (`live_context_limit` already carried a comment
+  about this exact class of freeze; only the remote half had been fixed.)
+  The cache is now served immediately and refreshed on a daemon thread:
+  - `Provider.static_context_limit()` is the new offline answer (config /
+    `remote_context_limits.json`, no network), served until the first live
+    value lands. Stale beats blocking.
+  - A failed refresh caches the static fallback, so a down backend backs off
+    for the TTL instead of spawning a probe thread per frame; `_limit_pending`
+    keeps a burst of renders to one in-flight probe.
+  - The 120s TTL itself is unchanged — LlamaDesk can reload the same model at
+    a different ctx, so a live `n_ctx` must not be cached forever. Only the
+    *waiting* moved off the render path.
+- **R95j. A live think row invalidates once per second, not once per render.**
+  Its header carries a running clock, so the transcript cache was dropped
+  outright while one existed — rebuilding the whole scrollback on the 0.5s
+  ticker AND on every keystroke, mouse move and status invalidate, for a
+  clock that changes once a second. The cache key is now the displayed whole
+  second, so it rebuilds exactly when the display would differ.
+
+### Deep-dive batch 5: the render path and per-keystroke I/O (2026-07-22, R96a–m)
+A measured performance pass over every hot path — each finding was
+benchmarked against the real code before and after, not estimated. The theme:
+work that is proportional to the whole session (or to the whole file, or to
+the whole log) sitting on a path that runs per frame, per keystroke, or per
+tool result. One candidate fix was **rejected by measurement** and is
+recorded with the others (R96i).
+
+- **R96a. The `/command` completer never touches the filesystem per
+  keystroke.** `SlashCompleter.get_completions` called `skills.discover()`
+  (a directory walk) and then `skills._blurb()` — which `read_text()`'d the
+  ENTIRE skill file and split every line — for every installed skill. The
+  TUI wires the completer with `complete_while_typing=True`, and
+  prompt_toolkit's default `get_completions_async` just iterates
+  `get_completions` inline, so all of it ran **on the event-loop thread**:
+  blocking filesystem I/O directly inside keystroke latency, and that was
+  the warm-page-cache case. Measured at 20 skills of ~16KB: **2.05ms →
+  0.089ms per keystroke (23×)**.
+  - `_blurb` now reads three bounded `readline(512)`s instead of the whole
+    file — it only ever inspected the first three lines.
+  - The listing is cached in the completer against `skills.dir_stamp()` —
+    `(path, mtime_ns)` per skills dir. A dir's mtime moves when a skill is
+    added or removed, which is exactly what `discover()`'s answer depends
+    on, so this stays correct for a skill dropped in mid-session (tested)
+    while costing two `stat()` calls. Known, accepted limit: editing an
+    existing skill's blurb line in place doesn't move the dir mtime, so that
+    one string can lag until restart; which skills *exist* is always current.
+  - `skills.discover()` / `skills.run()` / `/skills` are unchanged and still
+    read live — only the completer caches.
+- **R96b. The chat transcript renders in time independent of session
+  length.** R95j fixed *when* the transcript cache was dropped; this fixes
+  *how much* is rebuilt when it is. The per-entry parse cache (`_cache[i]`)
+  was already right, but the FLATTENED fragment list was thrown away on
+  every append — so each frame re-concatenated every fragment in the
+  session. Measured on realistic ANSI-coloured scrollback: **7.0ms/frame at
+  1MB and 33.8ms/frame at 4MB, now a flat ~1.5ms at both** — the 4MB case
+  was capping the app at ~29fps before prompt_toolkit rendered anything, and
+  it got worse for as long as the session ran.
+  - Appends always land on the LAST entry, so `_dirty(i)` now records the
+    LOWEST changed index (`_dirty_from`) and `_rebuild_locked()` re-flattens
+    only from there. `_offsets[i]` — (fragment index, line count) at the
+    point entry i begins — makes truncating to any dirty index a `del` on
+    the tail instead of a full re-concatenation.
+  - This also covers the non-tail case properly: expanding a collapsed think
+    block re-flattens from that row on, not from zero.
+  - A live think row is no longer force-re-parsed every frame (the old
+    `cached = None` did that regardless of R95j's clock key). The clock key
+    now marks just the live rows dirty when the displayed second moves,
+    which is what R95j intended.
+  - `_text_cache` is mutated in place. Safe because every reader
+    (`_render_fragments`, `_sel_text`) is on the UI thread — the worker only
+    ever marks entries dirty, never flattens.
+  - The regression test asserts **complexity, not output**: it counts
+    per-entry cache reads across 100 appends. The old code scored exactly
+    5050 (n(n+1)/2); the bound is 3n. A second test asserts the incremental
+    result is byte-identical to a naive full rebuild, including after a
+    non-tail entry changes.
+- **R96c. Drag-select stops rebuilding the whole transcript per mouse-move.**
+  `_overlay()` re-styles the dragged range in reverse video and runs on
+  every frame while a selection is live or frozen — a drag fires
+  `app.invalidate()` on every mouse-move. It early-out for fragments fully
+  outside the selection, but still did it by **appending each one to a new
+  list**, so it was O(total fragments) in both time and allocation.
+  Measured at 102k fragments: **21ms/frame → identical output, ~18×
+  faster** (constant-factor, not complexity — a fragment's position is only
+  knowable from everything before it, so the walk to the first crossed
+  fragment stays linear).
+  - Untouched fragments now come from **list slices**
+    (`frags[:i] + mid + frags[j:]`) instead of a Python-level append loop —
+    a slice is a C-level pointer copy. Only the fragments the selection
+    actually crosses go through the per-character re-split.
+  - The regression test compares directly against a copy of the pre-fix
+    implementation kept in the test file (`_overlay_naive`) rather than an
+    arbitrary threshold, so it measures the real claim (meaningfully
+    faster, same output) instead of a guessed constant.
+- **R96d. `secrets.redact()` is linear, not quadratic.** It rebuilt
+  `text = text[:m.start] + "<secret>" + text[m.end:]` per match,
+  right-to-left so earlier indices stayed valid — but every substitution
+  copies the ENTIRE string, so redacting a match-dense blob (a big `.env`,
+  a token-heavy log — exactly the case R58 exists for) was
+  O(matches × len(text)). Measured on 57KB with 1500 matches: **7.6ms →
+  0.2ms (38×)**.
+  - Now a single left-to-right pass: accumulate the untouched
+    between-matches slices plus `"<secret>"` into a list, `"".join()` once.
+    Same "earlier spans stay valid" property (every slice is read before
+    any substitution happens), linear instead of quadratic.
+  - `redact()` no longer assumes its caller passed matches in document
+    order — it sorts internally, same as before, but a test now covers
+    calling it with matches in reverse/scrambled order directly (a caller
+    may reasonably do this after filtering an allowlist).
+  - The regression test compares wall-clock scaling at 4× the matches/text:
+    quadratic old code scored ~18× the time; the bound is 8×.
+- **R96e. `/cost` stops parsing every log line to find the few it wants.**
+  `Session.iter_records()` now takes an optional `events` set; a line whose
+  substring `'"event": "<name>"'` doesn't appear for any wanted event is
+  skipped WITHOUT calling `json.loads` on it. `usage_by_model` (what `/cost`
+  and `/cost all` read) only wants `assistant` records, but `tool` records
+  dominate a session's log — one per tool result, each carrying up to 4KB of
+  output (`Engine.send`'s `output=o[:4000]`) — so parsing every line just to
+  discard most of them was most of the cost. Measured on an 8MB log:
+  **18ms → 6.9ms**.
+  - The substring check can only false-POSITIVE (a tool result whose output
+    happens to contain the literal marker text still gets parsed and then
+    correctly rejected by the real `event` check that follows) — never a
+    false negative, since every record is written by the same `log()` via
+    plain `json.dumps` defaults, so the marker's exact quoting/spacing is
+    guaranteed.
+  - `usage_all_sessions()` inherits the fix for free — it calls
+    `usage_by_model` per session log, so this is also what makes `/cost all`
+    (which reads every session ever logged, R20 never deletes them) scale
+    better with total history.
+  - `list_sessions()` was NOT touched: it already breaks at the first
+    matching record, so it's bounded by "how far into one file the first
+    real user message is," not by the log's total size — there was nothing
+    to fix there.
+  - One test asserts `json.loads` is called exactly once while filtering 3
+    lines to 1 match (a monkeypatched counting wrapper around `json.loads`
+    itself, not an internal hook); another confirms a tool-output string
+    containing the literal marker text doesn't produce a false record.
+- **R96f. The TUI stops paying for a per-turn thread it never needed.**
+  `ui._run_turn` wraps `engine.send()` in its own thread purely so the MAIN
+  thread can catch `KeyboardInterrupt` (R17) while `input()` blocks. In the
+  TUI that handler was unreachable: `SIGINT` is delivered only to the
+  process's main thread, and `_run_turn` was being called from the TUI's
+  `_worker` thread, not it; prompt_toolkit also runs the terminal in raw
+  mode, so `^C` never becomes a signal there at all — TUI cancellation is
+  entirely separate (`fe.cancel_event.set()` via the Esc-Esc menu). So every
+  TUI turn paid for an extra thread plus a 10Hz join-poll for the whole
+  duration of the turn, for a mechanism that only ever fires in the classic
+  REPL.
+  - `_run_turn`'s body split into `_send_turn` (clear cancel, begin/send/end,
+    catch-and-print an error) and a thin thread+`KeyboardInterrupt` wrapper
+    around it. The TUI's `_worker` now calls `_send_turn` directly for a
+    plain turn, and `_run_bootstrap(..., sync=True)` for the bootstrap
+    prompt — both already run on `_worker`, which is not the main thread, so
+    the wrapper bought nothing there either. The classic REPL's call sites
+    are unchanged: `_run_turn` (still thread-wrapped) and
+    `_run_bootstrap(sync=False)` (the default).
+  - This also collapses "which thread is a mid-turn key prompt on" from
+    four levels deep (UI → worker → per-turn thread → provider) to three —
+    one less thread identity a session builder has to reason about.
+  - Three tests: `_send_turn` and `_run_bootstrap(sync=True)` each assert
+    `engine.send()` runs on the CALLING thread (a fake engine records
+    `threading.current_thread()`); a third drives `Tui._worker` end-to-end
+    and asserts it reaches `ui._send_turn`, never `ui._run_turn`, guarding
+    against a regression sliding back to the thread-wrapped call.
+- **R96g. `secrets.scan()`'s shape pass skips patterns that can't possibly
+  match.** The 10-pattern shape pass ran `finditer` for every pattern over
+  the WHOLE tool result, even though 8 of the 10 require a specific literal
+  substring (`AKIA`/`ASIA`, a `gh*_` prefix, `xox*-`, `_live_`, `sk-`,
+  `Bearer`, `-----BEGIN`) that ordinary text almost never contains. Measured
+  on 60KB of ordinary source (this runs on every tool result, on the worker
+  thread, whenever `runtime.redact_secrets` is on — the default): **10.84ms
+  → 7.10ms**.
+  - `_LITERAL_GUARD` maps each pattern name to a tuple of literals (or
+    `None` for the two patterns with no fixed prefix — `GUID/UUID`'s is a
+    dash-separated hex shape, `Env credential`'s is five different
+    variable-name shapes, both always scanned) — if NONE of a pattern's
+    literals appear anywhere in the text, `finditer` is skipped entirely.
+    `in` on a plain `str` is a C-level substring search, far cheaper than
+    even a fast regex engine over the same text.
+  - **A guard only needs to be a superset of what its regex requires** —
+    correctness means "every string the regex can match contains at least
+    one guard literal," never the reverse. A looser guard (e.g. plain `"gh"`
+    instead of the five real prefixes) would still be correct, just filter
+    less; there's no failure mode from being imprecise, only from being too
+    narrow.
+  - A parametrized test checks this invariant directly against real matching
+    samples for every guarded pattern, so a future edit to `PATTERNS` that
+    adds a new prefix shape without updating its guard fails immediately —
+    the exact mistake that would turn this into a silent false negative
+    (missing a real secret) rather than a mere missed optimization.
+  - **Rejected during this same pass**: collapsing the 10 patterns into one
+    alternation regex (one `finditer` call instead of ten) measured
+    **slower** — 13.99ms vs 9.56ms unguarded — because Python's `re` doesn't
+    optimize large alternations and loses each pattern's own literal
+    prefilter that the engine could otherwise use internally. Not applied.
+- **R96h. `approve.is_allowed()` stops re-tokenizing the same allowlist
+  rule on every check.** `_norm_command` (`shlex.split` + `~` expansion) ran
+  once per RULE per check — an allowlist with 200 "always allow" entries
+  re-tokenized all 200 rule strings on every single tool call in a turn,
+  even though the rules themselves only change when the user adds one.
+  Measured: **20 rules: 147.5µs → 4.5µs (33×); 200 rules: 1453.4µs → 41.6µs
+  (35×)** per check (warmed cache; a cold call still pays one real
+  tokenization, same as before).
+  - `_norm_command` is now `functools.lru_cache(maxsize=512)`-wrapped and
+    returns a `tuple` instead of a `list` (hashable, so a shared cached
+    result can't be corrupted by one caller mutating it — every existing
+    caller only ever compares/slices/indexes it, which works identically on
+    a tuple). 512 is comfortably above any real allowlist plus a session's
+    distinct commands; a miss just re-tokenizes, so eviction costs nothing
+    beyond the one-time work this fix removes.
+  - The remaining per-check cost is the O(rules) scan itself — inherent to
+    the linear-match design, not this fix's target — so this closes the
+    tokenization overhead, not the algorithm's shape.
+  - Three tests: a monkeypatched counting wrapper around `shlex.split`
+    asserts 50 identical calls tokenize once; a correctness test confirms
+    the cache is transparent (two different strings still get their own
+    right answer); a third runs `is_allowed` 20 times over a 50-rule
+    allowlist and asserts exactly 51 real tokenizations (50 rules + the
+    incoming signature), not 50×20+20.
+- **R96i. `_limit_pending`'s check-then-add is now atomic.**
+  `Engine._context_limit_nonblocking` (R95i) tracks which cache keys already
+  have a refresh probe in flight so a burst of renders spawns one probe, not
+  one per frame — but `if key not in pending: pending.add(key)` is two
+  operations, and the code comment claimed this was "atomic under the GIL,
+  no lock needed," which is true of `.add()`/`.discard()` alone but not of
+  the `if` around them. Two near-simultaneous callers (a TUI render racing
+  the classic footer, say) could both observe "not pending" before either
+  added the key, spawning two probe threads for one key.
+  - `Engine.__init__` now creates `self._limit_pending_lock`
+    (`threading.Lock`), and `_context_limit_nonblocking` wraps only the
+    check-then-add in it — never the network call itself, which stays on
+    the background `_refresh` thread, unguarded. The lock is never held
+    across anything that could block, so it can't turn into a stall on the
+    UI thread (the one invariant this whole code path exists to protect).
+  - The consequence was bounded (one wasted probe thread, never
+    corruption), so this is a correctness/cleanliness fix, not a
+    user-visible latency one.
+  - The regression test needed care: a plain concurrent-threads test passed
+    even on the UNFIXED code across 8 runs, because CPython's GIL makes the
+    real check-then-add race too narrow to hit by chance. The test
+    deterministically forces the window open with a `set` subclass whose
+    `__contains__` sleeps after reading, and the fake probe stays "in
+    flight" for the test's duration so a probe that legitimately finishes
+    and `discard()`s its key mid-test isn't mistaken for the bug.
+- **R96j. `_client_for()` no longer leaks the losing side of a connection-
+  pool race.** Two threads can race to build a client for the same
+  not-yet-pooled endpoint (the worker mid-turn vs. the UI thread's `/props`
+  status probe, both call `_client_for`) — `self._http.setdefault(base_url,
+  new_client)` correctly makes both callers converge on whichever client won
+  the race, but the LOSER's freshly built `httpx.Client` (a real connection
+  pool — sockets, not just Python memory) became unreachable from anywhere
+  except the local variable that built it, and was never `close()`d. Rare
+  (only the first touch of an endpoint can race) but a genuine fd leak.
+  - Renamed the local to `new_client` and compare it against what
+    `setdefault` actually returned: `if client is not new_client:
+    new_client.close()`. The winning client (whichever one is now shared) is
+    never touched.
+  - The regression test forces the race deterministically rather than hoping
+    two real threads happen to interleave at the right instant: a patched
+    `httpx.Client` constructor holds the FIRST call open on a barrier while a
+    second call runs to completion and installs its own client first, so the
+    first call's build is guaranteed to be the one `setdefault` discards.
+    Asserts both callers converge on the same client, the discarded one gets
+    `close()`d, and the shared one never does.
+- **R96k. `resume_from`'s token estimate no longer copies the whole history
+  first.** `tokens.estimate_tokens("".join(str(m.get("content", "")) for m
+  in msgs))` built one big string spanning every restored message just to
+  take `len(...) // 4` — a transient full-history-sized allocation on every
+  resumed session, for no reason: a bare `"".join` adds no separator chars,
+  so `sum(len(...))` is the identical number without ever materializing the
+  joined string. Trivial in cost (this pass's smallest finding), included
+  for completeness.
+  - A pinned-value test (`(123 + 77 + 50) // 4`) guards the exact number
+    against future drift — this fix is a pure refactor with identical
+    output before and after, so unlike the other findings here there is no
+    "fails without the fix" version of this test to write; the existing
+    R90g gauge-restoration test already covered the behavior.
+- **R96l. P6 (`append()`'s `+=` amplification into a `_MERGE_LIMIT`-sized
+  entry) investigated, NOT applied — like R96g's union-regex, recorded here
+  because it was tried and measured, not skipped.** The original audit
+  suggested lowering `_MERGE_LIMIT` now that R96b makes the render cache
+  tail-incremental (more, smaller entries no longer costs an O(session)
+  rebuild per extra one). Measured against that premise:
+  - **Shrinking `_MERGE_LIMIT`** (4096 → 256): append cost drops only ~7%
+    (67.5ms → 62.5ms per 1MB streamed) — the original report's 4096-vs-65536
+    comparison made the effect look larger than it is; the curve is flat
+    below 4096. Meanwhile `_live_clock_key()` (scans every open think row
+    per frame) and every other O(entries) path get proportionally SLOWER as
+    entry count rises 16× (measured: 10.9µs → 158.4µs per call). Under a
+    live think row — exactly when this matters, since that's what makes
+    `_live_clock_key()` run every frame — this is a net loss, not a win.
+  - **List-based accumulation** (buffer chunks in a list, join lazily
+    instead of repeated `+=`) gets the real fix — no `+=` amplification at
+    all, at the SAME entry granularity, so no downside on the O(entries)
+    paths: **60.2ms per 1MB, ~20% better than today**, with no tradeoff.
+    But it means an accumulating entry is no longer always a plain `str` —
+    it touches all 6 places in `tui.py` that branch on
+    `isinstance(item, str)` / `isinstance(item, dict)` to distinguish plain
+    text from a think-row dict, in the same file R96b/R96c just reworked.
+  - **Not applied.** The real-world magnitude here is sub-millisecond per
+    typical LLM response either way (a few KB of streamed text, not
+    megabytes) — genuinely the smallest-impact finding in this whole pass
+    once measured precisely, and not worth the integration risk of a third
+    consecutive change to this file's core render-cache invariants for that
+    payoff. Revisit if a future profile shows streaming append actually
+    costing something a user would notice.
+- **R96m. `grep` bounds the PRODUCER, not just the final string — the one
+  finding in this whole pass with a real failure mode (OOM), not just
+  latency.** `subprocess.run(capture_output=True, ...)` buffered grep's
+  COMPLETE stdout before the old `out[:MAX_READ_BYTES]` truncation ever ran.
+  A broad pattern over a large tree (`grep -rn "e" ~`) can produce gigabytes
+  within the 30s timeout — and the model, which picks its own search
+  pattern and path, is exactly the actor most likely to issue an
+  over-broad one.
+  - `grep` now uses `subprocess.Popen` directly and reads stdout
+    INCREMENTALLY via `select.select([proc.stdout], [], [], remaining)`,
+    where `remaining` is recomputed from a wall-clock deadline every
+    iteration — so a stall between chunks (not just total elapsed time) is
+    still caught by the same loop, not a separate mechanism. The process is
+    `kill()`ed the moment `MAX_READ_BYTES` worth of stdout has arrived,
+    instead of being left to keep producing output that would only be
+    discarded at the string-slicing step.
+  - The whole process lifecycle (kill decision, draining stderr, closing
+    both pipes, `wait()`) is now in a `finally` block — ANY exit from the
+    read loop (normal EOF, truncation, timeout, or an unexpected exception)
+    still reaps the child. Without this, an exception mid-loop would hit the
+    function's outer `except Exception` and return before the process was
+    ever waited on — the same zombie/orphan class of bug R95c's
+    process-group kill exists to prevent for `run_command`, just via a
+    different mechanism here (no shell, so no process GROUP to kill —
+    grep itself is the only process, and `kill()` is enough).
+  - Output truncation now carries an explicit
+    `[output truncated at N chars — narrow the pattern/path]` notice, same
+    spirit as `read_file`'s and `run_command`'s existing truncation
+    markers. The old code silently sliced the string with no notice at all
+    — a real, if minor, side-effect improvement this fix surfaced.
+  - **Three tests, each needed care to actually discriminate old vs. new
+    behavior** (the naive version of two of them passed on the OLD code
+    too, since both old and new code produce the same truncated final
+    string):
+    - A truncation test against ~20MB of real matches with the cap set
+      tiny, asserting the killed process's returncode is **negative**
+      (`SIGKILL` → `-9` on POSIX) — the only way to prove the producer,
+      not just the string, was actually bounded, since grep finishes this
+      workload well inside 30s if left to run.
+    - A timeout test that patches `select.select` to report "never ready"
+      against a real (harmless, fast) grep process, asserting the timeout
+      message fires and the process is still reaped.
+    - A correctness test confirming an ordinary under-the-cap search still
+      returns every match, complete and untruncated.
+
+### R97. `apply_patch` — a real multi-hunk diff tool
+`edit_file` needs one call per uniquely-anchored change; five small,
+unrelated edits in one file meant five approvals, or a `write_file` of the
+whole thing (loses granularity, riskier on a large file). `apply_patch`
+takes one unified diff — the format every model has seen a million times as
+`git diff`/`diff -u` output — and applies every hunk as ONE atomic change:
+all hunks match and apply, or none do and the file is untouched.
+
+- **New engine-side module `aurora/patch.py`** (no I/O, no UI imports):
+  `parse(diff_text) -> list[Hunk]` and `apply(text, hunks) -> str`. A `Hunk`
+  is `(old, new, header)` — `old`/`new` are the joined context+removed /
+  context+added lines, `header` is the raw `@@ ... @@` line kept only for
+  error messages.
+- **Hunks are matched by CONTENT, never by the diff's own line numbers** —
+  the same reason `edit_file` requires a unique anchor. A model's
+  `@@ -l,s +l,s @@` numbers drift the moment any earlier hunk in the same
+  patch has already changed the file, and a patch generated from a
+  slightly-stale read is common; trusting them would misapply silently.
+  Instead each hunk's context+removed block must match **exactly once** in
+  the text as it stands after every earlier hunk in the same patch has
+  already applied (hunks apply IN ORDER against the running result, same
+  "old text must match exactly and uniquely" contract `edit_file` already
+  has, extended to N hunks with an all-or-nothing outcome).
+- **`--- `/`+++` file-header lines are read and discarded.** The tool's own
+  `path` argument is the ONLY authority on which file gets written — a
+  model-supplied header naming a different file must never redirect where
+  the patch lands.
+- **Three deliberate edge-case decisions, each backed by a test:**
+  - A hunk with `old == new` (every line was context, no real change) is a
+    silent no-op, not an error — no reason to fail a harmless hunk.
+  - A hunk with **zero** context/removed lines (pure insertion, all `+`) is
+    a **parse-time error**, not a silent misapplication: `text.count("")`
+    matches everywhere, so `text.replace("", new, 1)` would insert at the
+    very START of the file — almost never what's intended. The model is
+    told to add at least one surrounding context line.
+  - A bare blank line inside a hunk (a model that forgot the leading space
+    marker for an empty source line — common) is treated as an empty
+    CONTEXT line, not a parse error. `\ No newline at end of file` marker
+    lines are skipped.
+- **The approval preview shows the REAL computed result, never the raw
+  submitted diff** — same principle as R95a ("the diff IS the change; a
+  preview that under-reports is worse than none"). `approve._diff_preview`
+  actually parses and applies the patch against the real file content and
+  runs `difflib.unified_diff` on the result, exactly like `write_file`/
+  `edit_file`'s previews already do. A patch that would FAIL to apply
+  (context not found, ambiguous match) surfaces that failure AT the
+  approval prompt, via `diff_preview()`'s existing outer exception guard —
+  not only discovered after the human already said yes.
+- **Approval gate + allowlist wiring**: added to `NEEDS_APPROVAL`, never to
+  `PARALLEL_SAFE` (it mutates). `approve.load()`'s tool list
+  (`run_command`/`write_file`/`edit_file`) is now `_TOOLS`, extended to
+  include `apply_patch`, so "always allow" on a patched path works the same
+  way it already does for `write_file`/`edit_file` — without this, the
+  first "always allow" on an `apply_patch` result would `KeyError` inside
+  `add_rule`, since `load()`'s `setdefault` never created that bucket.
+- **Tests**: `tests/test_patch.py` covers `patch.py` in isolation (13
+  cases: multi-hunk ordering, header-line stripping, no-newline markers,
+  the blank-context-line accommodation, the no-op/pure-insertion/ambiguous/
+  not-found edge cases). `tests/test_core.py` covers the tool + approval
+  integration (11 cases): the real file write, all-or-nothing across
+  hunks, the true-no-op path never touching disk, registration in
+  `RUNNERS`/`SPEC`/`NEEDS_APPROVAL`, the allowlist round-trip, and — the
+  two tests that matter most — the preview showing the actual diff for a
+  good patch and surfacing the real error for a bad one.
+
+### R98. Up/down arrow only recall history from an EMPTY draft
+The TUI's input line binds ↑/↓ to move within a multi-line draft OR recall
+`/model`-style command history, depending on where the cursor is — but the
+old test was `cursor_position_row == 0` (for ↑) / `== line_count - 1` (for
+↓) **alone**. A multi-line draft (a pasted error log, a longer message
+being composed) that happened to put the cursor back on the first/last row
+after an earlier cursor move meant the very next ↑/↓ jumped straight into
+command history, discarding the user's place in their own in-progress
+draft — with no warning and no way to tell it was about to happen.
+
+- Both bindings now gate on `not buf.text` (the draft is completely empty)
+  instead of the cursor's row. A non-empty draft always moves the cursor,
+  regardless of which row it's currently on; only a genuinely empty prompt
+  recalls history, preserving the classic REPL muscle-memory (empty prompt,
+  press ↑, get the last submitted line).
+- This does mean the old "press ↑ repeatedly to cycle further back through
+  history" pattern only continues while the recalled text is then cleared
+  back to empty between presses — once a recalled entry sits in the draft,
+  a further ↑ now moves the cursor within it rather than loading the entry
+  before it. This is the intentional trade the fix makes: an in-progress
+  multi-line draft must never be silently clobbered by history recall, and
+  that guarantee is only possible by treating "the draft has ANY text" as
+  the line, including text that arrived via a previous recall.
+- Tests (`tests/test_tui.py`) invoke the registered ↑/↓ key-binding handlers
+  directly (no real terminal/event loop needed, since neither handler reads
+  anything off the key-press event itself) via a small `_press()` helper
+  that finds the binding by its registered key. The history-recall path is
+  tested by spying on `history_backward`/`history_forward` rather than
+  exercising prompt_toolkit's own history-loading machinery, which needs a
+  running asyncio event loop (`Buffer.load_history_if_not_yet_loaded`
+  schedules a background task via `get_app()`) that a headless test
+  fixture doesn't have — that machinery is prompt_toolkit's own concern,
+  not what this fix changes. The plain cursor-movement path (no history
+  involved) is verified against the buffer's real cursor position instead.
+
+### R99. A 429 gets its own backoff-and-retry, distinct from connection retry
+`turn()` already retries transient connection failures (a stale pooled
+keep-alive reset) with a flat `0.3 * (attempt+1)` delay. A 429 rate limit —
+routinely hit on an OpenRouter free-tier model shared across everyone
+without their own key on that upstream — instead failed the WHOLE turn
+immediately: `agent.py`'s notify was friendly ("try again shortly, add
+your own key, or /model to switch"), but it was still a dead end, not an
+actual retry. A shared quota clears in a few seconds; that's exactly the
+kind of wait a program can do for the user instead of asking them to.
+
+- **`_RateLimited`** (`openai_compat.py`), a small internal-only exception
+  — never raised past `turn()` — lets the retry logic distinguish a 429
+  from a generic 4xx/5xx without parsing message text. Raised at the same
+  status-check point that already classifies `a >= 400`, before the
+  generic `ProviderError`/`MalformedToolCall` branches.
+- **`_RATE_LIMIT_BACKOFF = (1.0, 3.0)`** — its own schedule, deliberately
+  NOT the connection-retry's flat delay: a stale connection resets
+  instantly on retry, a shared quota needs real seconds. Two backoff waits
+  across the existing 3-attempt budget (`_ATTEMPTS`, unchanged).
+  Exhausting all three still raises `ProviderError` with a message
+  containing both "429" and "rate limited" — `agent.py`'s existing
+  message-based classifier (`"429" in msg or ("rate" in msg.lower() and
+  "limit" in msg.lower())`) needed no changes to keep recognizing it.
+- The `except httpx.HTTPError as e:` clause widened to
+  `except (httpx.HTTPError, _RateLimited) as e:` — the partial-text
+  "keep what streamed so far" branch above the retry logic stays generic
+  over exception type (a 429 can never actually reach it with
+  `result.text` set, since it's always the very first event of the
+  stream, but the check isn't gated on exception type regardless).
+- **Four tests**: a 429-then-succeed case (retried exactly as many times
+  as needed, backoff slept in the right order); an always-429 case
+  (exhausts all 3 attempts, raises with "429" in the message); a check
+  that the sleep durations used are the 429 schedule, not the connection-
+  retry's `0.3 * attempt` one; and a check that `agent.py`'s existing
+  classifier still recognizes the exhausted-retry message and produces
+  the friendly shared-quota notice, not a raw error dump.
+
+### R100. `wait_until` — poll a shell command until it succeeds
+"Wait for the dev server to start listening", "wait until the build
+produces this file" today force the model to guess a single `sleep N`
+duration inside `run_command` and hope it was long enough — too short and
+the next step fails spuriously, too long and the turn wastes time waiting
+past when the condition was already true. `wait_until` reuses the "poll
+until true or give up" shape `llamadesk.LlamaDesk.wait_ready` already uses
+internally for a model load, exposed as a general tool.
+
+- **Refactored `run_command`** to extract `_run_command_once(command,
+  workdir) -> (output, returncode | None)` — the exact same process-group-
+  safe execution (R95c) `run_command` already had, unchanged behavior and
+  output text, just factored so `wait_until` can check the REAL exit code
+  per attempt. Parsing `run_command`'s own display text (`"[exit N]"`) back
+  out to decide whether to keep polling would have been fragile — exactly
+  the kind of thing that silently breaks the moment that text format
+  changes for an unrelated reason.
+- `wait_until(command, cwd="", interval=2.0, timeout=60.0)`: re-runs
+  `_run_command_once` every `interval` seconds until it exits 0 or
+  `timeout` elapses (clamped to 300s max — a wait tool must not become an
+  unbounded background job the agent loop can't see, same ceiling spirit
+  as `COMMAND_TIMEOUT`'s own default). A per-attempt timeout (the command
+  itself hanging) is reported as "timed out mid-command", distinct from an
+  ordinary nonzero exit.
+- **Approval is asked ONCE for the whole call**, not per poll — `agent.py`'s
+  gate wraps the tool call itself; `wait_until` calls `_run_command_once`
+  directly inside its loop, bypassing the gate a second time (which already
+  ran). Re-approving every 2-second poll would make the tool unusable.
+- **Its own allowlist bucket, separate from `run_command`'s.** `approve.py`'s
+  `run_command`-specific branches (`_signature`/`is_allowed`/`add_rule`)
+  became `_COMMAND_TOOLS = ("run_command", "wait_until")` so both get
+  identical token-prefix matching — but an "always allow" made for one
+  never silently covers the other (own bucket in `allowlist.yaml`,
+  `data[tool]` rather than a hardcoded `data["run_command"]`). A plain
+  one-shot command and "keep re-running this until it succeeds" are
+  different enough risk shapes that conflating their rules would surprise
+  someone who only meant to approve one of them.
+- **Tests**: success-on-first-check, a condition that starts false and
+  becomes true mid-poll, timeout-and-give-up (exit code shown), the
+  per-attempt-timeout-vs-nonzero-exit distinction, `cwd` handling, the
+  300s clamp (exercised with a fake fast-forwarding `time.monotonic` rather
+  than actually waiting real minutes), registration in
+  `RUNNERS`/`SPEC`/`NEEDS_APPROVAL`, and the allowlist-bucket separation
+  from `run_command`.
+
+### R101. `/commit` — stage, draft, review, commit
+Every coding session that touches code ends the same way — `git add`,
+draft a message, `git commit` — entirely by hand, with no model
+assistance, no matter how much of the actual coding Aurora just did.
+`/commit [message]` removes that repetitive manual step.
+
+- **New engine-side module `aurora/gitcommit.py`** — plain git-shelling
+  functions (`is_repo`, `staged_diff`, `unstaged_summary`, `stage_all`,
+  `recent_log`, `commit`) plus `draft_message(engine, diff, recent)`, a
+  one-off model completion in the same shape as `memory._draft()` (a plain
+  user-turn request outside the normal conversation, not a tool call).
+  Operates on the **real project `.git`** — a completely different target
+  from `rewind.py`'s shadow repo (a parallel, separate history under
+  `AURORA_HOME` used purely for undo). Neither module imports the other;
+  conflating them would mean `/commit` accidentally committing into the
+  wrong repository.
+- **`_commit_cmd`** (`ui.py`, shared by both front ends via
+  `_handle_command`) orchestrates entirely with EXISTING primitives —
+  `select()`, `confirm()`, `input()`, `colour_diff()` — no new `Frontend`
+  protocol method needed, since staging/diffing/committing are plain
+  synchronous git calls, not a new kind of human interaction the engine
+  side has to request.
+- **Never silently stages anything.** If nothing is staged, `/commit`
+  shows exactly what `git status --porcelain` reports (what `git add -A`
+  WOULD include) and asks first (`confirm(..., default_yes=False)`) — an
+  auto-stage-and-commit that swept up an unrelated stray file would be
+  exactly the kind of surprise Aurora's approval gate exists to prevent
+  everywhere else.
+- **The message**: an explicit `/commit <message>` argument skips drafting
+  entirely; otherwise the model drafts one from the staged diff, shown
+  alongside the last 5 commit subjects (`recent_log`) as a style reference
+  so the draft matches the repo's own commit voice rather than a generic
+  one.
+- **Review before committing, every time** — the diff (`colour_diff`,
+  capped at 4000 chars with a truncation note, same shape as the approval
+  gate's own diff preview) and the drafted/given message are both shown,
+  then a menu: **Yes, commit** / **Edit the message** (free-text, loops
+  back to the same review) / **Cancel** (leaves the change staged, not
+  discarded). An empty message — an empty draft, or an empty edit — is
+  refused rather than silently committed; the loop asks again.
+- **Tests**: `tests/test_gitcommit.py` covers the module against a real
+  throwaway git repo (10 cases: repo detection, staged-vs-unstaged diff
+  content, `stage_all`, `recent_log`, a real commit landing with the right
+  subject, committing nothing staged failing cleanly, and `draft_message`
+  against a fake provider). `tests/test_core.py` covers the command's
+  orchestration (10 cases): not-a-repo, clean-tree, an explicit message
+  skipping the draft call entirely, the auto-draft path, the
+  nothing-staged confirm (both accept and decline), declining at the final
+  review (change stays staged, nothing committed), the edit-then-confirm
+  loop, and the empty-message refusal.
 
 ### Defaults
 - Aurora **starts on whichever model is first in `config.yaml`'s

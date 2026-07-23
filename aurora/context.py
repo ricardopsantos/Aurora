@@ -13,7 +13,6 @@ import re
 import subprocess
 from pathlib import Path
 
-CONTEXT_DIR = ".agentic_context"
 _INDEXES = ("KNOWLEDGE/INDEX.md", "MEMORY/INDEX.md", "SKILLS/INDEX.md")
 _CORE_RE = re.compile(r"^- `([^`]+)` — \[CORE\]", re.M)
 
@@ -37,9 +36,36 @@ _PROTOCOL = """\
 _root: Path | None = None
 
 
+def find_context_root(start: str | Path = ".") -> Path | None:
+    """THE detector for the context protocol folder — one implementation,
+    used by the bootstrap (`detect`), `/remember`, `/agentic_report` and the
+    status-bar link, so all of them agree on what "a context is present"
+    means (R90c).
+
+    Identified by WHAT IT CONTAINS, never by name (`.agentic_context` is the
+    convention, hidden or not, but nothing requires it): walking up from
+    `start`, the nearest ancestor with an immediate subfolder holding BOTH
+    `KNOWLEDGE/SKILL.md` and `MEMORY/SKILL.md` wins. Requiring the SKILL.md
+    files (not just the two directories) rules out an unrelated folder that
+    happens to have similarly-named subfolders with no actual content."""
+    p = Path(start).resolve()
+    for d in (p, *p.parents):
+        try:
+            children = [c for c in d.iterdir() if c.is_dir()]
+        except OSError:
+            continue
+        for cand in sorted(children):
+            if ((cand / "KNOWLEDGE" / "SKILL.md").is_file()
+                    and (cand / "MEMORY" / "SKILL.md").is_file()):
+                return cand
+    return None
+
+
 def detect(cwd: str | Path = ".") -> Path | None:
-    p = Path(cwd).resolve() / CONTEXT_DIR
-    return p if p.is_dir() else None
+    """The context root the bootstrap should load, by contents (R88/R90c) —
+    NOT a hardcoded `.agentic_context` path segment, and not cwd-only: the
+    same walk-up rule every other context-aware surface uses."""
+    return find_context_root(cwd)
 
 
 def _read(root: Path, rel: str) -> str:

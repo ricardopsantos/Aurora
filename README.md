@@ -4,7 +4,7 @@
 
 Micro terminal coding agent — OpenRouter / a local llama.cpp
 server, with a tool loop, approval gates, session logs, and native support
-for the `.agentic_context` protocol. The full specification (requirements,
+for the [`.agentic_context`](https://github.com/ricardopsantos/AgenticContext) protocol. The full specification (requirements,
 build plan, test plan) lives in **[AURORA.md](AURORA.md)** — this file is
 the quick start.
 
@@ -17,7 +17,7 @@ the quick start.
 **Start every session oriented.** Save a bootstrap prompt once and Aurora
 offers to run it at every boot — the repo ships a good default
 ([`bootstrap.example.md`](bootstrap.example.md)): read the README and rules
-files, bootstrap `.agentic_context/` if present, check the git state, and
+files, bootstrap [`.agentic_context/`](https://github.com/ricardopsantos/AgenticContext) if present, check the git state, and
 report a short brief before touching anything.
 
 ```
@@ -62,6 +62,33 @@ report a short brief before touching anything.
 
 ![Model picker: OpenRouter and local models in one menu](images/aurora.models-picker.png)
 
+**Doesn't waste your tokens**
+- The system prompt (your rules, indexes and `[CORE]` docs) is marked as
+  cacheable, so a long preamble isn't re-billed on every tool iteration of
+  every turn — which is where a multi-step task quietly spends most of its
+  money. `/cost` shows the per-model breakdown, cache hits included.
+- A round's read-only calls — reads, greps, fetches — run at once instead of
+  one after another. Approvals, ordering and the transcript are unchanged;
+  only the waiting overlaps.
+- Tools that reach what you meant: `grep` takes real regex, `read_file`
+  takes a line range, so the model narrows in instead of re-reading the
+  same file head.
+
+```
+> /cost
+token usage — session 2606384d9210
+  local
+    1 turn · in 500 · out 80 · no price
+  moonshotai/kimi-k2.7-code
+    1 turn · in 41k · out 1.2k · $0.0148  32k cached
+  total  $0.0148
+```
+
+`in` is the *billed* prompt total — every tool iteration of a turn pays for
+the whole context, which is exactly why the caching matters. Prices come
+from a per-model table you can edit; a model with no entry says "no price"
+rather than a `$0.00` that would imply it was free.
+
 **Built for daily terminal use**
 - Full-screen TUI: scrollable chat with streaming markdown, timed
   collapsible thinking blocks, mouse support and drag-to-copy — with a
@@ -71,6 +98,8 @@ report a short brief before touching anything.
   cross-session memory.
 - Reusable prompt-driven skills, plus a per-project bootstrap prompt so
   the agent starts every session already knowing the codebase.
+- On multi-step work the model keeps its own task list (`/todo`) instead of
+  losing the thread three tools deep.
 
 ## Install (macOS or Linux)
 
@@ -140,10 +169,13 @@ aurora --man          # full man-style manual
 | plain text (Ctrl+J or `\n` / `\br` newline) | talk to the model; writes/commands ask approval via a numbered/arrow-key menu: Yes / Always allow (remember) / No / Stop / Comment — steer the model instead |
 | `/…` + Tab | slash-command autocomplete (built-ins + skills) |
 | `!` (empty prompt) | persistent bash mode: `>` becomes `$`, every Enter runs a shell command locally (no LLM) until you press Esc or Backspace on an empty line |
-| `/model` | arrow-key menu: OpenRouter ($) · local loaded (free) · local library (free, loads, needs LlamaDesk) — current model marked `✔` and pre-selected; the choice is remembered and restored on the next start. Picking an entry with no key stored prompts for one; leaving it blank skips the switch and keeps the previous model |
+| `/model` | arrow-key menu: OpenRouter ($) · local loaded (free) · local library (free, loads, needs LlamaDesk) — current model marked `✔` and pre-selected; the choice is remembered and restored on the next start. Picking an entry with no key stored prompts for one; leaving it blank skips the switch and keeps the previous model. TUI only: Esc also cancels it with no change — every other menu in Aurora requires an explicit pick |
 | `/model add <url>` | add an OpenRouter model by its page URL (or bare `org/model` id): appends it to `config.yaml`, fetches ctx/pricing/description from the OpenRouter catalog, asks for the key if missing, and switches to it |
 | `/model remove <name>` | remove a configured model (URL or exact name; `rm` works too) — removing the current one falls back to the first remaining model with a key |
 | `/status` | backend health — local shows the real loaded model + context size |
+| `/cost [all]` | per-model breakdown of turns, tokens and estimated $ — for this session, or `all` sessions on this machine. Read straight from the session logs, so it works on old sessions too; an upper bound, not an invoice |
+| `/cache on\|off` | prompt caching (default ON, persisted): marks the system prompt as cacheable so the bootstrap preamble isn't re-billed on every tool iteration of every turn. On for remote models, off for the local one (llama.cpp caches its own prefix); `/cost` shows the hits |
+| `/todo` | show the model's current task list — it writes one itself with the `todo_write` tool on multi-step work, and `/clear` resets it |
 | `/think` · `/thinking` | show last turn's reasoning · toggle live dim reasoning stream |
 | `/markdown` | toggle pretty rendering (bold/code/bullets) vs raw text |
 | `/redact on\|off` | toggle secret detection in prompts + tool output (default ON, persisted) — a detected key/token/`.env` credential challenges you to keep it, redact it to `<secret>`, always allow it (allowlist — never flagged again), or stop |
@@ -159,10 +191,11 @@ aurora --man          # full man-style manual
 | `/copy-all` | copy the whole chat (questions + answers, no thinking) to clipboard, SSH-safe — also the status bar's "copy all" button |
 | `/rewind [id]` | list checkpoints taken before every approved write/edit/command and restore one — restoring is itself checkpointed, so it can be undone |
 | `/allowlist` | review the persistent approval allowlist |
-| `/remember` | review the session against `.agentic_context/MEMORY` and write anything worth keeping, with a per-finding approval challenge |
+| `/remember [all\|last [k]]` | save what's worth keeping into [`.agentic_context/MEMORY`](https://github.com/ricardopsantos/AgenticContext), with a per-finding approval challenge — from the last exchange (default), the last `k` exchanges, or the whole session (`all`). No `.agentic_context` found? Saves flat into `~/AURORA_PFCS/MEMORY/` instead (machine-wide, not project-specific) |
 | `/resume` · `/export` | pick a past session · dump conversation as markdown |
 | `/skills` · `/name args` | list / run skills (from `skills/` or `AURORA_HOME/skills/`) |
-| `/bootstrap` | run your saved bootstrap prompt as the first turn; `set [file] [project]` / `show` / `clear`. Global `AURORA_HOME/bootstrap.md`, project `.aurora/bootstrap.md` overrides. When one exists, startup immediately asks (as a menu) whether to run it |
+| `/bootstrap` | run your saved bootstrap prompt as the first turn; `set [file\|url] [project]` / `show` / `clear`. Global `AURORA_HOME/bootstrap.md`, project `.aurora/bootstrap.md` overrides. `set` with a URL downloads and caches it, remembering the source; when one exists, startup offers a plain yes/no for a local file/paste, or run-cached / re-download / skip for a URL-sourced prompt |
+| `/agentic_report` | *(only shown once a context protocol folder — a `KNOWLEDGE/SKILL.md` + `MEMORY/SKILL.md` pair, any folder name — is detected)* choose **Stats** (runs the folder's `scripts/stats.sh`) or **Index** (pretty-prints `KNOWLEDGE/INDEX.md` and `MEMORY/INDEX.md`) — also the target of the TUI status bar's "agentic report" link |
 | `/help` · `/quit` (or `/exit`) | help · quit immediately — a typed command may be instant, a key never is |
 | `aurora --debug` | tint the TUI's chat area and status bar red (distinct shades) so their bounds are obvious while you're working on layout |
 
@@ -209,7 +242,7 @@ Two cases are **not** part of this double-tap rule, on purpose:
   mode, or quitting the app.
 
 The full specification — original requirements R1–R24 plus the as-built
-additions (R25+, currently through R77) — lives in [AURORA.md](AURORA.md).
+additions (R25+, currently through R101) — lives in [AURORA.md](AURORA.md).
 How the pieces fit together (engine/UI boundary, provider abstraction,
 threading, persistence) is in [ARCHITECTURE.md](ARCHITECTURE.md).
 **Rule: README, AURORA.md and ARCHITECTURE.md must stay in sync with the

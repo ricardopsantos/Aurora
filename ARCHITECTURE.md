@@ -1,7 +1,7 @@
 # Aurora — Architecture
 
 Reference doc for how the pieces fit together. `AURORA.md` is the numbered
-requirements/spec (the *what* and *why*, R1–R77+); this is the *how* — module
+requirements/spec (the *what* and *why*, R1–R101+); this is the *how* — module
 map, data flow, boundaries, and the mechanisms worth understanding before
 touching them. Update this file whenever a change alters one of these shapes,
 not just when adding a requirement.
@@ -42,6 +42,17 @@ that feels like it needs `print()` or a widget inside `engine.py` or
 `agent.py` is a sign the abstraction is leaking — route it through a new
 `Frontend` method instead.
 
+**The guard is only as good as its AST check (R90a).** A *relative* import —
+`from .ui import estimate_tokens` inside `engine.py` — parses as
+`module="ui", level=1`, so the original `node.module.endswith(".ui")` test
+never saw it, and exactly that import sat in the engine for weeks while the
+suite stayed green. The check now rebuilds the dotted name from `node.level`
+and also inspects plain `import` statements. The general lesson: when a
+shared helper is wanted on both sides of the boundary, it goes into a
+neutral engine-side module (that's what `tokens.py` is — `estimate_tokens`
+/`fmt_token_count`, re-exported from `ui` for the existing call sites),
+never imported *out of* the UI half.
+
 ## 2. The agent loop (`agent.py`)
 
 `run_turn(provider, model, messages, system, cb: AgentCallbacks, ...)` is the
@@ -67,6 +78,18 @@ UI-agnostic and directly unit-testable with a fake provider + fake callbacks
 `self.messages` list, so history persists across turns without the agent loop
 knowing anything about session/engine state.
 
+**Step 2 runs read-only calls concurrently (R94), and that changes nothing
+observable.** Before the sequential per-call loop, every call whose name is
+in `tools.PARALLEL_SAFE` is dispatched at once through
+`tools.run_tools_parallel`; the loop then consumes those results in the
+model's original order. The invariant to preserve when touching this: only
+the *waiting* is parallel. Tool starts, approvals, secret challenges, the
+transcript and the history messages all stay strictly ordered — a user must
+never be asked two questions at once, and `messages` must never depend on
+which read finished first. `PARALLEL_SAFE` is an explicit allowlist, not
+`set(all) - NEEDS_APPROVAL`: the test is "read-only AND no shared state", so
+an ungated but stateful tool (`todo_write`, R93) is correctly excluded.
+
 **Degrade paths are deliberate, not incidental**: a malformed tool call gets
 one corrective retry, then the model degrades to chat-only for the rest of
 the session (`turn.degraded`); a `ProviderError` is inspected for known
@@ -90,6 +113,26 @@ format. One concrete implementation:
 
 **`make_provider(name, cfg, timeout)`** (`providers/__init__.py`) builds the
 right one from a config entry's `type:` field.
+
+**Per-turn knobs are ATTRIBUTES, not `turn()` parameters** — `extra_body`,
+`on_think` and (R91) `cache_prompt` are all set on the provider by
+`Engine.send` just before the call. That's a deliberate pattern, not
+laziness: `turn()`'s signature is implemented by every provider and faked by
+a dozen tests, so widening it for each new per-turn option would churn all
+of them for something only one implementation reads. New per-turn options
+should follow the same route.
+
+### Prompt caching (R91)
+`_system_message(system, cache)` decides between a plain string and a
+content block carrying `cache_control: {"type": "ephemeral"}`. The
+OpenAI-compatible world splits in two here and one marker covers both:
+OpenAI/DeepSeek-style backends cache long prefixes automatically and ignore
+the marker; Anthropic-family models via OpenRouter cache ONLY at an explicit
+breakpoint. Below `_CACHE_MIN_CHARS` nothing is marked — a cache *write*
+costs more than a plain read, and Anthropic won't cache a short prefix at
+all. The system prompt is the only sensible breakpoint: it's the one part of
+a request that is byte-identical for a whole session, and it is re-sent on
+every tool iteration, each one billed (R37).
 
 ### Networking hardening (all in `openai_compat.py` — read before touching connect logic)
 These exist because of *specific* production failures, not speculative
@@ -335,10 +378,22 @@ from an ad-hoc verification run that mocked only one of the two).
   this thread specifically, to fail loudly instead of deadlocking silently
   (that thread is the one that would have to deliver the answer).
 - **Worker thread** (`Tui._worker`): runs one loop consuming submitted lines
-  from `self._inbox`, calling into `ui._run_turn`/`_handle_command`. This is
-  where `Engine.send()` and the whole agent loop execute — it's fine for this
-  thread to block on network I/O or on `ask()`/`select_menu()` (those route
-  back to the UI thread via a `queue.Queue`).
+  from `self._inbox`, calling into `ui._send_turn`/`_handle_command` (R96f —
+  `_send_turn` directly, not through a per-turn wrapper thread; see below).
+  This is where `Engine.send()` and the whole agent loop execute — it's fine
+  for this thread to block on network I/O or on `ask()`/`select_menu()`
+  (those route back to the UI thread via a `queue.Queue`).
+- **No per-turn wrapper thread in the TUI (R96f).** `ui._run_turn` wraps a
+  turn in its own thread so the MAIN thread can catch `KeyboardInterrupt`
+  while `input()` blocks — that only makes sense in the classic REPL, where
+  `run_turn` executes ON the main thread. The TUI's `_worker` is already a
+  background thread, and SIGINT is only ever delivered to the process's main
+  thread anyway (prompt_toolkit also runs the terminal in raw mode, so `^C`
+  never becomes a signal there at all — TUI cancellation is
+  `fe.cancel_event.set()` via the Esc-Esc menu, unrelated to this
+  mechanism). So the TUI calls `ui._send_turn` — the turn's body factored out
+  of `_run_turn` — directly on the worker thread, collapsing "which thread is
+  a mid-turn key prompt on" from four levels deep to three.
 - **Ticker thread**: purely cosmetic, invalidates the app every 0.5s while
   busy to animate the spinner/elapsed-time.
 - **Startup banner health probe** (`Tui._banner`/`ui._banner`, both call
@@ -350,6 +405,18 @@ from an ad-hoc verification run that mocked only one of the two).
   via `thread.join(timeout)` — if the probe hasn't returned in time, startup
   proceeds with an "unknown/timed out" health result instead of waiting on
   it. A health CHECK must never be able to block the thing it's checking.
+- **Context-limit refresh** (`Engine._context_limit_nonblocking`, R95i): the
+  same rule applied to the *steady-state* render path. `context_stats()` is
+  called by `status()` on the UI thread on every frame, and for the `local`
+  model the limit is a live `/props` lookup behind an endpoint probe — so a
+  backend that was down froze the app for ~6s each time the 120s cache
+  expired. The lookup now runs on a daemon thread and the render is served
+  the cached value (or `Provider.static_context_limit()`, the offline
+  answer, before the first one lands). **Stale beats blocking.**
+
+  This is the general shape for anything the status bar wants to show: if
+  answering it can touch a socket, the render path gets the last known
+  value and a background refresh, never the call itself.
 
 A blocking ask/select is a **queue handoff**: the worker thread calls
 `ask()`/`select_menu()`, which sets state (`self._question`/`self._menu_*`),
@@ -490,7 +557,7 @@ not Esc) and a stale arm must never silently fire on an unrelated later Esc.
 
 ## Where to look next
 
-- **Requirements** (R1–R77+, the numbered spec with dates and rationale):
+- **Requirements** (R1–R101+, the numbered spec with dates and rationale):
   `AURORA.md`.
 - **User-facing feature list**: `README.md` → "Daily use" and "Esc, the
   double-tap control key".

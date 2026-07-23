@@ -26,6 +26,10 @@ class TurnResult:
     input_tokens: int = 0
     output_tokens: int = 0
     stop_reason: str = ""
+    # R91: how many of input_tokens the provider served from its prompt cache
+    # (usage.prompt_tokens_details.cached_tokens). 0 when the provider doesn't
+    # report it — never assume "no cache hit", only "not reported".
+    cached_input_tokens: int = 0
 
 
 class ProviderError(Exception):
@@ -134,6 +138,11 @@ class Provider(ABC):
         # optional reasoning-stream callback (thinking models); set by the
         # engine per turn. Reasoning never enters TurnResult.text/history.
         self.on_think = None
+        # R91: mark the system prompt as cacheable on this request. Set by the
+        # engine per turn from the model entry's `cache:` flag — an attribute
+        # rather than a turn() parameter, same as extra_body/on_think, so the
+        # Provider signature (and every fake provider in the tests) is unchanged.
+        self.cache_prompt: bool = False
 
     @staticmethod
     def _urls(raw) -> list[str]:
@@ -158,6 +167,14 @@ class Provider(ABC):
         """Provider-native assistant message for the history (text + calls)."""
 
     def context_limit(self, model: str) -> int:
+        return int(self.config.get("context_limit", 0)) or 128_000
+
+    def static_context_limit(self, model: str) -> int:
+        """The limit knowable WITHOUT touching the network (R95i). The status
+        bar renders on the UI thread and must never block on a socket, so it
+        serves this until a background refresh produces the live value.
+        Subclasses that do live lookups override `context_limit`; this stays
+        the offline answer."""
         return int(self.config.get("context_limit", 0)) or 128_000
 
     def has_pricing(self, model: str) -> bool:

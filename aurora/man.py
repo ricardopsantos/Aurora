@@ -53,7 +53,9 @@ def man_page() -> str:
                   {D}(no key set){R} — picking it offers to enter/store it
                   right there instead of failing later. Leaving the prompt
                   blank (empty or whitespace only) skips the switch entirely
-                  — you stay on whichever model was active before.
+                  — you stay on whichever model was active before. TUI only:
+                  Esc also cancels it with no change (every other menu
+                  requires an explicit pick).
     {C}/model add{R} {G}url{R} Add an OpenRouter model by its page URL
                   (https://openrouter.ai/<org>/<model>) or bare org/model id:
                   validates it against the OpenRouter catalog, appends it to
@@ -83,6 +85,19 @@ def man_page() -> str:
                   allowlisted, or clear them all (persisted).
     {C}/status{R}       Backend health: local shows the real loaded model +
                   context size from /props; a remote model shows key presence.
+    {C}/cost{R} [{G}all{R}]     Per-model token + $ breakdown for this session, or
+                  every session on this machine. Read straight from the
+                  session logs, so it works on past sessions too. Prices
+                  come from {Y}providers/remote_context_limits.json{R}; the
+                  total is an UPPER bound (cached tokens bill cheaper).
+    {C}/cache{R} {G}on|off{R}   Prompt caching (persisted). Marks the system prompt
+                  as cacheable so the bootstrap preamble isn't re-billed on
+                  every tool iteration of every turn. On by default for
+                  remote models, off for the local one (llama.cpp keeps its
+                  own prefix cache). {C}/cost{R} shows the cache hits.
+    {C}/todo{R}         Show the model's current task list. The model writes it
+                  itself with the {Y}todo_write{R} tool on multi-step work;
+                  {C}/clear{R} resets it with the conversation.
     {C}/think{R}        Print the last turn's reasoning (thinking models).
     {C}/thinking{R}     Toggle live reasoning: dim stream vs "(thinking…)"
                   marker. Default from {Y}runtime.show_thinking{R} in config.
@@ -94,15 +109,38 @@ def man_page() -> str:
                   approved write/edit/command, labelled with the causing
                   prompt. Restoring is undoable — the pre-rewind state is
                   checkpointed too. Gitignored files are never touched.
+    {C}/commit{R} [{G}msg{R}]  Stage + commit the REAL project repo (not
+                  {C}/rewind{R}'s shadow one). Nothing staged? shows what
+                  {C}git add -A{R} would include and asks first. Drafts a
+                  message from the diff (style-matched to recent commits)
+                  unless you pass one; shows it before committing, with a
+                  chance to edit or cancel.
     {C}/resume{R}       Pick a past session and continue it. On quit Aurora
                   prints the exact command to re-enter the same session.
     {C}/export{R}       Dump the conversation as markdown in the cwd.
     {C}/skills{R}       List skills; run one with {C}/name{R} {G}args{R}.
     {C}/bootstrap{R}    Run the saved bootstrap prompt as a user turn.
-                  {C}set{R} [{G}file{R}] [{G}project{R}] · {C}show{R} · {C}clear{R} [{G}project{R}].
+                  {C}set{R} [{G}file{R}{Y}|{R}{G}url{R}] [{G}project{R}] · {C}show{R} · {C}clear{R} [{G}project{R}].
                   Global {G}AURORA_HOME/bootstrap.md{R}; a project's
-                  {G}.aurora/bootstrap.md{R} overrides. When one exists,
-                  startup immediately asks to run it (Enter = yes).
+                  {G}.aurora/bootstrap.md{R} overrides. {C}set{R} with a URL
+                  downloads and caches it, remembering the URL; when one
+                  exists, startup offers to run it — a plain yes/no for a
+                  local file/paste, or run-cached / re-download / skip for
+                  a URL-sourced prompt.
+    {C}/remember{R} [{G}all{R}{Y}|{R}{G}last{R} [{G}k{R}]] Save what's worth keeping from the
+                  session into MEMORY, with a per-finding approval
+                  challenge. Default (no argument, or {C}last{R}) is just
+                  the last question/reply pair; {C}last{R} {G}k{R} the last {G}k{R}
+                  pairs; {C}all{R} the whole session. No context protocol
+                  folder detected? Saves flat into
+                  {G}~/AURORA_PFCS/MEMORY/{R} instead (machine-wide, not
+                  project-specific).
+    {C}/agentic_report{R} {D}(only shown once a context protocol folder — a
+                  KNOWLEDGE/SKILL.md + MEMORY/SKILL.md pair — is
+                  detected){R} Choose {C}Stats{R} (runs the folder's
+                  {G}scripts/stats.sh{R}) or {C}Index{R} (pretty-prints
+                  KNOWLEDGE/INDEX.md and MEMORY/INDEX.md). Also the target
+                  of the TUI status bar's "agentic report" link.
     {C}/help{R} {C}/quit{R}   Command summary · quit immediately.
     {B}!{R}{G}cmd{R}          Classic REPL: run one bash command locally, no LLM.
                   TUI: {B}!{R} on an EMPTY prompt enters persistent bash mode

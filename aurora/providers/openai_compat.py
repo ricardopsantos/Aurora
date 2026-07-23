@@ -17,6 +17,23 @@ from .happy_eyeballs import HappyEyeballsTransport
 _REMOTE_CONTEXT_LIMITS_PATH = Path(__file__).parent / "remote_context_limits.json"
 
 
+class _RateLimited(Exception):
+    """R99: internal control-flow only, never raised past `turn()` — a 429
+    status remembered just long enough to retry the same request with
+    backoff before it ever becomes a ProviderError the agent loop has to
+    give up the turn on. A free-tier model's shared rate limit is routinely
+    a few seconds of real waiting, not a fatal error; today's code prompted
+    the user to just try again themselves. Deliberately its own exception
+    (not reusing ProviderError) so the retry logic in `turn()` can tell a
+    429 apart from a generic 4xx/5xx without parsing the message text."""
+
+
+# R99: exponential, not the connection-retry's flat 0.3*(attempt+1) — a
+# shared free-tier limit clears on the order of seconds, a stale pooled
+# connection resets instantly. One entry per retry (len == _ATTEMPTS - 1).
+_RATE_LIMIT_BACKOFF = (1.0, 3.0)
+
+
 def _load_remote_context_limits() -> dict[str, dict]:
     """Known per-model info for remote (non-"local") models, editable
     without a code change. The JSON file is a LIST of model entries (so it
@@ -91,6 +108,16 @@ def save_remote_model_info(model_id: str, info: dict) -> None:
     _REMOTE_CONTEXT_LIMITS_PATH.write_text(json.dumps(entries, indent=2) + "\n")
 
 
+def price_for(model: str) -> tuple[float, float] | None:
+    """($/Mtok in, $/Mtok out) for a model, or None when unpriced — the one
+    place the per-model price table is read outside a live provider
+    instance, so `/cost` (R92) prices a past session's models without
+    building a provider for each one."""
+    entry = REMOTE_CONTEXT_LIMITS.get(model, {})
+    pin, pout = entry.get("price_in_per_mtok"), entry.get("price_out_per_mtok")
+    return None if pin is None or pout is None else (pin, pout)
+
+
 def _is_bare_ip(base_url: str) -> bool:
     """True when the endpoint is a literal private/loopback IP rather than a
     hostname. A LAN reverse proxy (e.g. Caddy) commonly serves a cert issued
@@ -118,6 +145,32 @@ def _is_lan_host(base_url: str) -> bool:
                ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False   # a public DNS name → remote
+
+
+# R91: a cache breakpoint only pays off on a big, byte-identical prefix.
+# Anthropic-family models (the ones that need the EXPLICIT cache_control
+# marker, via OpenRouter) won't cache under ~1024 tokens at all, and a write
+# costs more than a plain read — so below this we send the plain string and
+# skip the whole mechanism. ~4 chars/token, matching tokens.estimate_tokens.
+_CACHE_MIN_CHARS = 4 * 1024
+
+
+def _system_message(system: str, cache: bool) -> dict:
+    """The system message, as a cacheable content block when it's worth it.
+
+    OpenAI-compatible caching splits in two: OpenAI/DeepSeek-style backends
+    cache long prefixes automatically and ignore the marker, while
+    Anthropic-family models routed through OpenRouter cache ONLY at an
+    explicit `cache_control` breakpoint. Marking the system prompt covers
+    both — it's the one part of every request that is byte-identical across
+    a whole session (base preamble + AGENTS.md + the three indexes + every
+    [CORE] doc), and it is re-sent on every tool iteration, not just every
+    turn (R37 bills each one)."""
+    if not cache or len(system) < _CACHE_MIN_CHARS:
+        return {"role": "system", "content": system}
+    return {"role": "system",
+            "content": [{"type": "text", "text": system,
+                         "cache_control": {"type": "ephemeral"}}]}
 
 
 def _to_openai_tools(specs: list[dict]) -> list[dict]:
@@ -164,12 +217,21 @@ class OpenAICompatProvider(Provider):
         # failure on the winning family — httpcore retries only
         # ConnectError/ConnectTimeout, before the request is sent, so no
         # duplicate request and no duplicated streamed text.
-        client = httpx.Client(
+        new_client = httpx.Client(
             transport=HappyEyeballsTransport(
                 retries=2, verify=not _is_bare_ip(base_url)),
             timeout=httpx.Timeout(self.timeout, connect=connect))
         with self._http_lock:
-            client = self._http.setdefault(base_url, client)
+            client = self._http.setdefault(base_url, new_client)
+        if client is not new_client:
+            # R96j: lost the race — another thread (worker vs. UI-thread
+            # /props probe, both call this) built and installed a client for
+            # the same endpoint first. `setdefault` correctly returns THEIRS,
+            # but the one we just built here is now unreachable from
+            # anywhere except this local — close it explicitly or its
+            # connection pool (sockets, not just Python memory) leaks for
+            # the life of the process.
+            new_client.close()
         return client
 
     def _probe(self, url: str) -> bool:
@@ -182,8 +244,11 @@ class OpenAICompatProvider(Provider):
         base = url.removesuffix("/v1")
         try:
             h = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-            httpx.get(f"{base}/props", headers=h, timeout=2,
-                     verify=not _is_bare_ip(url)).raise_for_status()
+            # R95h: reuse this endpoint's pooled client. A bare `httpx.get`
+            # built a fresh client — and so a fresh TCP+TLS handshake — for
+            # every probe, which is most of what a probe costs.
+            self._client_for(url).get(f"{base}/props", headers=h,
+                                      timeout=2).raise_for_status()
             return True
         except Exception:
             return False
@@ -258,6 +323,11 @@ class OpenAICompatProvider(Provider):
         listed = REMOTE_CONTEXT_LIMITS.get(model, {}).get("context_size")
         return self.live_context_limit(model) or listed or super().context_limit(model)
 
+    def static_context_limit(self, model: str) -> int:
+        """R95i: same answer minus the live /props call — no network."""
+        listed = REMOTE_CONTEXT_LIMITS.get(model, {}).get("context_size")
+        return listed or super().static_context_limit(model)
+
     def has_pricing(self, model: str) -> bool:
         """Whether a real cost estimate is possible — only when the model is
         listed in remote_context_limits.json WITH price fields (local/
@@ -281,14 +351,23 @@ class OpenAICompatProvider(Provider):
         return h
 
     def turn(self, model, messages, system, tools, on_text, cancel) -> TurnResult:
-        # pick a working endpoint before every turn so we fail over fast
-        # when the LAN/Tailscale path changes between messages. PIN it in a
-        # local: `self.base_url` is also flipped by the UI thread's status-
-        # render probes (live_context_limit → pick_endpoint), and a mid-turn
-        # flip must not redirect this request or its retries.
-        base = self.pick_endpoint(cache_ok=False)
+        # Pick a working endpoint so we fail over when the LAN/Tailscale path
+        # changes between messages. PIN it in a local: `self.base_url` is also
+        # flipped by the UI thread's status-render probes (live_context_limit
+        # → pick_endpoint), and a mid-turn flip must not redirect this request
+        # or its retries.
+        #
+        # R95h: honour the short TTL cache instead of forcing a probe. `turn()`
+        # is called once per agent ITERATION, not once per user message, so
+        # cache_ok=False meant a 10-iteration turn paid 10 extra probe round
+        # trips — negligible on localhost, real over a tailnet. The 10s TTL
+        # still re-probes between messages (a human turnaround is longer than
+        # that), and a connection failure below explicitly expires the cache
+        # (`_working_url_at = 0.0`), so failover is unchanged where it counts.
+        base = self.pick_endpoint(cache_ok=True)
         client = self._client_for(base)
-        msgs = ([{"role": "system", "content": system}] if system else []) + messages
+        msgs = ([_system_message(system, self.cache_prompt)]
+                if system else []) + messages
         payload = {"model": model, "messages": msgs, "stream": True,
                    "stream_options": {"include_usage": True}}
         if tools:
@@ -316,6 +395,14 @@ class OpenAICompatProvider(Provider):
                     if kind == "status":
                         if a >= 400:
                             body = _b or ""
+                            # R99: a 429 gets its own retry path below, with
+                            # backoff — a shared free-tier limit routinely
+                            # clears in a few seconds, so failing the whole
+                            # turn immediately just pushes the same "try
+                            # again" onto the user that this loop can do
+                            # itself.
+                            if a == 429:
+                                raise _RateLimited(body)
                             # llama.cpp surfaces template/parse failures as
                             # 500s with "Failed to parse" — gpt-oss mode
                             if "parse" in body.lower():
@@ -336,6 +423,12 @@ class OpenAICompatProvider(Provider):
                     if usage:
                         result.input_tokens = usage.get("prompt_tokens", 0)
                         result.output_tokens = usage.get("completion_tokens", 0)
+                        # R91: how much of that prompt was a cache HIT. Not
+                        # every backend reports it; 0 means "not reported",
+                        # never "definitely no hit".
+                        details = usage.get("prompt_tokens_details") or {}
+                        result.cached_input_tokens = details.get(
+                            "cached_tokens", 0) or 0
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
@@ -362,10 +455,13 @@ class OpenAICompatProvider(Provider):
                             slot["name"] += fn["name"]
                         if fn.get("arguments"):
                             slot["args"].append(fn["arguments"])
-            except httpx.HTTPError as e:
+            except (httpx.HTTPError, _RateLimited) as e:
                 # mid-stream drop (read timeout on a slow long generation,
                 # server restart): the user already WATCHED the partial text
-                # stream — keep it in history instead of discarding the turn
+                # stream — keep it in history instead of discarding the turn.
+                # A 429 can never reach this with result.text set — it's the
+                # status line, always the first event — but the check stays
+                # generic rather than gated on exception type.
                 if result.text:
                     note = (f"\n[stream interrupted: {e.__class__.__name__} — "
                             f"partial answer kept]")
@@ -377,6 +473,17 @@ class OpenAICompatProvider(Provider):
                     result.stop_reason = "interrupted"
                     pending.clear()   # half-received tool calls are unusable
                     return result
+                # R99: a rate limit gets its OWN retry schedule (backoff,
+                # not the connection-retry's flat delay) — distinct because
+                # the right wait time for "server briefly hiccuped" and "a
+                # shared quota needs seconds to free up" aren't the same.
+                if isinstance(e, _RateLimited):
+                    if _attempt + 1 < _ATTEMPTS:
+                        import time
+                        time.sleep(_RATE_LIMIT_BACKOFF[_attempt])
+                        continue
+                    raise ProviderError(
+                        f"{self.name} rate-limited (429): {e}") from e
                 # nothing streamed yet: a transient connection failure (stale
                 # pooled keep-alive reset after idle) is safe to retry fresh
                 if _attempt + 1 < _ATTEMPTS and isinstance(e, _RETRIABLE):

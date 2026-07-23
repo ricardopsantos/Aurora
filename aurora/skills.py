@@ -23,14 +23,39 @@ def _dirs(config_base: str | None) -> list[Path]:
 
 
 def _blurb(path: Path) -> str:
+    """The first line's trailing comment. Reads only the HEAD of the file
+    (R96a): a skill is an arbitrary script — this used to `read_text()` the
+    whole thing and split every line just to look at the first three, and it
+    runs behind the `/command` completer, once per skill per keystroke."""
     try:
-        first = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        for line in first[:3]:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            head = [f.readline(512) for _ in range(3)]
+        for line in head:
             if "#" in line and not line.startswith("#!"):
                 return line.split("#", 1)[1].strip()[:70]
     except Exception:
         pass
     return ""
+
+
+def dir_stamp(config_base: str | None = None) -> tuple:
+    """A cheap fingerprint of the skills dirs — (path, mtime_ns) per dir.
+
+    A directory's mtime changes when a file is added or removed, which is
+    exactly what `discover()`'s answer depends on. Lets a caller cache the
+    listing across keystrokes and still notice a newly-dropped skill, for
+    two `stat()` calls instead of a directory walk plus a read per skill
+    (R96a). An in-place EDIT of an existing skill's blurb line doesn't move
+    the dir mtime, so a cached blurb can lag until the next restart — the
+    listing itself (which names exist) is always current.
+    """
+    out = []
+    for d in _dirs(config_base):
+        try:
+            out.append((str(d), d.stat().st_mtime_ns))
+        except OSError:
+            continue
+    return tuple(out)
 
 
 def discover(config_base: str | None = None) -> dict[str, Path]:
