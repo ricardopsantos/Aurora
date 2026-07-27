@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 
 _INDEXES = ("KNOWLEDGE/INDEX.md", "MEMORY/INDEX.md", "SKILLS/INDEX.md")
-_CORE_RE = re.compile(r"^- `([^`]+)` — \[CORE\]", re.M)
+_CORE_RE = re.compile(r"^- `([^`]+)` — \[CORE\]", re.MULTILINE)
 
 _PROTOCOL = """\
 ## agentic_context protocol (run it yourself, every task)

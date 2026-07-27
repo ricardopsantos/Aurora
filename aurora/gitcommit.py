@@ -33,6 +33,14 @@ class GitError(Exception):
     pass
 
 
+# R125d: cap what actually goes to the model, independent of ui.py's
+# display-only _COMMIT_DIFF_PREVIEW_CAP — a large staged diff (vendored
+# deps, a regenerated lockfile) would otherwise blow a local model's context
+# or rack up unexpected remote token cost even though the preview looked
+# bounded.
+_DRAFT_DIFF_CAP = 20000
+
+
 def _git(cwd: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True,
                           text=True, timeout=30, check=check)
@@ -74,8 +82,11 @@ def recent_log(cwd: str = ".", n: int = 5) -> str:
 def draft_message(engine, diff: str, recent: str) -> str:
     """One-off model completion, same shape as `memory._draft()` — a plain
     user-turn request outside the normal conversation, not a tool call."""
+    shown_diff = diff
+    if len(diff) > _DRAFT_DIFF_CAP:
+        shown_diff = diff[:_DRAFT_DIFF_CAP] + "\n… (truncated)"
     ask = _DRAFT_PROMPT.format(recent=recent.strip() or "(no history yet)",
-                               diff=diff)
+                               diff=shown_diff)
     msg = [{"role": "user", "content": ask}]
     provider = engine._provider_for(engine.current, interactive=True)
     result = provider.turn(engine.current.get("model", ""), msg, "", None,

@@ -5,12 +5,14 @@ the approval gate (R7/R8), and malformed-local-tool-call degrade (R5).
 UI-agnostic: the caller passes callbacks so this works under any front end.
 """
 
+import json
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 from . import approve, tools
 from . import secrets as secretscan
-from .providers.base import MalformedToolCall, ProviderError, TurnResult
+from .providers.base import MalformedToolCall, ProviderError
 
 
 def _provider_label(provider) -> str:
@@ -50,6 +52,54 @@ def _connectivity_hint(provider) -> str:
             f"{base}")
 
 
+# R58/R131: tools whose own `command` argument is scanned for secrets and
+# REPORTED (never blocked, never rewritten) before it runs — the deliberate
+# exception to the keep/redact/stop challenge, because a shell command
+# usually needs the real value to work and blocking here would duplicate the
+# approval gate it already passed. Mirrors approve._COMMAND_TOOLS: the same
+# two tools that take a shell `command` string.
+_COMMAND_ARG_TOOLS = ("run_command", "wait_until")
+
+# R58 gap fix (2026-07-27): write_file/edit_file/apply_patch arguments were
+# never scanned at all — a model copying a secret from an earlier tool
+# result into a new file it's writing hit no notice and no challenge, only
+# the user's prompt and tool OUTPUT were covered. Maps each tool to the one
+# argument that actually carries new content being written — `old`
+# (edit_file) is what's already in the file, not new exposure, so it's
+# deliberately excluded to avoid a redundant challenge on text the file
+# already contains.
+_WRITE_ARG_FIELD = {"write_file": "content", "edit_file": "new",
+                    "apply_patch": "diff"}
+
+
+_EXPLAIN_PROMPT = """\
+Explain in 2-4 plain-English sentences what this tool call will do and \
+why it might be run, for a user who is deciding whether to approve it. \
+Be concrete about side effects — what gets written, changed, or executed \
+— rather than restating the raw arguments verbatim.
+
+Tool: {name}
+Arguments: {args}
+"""
+
+
+def _explain_tool_call(provider, model, name: str, args: dict) -> str:
+    """R103: the approval gate's "explain" option. A one-off, tool-free
+    model completion describing what a PENDING call will do — never added
+    to the conversation history, same "side completion" shape as
+    memory._draft()/gitcommit.draft_message(). Deliberately asked of the
+    SAME provider/model already selected for the turn: an explanation from
+    a different model than the one that chose to make the call would be
+    answering for a decision it didn't make."""
+    ask = _EXPLAIN_PROMPT.format(name=name, args=json.dumps(args, indent=2))
+    try:
+        result = provider.turn(model, [{"role": "user", "content": ask}],
+                               "", None, lambda _s: None, lambda: False)
+        return (result.text or "").strip() or "(no explanation returned)"
+    except Exception as e:
+        return f"[explain failed: {e.__class__.__name__}: {e}]"
+
+
 @dataclass
 class AgentCallbacks:
     on_text: Callable[[str], None]                 # streamed assistant text
@@ -59,7 +109,7 @@ class AgentCallbacks:
     ask_continue: Callable[[int], object]          # -> bool or (bool, guidance)
     notify: Callable[[str], None]                  # notices (degrade, cancel)
     cancelled: Callable[[], bool]                  # poll for Ctrl+C
-    checkpoint: Callable[[str], object] | None = None  # pre-mutation snapshot (R47)
+    checkpoint: Callable[[str, dict], object] | None = None  # pre-mutation snapshot (R47/R181)
     on_request: Callable[[], None] | None = None   # an LLM request is starting
     # R58: secret-redaction challenge. None means the feature is OFF (the
     # engine only ever sets this when runtime.redact_secrets is true) — the
@@ -70,6 +120,27 @@ class AgentCallbacks:
     # against these are dropped before secret_challenge ever fires again
     secret_allowlist: set | None = None
     on_usage: Callable[[int, int], None] | None = None
+    # R133c: every outcome of the approval gate, including the ones that never
+    # ask the user (allowlisted, denied by policy). Wired at the gate itself
+    # rather than around `approve` because a daily driver with an allowlist
+    # takes the no-question path most of the time — logging only the asked
+    # ones would under-report exactly the common case.
+    # (tool, decision, detail) — decision is one of _APPROVAL_DECISIONS.
+    on_approval: Callable[[str, str, str], None] | None = None
+    # R154: "history is at a safe boundary — fold it if it's too big." Called
+    # between rounds ONLY (never mid-round), because that is the one point
+    # where every assistant `tool_calls` entry already has its matching
+    # `tool` results and the list can be rewritten without producing an
+    # invalid sequence. The engine owns the policy (threshold, whether it's
+    # enabled at all); the loop only owns knowing when it's safe to ask.
+    # Must mutate `messages` IN PLACE — see run_turn.
+    maybe_compact: Callable[[], None] | None = None
+
+
+# R133c: the closed set of gate outcomes. Kept as data so the session log and
+# any reader agree on the vocabulary instead of matching free text.
+_APPROVAL_DECISIONS = ("allowlisted", "approved", "always_allow", "denied",
+                       "denied_policy", "always_deny", "steered", "stopped")
 
 
 def _norm(ans, default_note: str = "") -> tuple:
@@ -97,34 +168,76 @@ class Turn:
     # cheaper but not free, and the discount isn't reported uniformly, so the
     # cost estimate stays a deliberate UPPER bound.
     cached_input: int = 0
+    # R133a: SUM of reasoning tokens across iterations — a SUBSET of
+    # output_tokens, never added to it. `reasoning_chars` is the streamed
+    # fallback for backends that report no reasoning_tokens (local llama.cpp).
+    reasoning_tokens: int = 0
+    reasoning_chars: int = 0
+    # /model picker (feature request, 2026-07-27): wall time of the LAST
+    # successful `provider.turn()` call this turn made — a cached, no-probe
+    # signal of "how fast is this model responding right now", logged
+    # alongside the assistant record so the picker can read it back later
+    # without a live network call. Overwritten each round; the final value
+    # is whichever round completed last, which is what a "how did this model
+    # just do" reading should mean, not the sum/average across a multi-tool
+    # turn.
+    last_request_latency: float = 0.0
     iterations: int = 0
     degraded: bool = False
+    cancelled: bool = False
     events: list = field(default_factory=list)
 
 
 def run_turn(provider, model, messages, system, cb: AgentCallbacks,
-             max_iterations: int, tools_enabled: bool, web: bool) -> Turn:
+             max_iterations: int, tools_enabled: bool) -> Turn:
     """Drive one turn. `messages` is mutated in place with the full exchange
     (assistant + tool-result messages) so history persists across turns."""
     turn = Turn()
     allow = approve.load()
-    tool_specs = tools.specs(web) if tools_enabled else None
+    try:
+        deny = approve.load_deny()   # R120: empty dict for anyone who's never set one
+        deny_broken = False
+    except approve.ApproveLoadError as e:
+        # R170a: a corrupt denylist.yaml must fail CLOSED, not silently
+        # behave like an empty one (which would disable deny enforcement
+        # with no visible error). Block every gated call until fixed.
+        cb.notify(f"denylist.yaml is unreadable ({e}) — blocking all gated "
+                  "tool calls until it's fixed")
+        deny, deny_broken = {}, True
+    tool_specs = tools.specs() if tools_enabled else None
     iteration = 0
     checkpoint = max_iterations   # "continue?" grants another full block
     silent_continue = False       # user picked "keep going, don't ask again"
-    last_calls: set[tuple] = set()  # loop detection: calls seen last round
+    # loop detection: (call, output) seen last round — keyed on RESULT too,
+    # not just the call, so a legitimate re-run (write → test → fix →
+    # re-test) whose output actually changed is never told "you already ran
+    # this exact call with this exact result" when it didn't.
+    last_results: dict[tuple, str] = {}
 
     while True:
         if cb.cancelled():
             cb.notify("interrupted")
+            turn.cancelled = True
             return turn
+        # R154: fold history BEFORE building the next request, not after the
+        # turn ends. `iteration` is still the count of COMPLETED rounds here,
+        # so this never fires on the first request of a turn (nothing new to
+        # fold yet) and always fires at a round boundary, where history is a
+        # valid sequence. The callback mutates `messages` in place, so the
+        # `provider.turn` below sees the folded list — an engine that rebound
+        # its own `self.messages` instead would leave this loop driving the
+        # pre-fold list for the rest of the turn.
+        if iteration and cb.maybe_compact is not None:
+            cb.maybe_compact()
         iteration += 1
         turn.iterations = iteration
         if cb.on_request:
             cb.on_request()
+        _t0 = time.monotonic()
         try:
             result = provider.turn(model, messages, system, tool_specs,
                                    cb.on_text, cb.cancelled)
+            turn.last_request_latency = time.monotonic() - _t0
         except MalformedToolCall as e:
             # R5: one corrective retry, then degrade to chat. The corrective
             # nudge is a transient message — removed whether the retry
@@ -137,9 +250,11 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                                             "Emit a single valid tool call, or answer in plain text."})
                 if cb.on_request:
                     cb.on_request()
+                _t0 = time.monotonic()
                 try:
                     result = provider.turn(model, messages, system, tool_specs,
                                            cb.on_text, cb.cancelled)
+                    turn.last_request_latency = time.monotonic() - _t0
                 except MalformedToolCall:
                     cb.notify("still malformed — dropping tools for this session (chat only)")
                     turn.degraded = True
@@ -190,12 +305,78 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
         turn.output_tokens += result.output_tokens
         turn.last_output_tokens = result.output_tokens or turn.last_output_tokens
         turn.cached_input += getattr(result, "cached_input_tokens", 0) or 0
+        turn.reasoning_tokens += getattr(result, "reasoning_tokens", 0) or 0
+        turn.reasoning_chars += getattr(result, "reasoning_chars", 0) or 0
         if cb.on_usage is not None:
             cb.on_usage(result.input_tokens, result.output_tokens)
 
         if result.stop_reason == "cancelled":
             cb.notify("interrupted")
+            turn.cancelled = True
             return turn
+
+        # R58 gap fix (2026-07-27): the assistant's OWN generated text was
+        # never scanned — only the user's prompt and tool output were. A
+        # model that echoes a secret back in its prose (copying a token from
+        # an earlier tool result into its answer) streamed it straight to
+        # the screen via cb.on_text AND stored it in `messages` unredacted,
+        # where it would be re-sent to the provider on every later round.
+        # This can't un-stream what already reached the screen (on_text
+        # already ran chunk-by-chunk inside provider.turn(), above) — but it
+        # keeps a "redact" choice from persisting the secret in history/the
+        # session log, and "stop" from letting a mid-turn reply's secret
+        # trigger any tool calls that came with it.
+        if cb.secret_challenge and result.text:
+            reply_matches = secretscan.scan(result.text, cb.secret_allowlist)
+            if reply_matches:
+                decision = cb.secret_challenge("reply", reply_matches,
+                                               source_text=result.text)
+                if decision == "stop":
+                    # P-1 fix: returning here without appending anything left
+                    # `messages` ending on the USER turn `Engine.send` already
+                    # appended — the next `send()` then appends ANOTHER user
+                    # message on top of it (two consecutive user turns, the
+                    # R44/R128 invalid sequence), and any tool_calls this
+                    # round carried were silently dropped with no _skip()/
+                    # _flush(). Redact and record a (tool-call-free) assistant
+                    # message instead, so history stays a valid, closed turn
+                    # and the raw secret never lands in it either way.
+                    cb.notify("stopped: secret detected in the assistant's reply")
+                    result.text = secretscan.redact(result.text, reply_matches)
+                    result.tool_calls = []
+                    messages.append(provider.assistant_message(result))
+                    turn.cancelled = True
+                    return turn
+                elif decision == "redact":
+                    result.text = secretscan.redact(result.text, reply_matches)
+
+        # R58 gap fix (2026-07-27): scan write_file/edit_file/apply_patch's
+        # actual written content BEFORE the assistant message (which carries
+        # these arguments verbatim) enters history — a redact here mutates
+        # `call.arguments` in place, so both the historical record AND the
+        # write that runs later this round see the same redacted text.
+        # Must happen before `messages.append` below, not in the per-call
+        # loop further down: by the time that loop runs, `result` is already
+        # the one being turned into the stored assistant message.
+        if cb.secret_challenge:
+            for call in result.tool_calls:
+                field = _WRITE_ARG_FIELD.get(call.name)
+                if not field:
+                    continue
+                text = str(call.arguments.get(field, ""))
+                if not text:
+                    continue
+                write_matches = secretscan.scan(text, cb.secret_allowlist)
+                if not write_matches:
+                    continue
+                decision = cb.secret_challenge(f"write:{call.name}", write_matches,
+                                               source_text=text)
+                if decision == "stop":
+                    cb.notify(f"stopped: secret detected in a {call.name} argument")
+                    turn.cancelled = True
+                    return turn
+                elif decision == "redact":
+                    call.arguments[field] = secretscan.redact(text, write_matches)
 
         messages.append(provider.assistant_message(result))
 
@@ -206,6 +387,22 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
         # optional tool_results_messages() hook (bulk API), if it has one —
         # otherwise one message per result via tool_result_message().
         round_out: list[tuple] = []  # (ToolCall, output)
+
+        def _skip(calls, reason: str) -> None:
+            """Answer `calls` without running them.
+
+            R134g: these used to extend `round_out` directly, which keeps
+            history valid but bypasses `cb.on_tool_result` — so a call
+            abandoned at the approval gate, at the iteration cap, or by
+            Ctrl+C produced NO session record at all. The log then said a
+            turn made two tool calls when the model asked for five, and
+            `/context`'s tools: count undercounted every stopped turn. Routing
+            them through the callback logs them and shows them, which is
+            also the honest thing for the user: the model asked, and this is
+            what happened to the request."""
+            for c in calls:
+                cb.on_tool_result(c.name, reason)
+                round_out.append((c, reason))
 
         def _flush() -> None:
             fn = getattr(provider, "tool_results_messages", None)
@@ -223,8 +420,8 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
             if not go_on:
                 cb.notify("stopped at iteration cap")
                 # feed a synthetic result so history stays valid
-                round_out.extend((c, "[skipped: user stopped at the iteration cap]")
-                                 for c in result.tool_calls)
+                _skip(result.tool_calls,
+                      "[skipped: user stopped at the iteration cap]")
                 _flush()
                 return turn
             if go_on == "silent":
@@ -234,10 +431,7 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
             else:
                 checkpoint = iteration + max_iterations
 
-        this_round = {(c.name, repr(sorted(c.arguments.items())))
-                      for c in result.tool_calls}
-        repeated = this_round & last_calls
-        last_calls = this_round
+        this_round_results: dict[tuple, str] = {}
 
         # R94: a round's read-only calls (reads/greps/fetches — no approval,
         # no shared state, see tools.PARALLEL_SAFE) are independent, so run
@@ -270,52 +464,141 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                 cb.on_tool_result(call.name, out)
                 round_out.append((call, out))
 
+            def _gate(decision: str, detail: str = "") -> None:
+                # R133c: never let a logging callback kill the turn (same
+                # contract as R42/R51 — the work matters, the record doesn't)
+                if cb.on_approval is None:
+                    return
+                try:
+                    cb.on_approval(call.name, decision, detail)
+                except Exception:
+                    pass
+
             if cb.cancelled():
                 cb.notify("interrupted")
                 # keep history valid: answer the remaining calls as skipped
-                round_out.extend((c, "[skipped: interrupted]")
-                                 for c in result.tool_calls[idx:])
+                _skip(result.tool_calls[idx:], "[skipped: interrupted]")
                 _flush()
+                turn.cancelled = True
                 return turn
-            if call.name in tools.NEEDS_APPROVAL and not approve.is_allowed(
+            if tools.needs_approval(call.name) and (deny_broken or approve.is_denied(
+                    call.name, call.arguments, deny)):
+                # R120: a denylist match skips the prompt entirely — no
+                # question asked, same as pi-permission-system's fail-closed
+                # "deny always wins" design. Checked before is_allowed: a
+                # call matching both an allow and a deny rule is a config
+                # mistake, not a case worth new precedence rules for.
+                cb.notify(f"denied by policy: {call.name}")
+                _gate("denied_policy")
+                _finish("[denied by policy]")
+                turn.events.append({"tool": call.name, "denied": True,
+                                    "policy": True})
+                continue
+            if tools.needs_approval(call.name) and not approve.is_allowed(
                     call.name, call.arguments, allow):
                 diff = approve.diff_preview(call.name, call.arguments)
-                ans, note = _norm(cb.approve(call.name, call.arguments, diff))
+                # R103: "explain" re-asks the SAME challenge after showing a
+                # model-written description of what the call will do — never
+                # a terminal answer on its own, so it loops rather than
+                # falling through to the y/a/n/s/c handling below.
+                while True:
+                    ans, note = _norm(cb.approve(call.name, call.arguments, diff))
+                    if ans != "e":
+                        break
+                    cb.notify(_explain_tool_call(provider, model, call.name,
+                                                 call.arguments))
                 if ans == "a":
                     rule = approve.add_rule(call.name, call.arguments)
                     cb.notify(f"always-allow added: {call.name} · {rule}")
                     allow = approve.load()
+                    _gate("always_allow", rule)
+                elif ans == "d":
+                    rule = approve.add_deny_rule(call.name, call.arguments)
+                    cb.notify(f"always-deny added: {call.name} · {rule}")
+                    try:
+                        deny, deny_broken = approve.load_deny(), False
+                    except approve.ApproveLoadError as e:
+                        cb.notify(f"denylist.yaml is unreadable ({e}) — "
+                                  "blocking all gated tool calls until it's fixed")
+                        deny, deny_broken = {}, True
+                    _gate("always_deny", rule)
+                    _finish("[denied by policy]")
+                    turn.events.append({"tool": call.name, "denied": True,
+                                        "policy": True})
+                    continue
                 elif ans == "s":
                     cb.notify("stopped by user")
-                    round_out.extend((c, "[skipped: user stopped the turn]")
-                                     for c in result.tool_calls[idx:])
+                    _gate("stopped")
+                    _skip(result.tool_calls[idx:],
+                          "[skipped: user stopped the turn]")
                     _flush()
                     return turn
                 elif ans == "c":
+                    _gate("steered", note)
                     _finish(f"[not run — user guidance: {note}]")
                     turn.events.append({"tool": call.name, "steered": note})
                     continue
                 elif ans != "y":
+                    _gate("denied", note)
                     _finish(f"[denied by user: {note}]" if note
                             else "[denied by user]")
                     turn.events.append({"tool": call.name, "denied": True})
                     continue
+                else:
+                    _gate("approved", note)
+            elif tools.needs_approval(call.name):
+                # the gate was passed without a question — an existing
+                # allowlist rule matched. The common path for a daily driver,
+                # and invisible in the log until R133c.
+                _gate("allowlisted")
             # R58: run_command's PARAMETERS are the deliberate exception to
             # the keep/redact/stop challenge — the command needs its real
             # argument to actually work (a real key in a curl header, say),
             # so silently altering it would just break it, and blocking would
             # duplicate the approval gate it already went through above. This
             # is a NOTICE only: it never blocks, never touches what runs.
-            if call.name == "run_command" and cb.secret_challenge:
-                param_matches = secretscan.scan(call.arguments.get("command", ""),
-                                                cb.secret_allowlist)
+            # R131: `wait_until` (R100) is the second shell entry point and
+            # takes the same `command` argument — it inherited run_command's
+            # allowlist shape (approve._COMMAND_TOOLS) and its process-group
+            # hardening (R95c), but not this notice, so a credential in a
+            # polled command went unflagged where the identical string in a
+            # one-shot command was reported. An omission, not a decision.
+            # R170g: `secretscan.scan` only ever sees the literal `command`
+            # STRING — it can't decode/execute anything, so a secret piped
+            # through `base64 -d`, hex, or built up via `$(...)` substitution
+            # never appears in the text it scans and is invisible to this
+            # notice. That's an inherent limit of a static text scan, not a
+            # bug to fix here — but the wording said "possible secret" with
+            # nothing warning that a clean scan doesn't mean a clean command,
+            # which reads as more assurance than the check can back up.
+            if call.name in _COMMAND_ARG_TOOLS and cb.secret_challenge:
+                # wait_until's optional `then` (feature request, 2026-07-27)
+                # is a second shell command argument, same shape as
+                # `command` — scanned together so a secret placed in the
+                # follow-up isn't invisible to this notice just because it
+                # landed in the newer field.
+                scanned = call.arguments.get("command", "")
+                if call.arguments.get("then"):
+                    scanned += "\n" + call.arguments["then"]
+                param_matches = secretscan.scan(scanned, cb.secret_allowlist)
                 if param_matches:
-                    cb.notify(f"possible secret in this command: "
-                             f"{secretscan.preview(param_matches)}")
+                    cb.notify(f"possible secret in this command "
+                             f"(raw-text scan, easy to evade via encoding — "
+                             f"not a guarantee): {secretscan.preview(param_matches)}")
             # R47: snapshot the tree before any mutation lands (approved or
-            # allowlisted) — /rewind restores to this point
-            if call.name in tools.NEEDS_APPROVAL and cb.checkpoint is not None:
-                cb.checkpoint(call.name)
+            # allowlisted) — /rewind restores to this point. R181: the
+            # callback also gets `call.arguments` now, so it can ALSO
+            # snapshot the single target FILE when the call names one
+            # unambiguously (write_file/edit_file/apply_patch all take
+            # `path`) — regardless of whether that path is inside the
+            # checkpointed tree at all. The whole-tree checkpoint alone is
+            # blind to anything outside cwd (`rewind.covers()`'s documented
+            # gap); the per-file snapshot is what lets `/undo` work on "the
+            # file I just told you to edit" when that file lives somewhere
+            # else entirely (a Desktop file, say) — the case that broke
+            # twice in production.
+            if tools.needs_approval(call.name) and cb.checkpoint is not None:
+                cb.checkpoint(call.name, call.arguments)
             if idx in prefetched:
                 out = prefetched[idx]   # already ran (and announced) in the
                 # R94 parallel batch above
@@ -333,19 +616,29 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                                                    source_text=out)
                     if decision == "stop":
                         cb.notify("stopped: secret detected in tool output")
-                        round_out.extend(
-                            (c, "[skipped: secret detected — user stopped the turn]")
-                            for c in result.tool_calls[idx:])
+                        # R143c: the one abandon site R134g missed — it
+                        # extended round_out directly, so these calls never
+                        # reached cb.on_tool_result and produced no session
+                        # record at all, undercounting /context's tools: exactly
+                        # as the other three did before R134g.
+                        _skip(result.tool_calls[idx:],
+                              "[skipped: secret detected — user stopped the turn]")
                         _flush()
                         return turn
                     elif decision == "redact":
                         out = secretscan.redact(out, matches)
-            # loop nudge: the model just repeated last round's exact call —
-            # tell it so instead of silently feeding the same output again
-            if (call.name, repr(sorted(call.arguments.items()))) in repeated:
+            # loop nudge: the model just repeated last round's exact call
+            # AND got the exact same result — tell it so instead of silently
+            # feeding the same output again. Keyed on the result too, not
+            # just the call, so a deliberate re-run (write -> test -> fix ->
+            # re-test) whose output changed is never told it's a no-op repeat.
+            key = (call.name, repr(sorted(call.arguments.items())))
+            if last_results.get(key) == out:
                 out += ("\n[note: you already ran this exact call with this "
                         "exact result — do not repeat it; use the result "
                         "above or give your final answer]")
+            this_round_results[key] = out
             _finish(out)
             turn.events.append({"tool": call.name, "args": call.arguments})
+        last_results = this_round_results
         _flush()

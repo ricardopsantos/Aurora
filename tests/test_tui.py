@@ -2,6 +2,7 @@
 built but never run (no terminal needed)."""
 
 import threading
+from pathlib import Path
 
 import pytest
 from prompt_toolkit.keys import Keys
@@ -21,9 +22,86 @@ def _press(t, key):
     raise AssertionError(f"no binding registered for {key}")
 
 
+class _FakeKeyEvent:
+    """Minimal stand-in for prompt_toolkit's KeyPressEvent — enough for the
+    bindings that read `event.arg` (the repeat count)."""
+    arg = 1
+
+
+def _press_with_arg(t, key):
+    """`_press` with a real-enough event object, for bindings whose body
+    touches `event`."""
+    for b in t.app.key_bindings.bindings:
+        if b.keys == (key,):
+            b.handler(_FakeKeyEvent())
+            return
+    raise AssertionError(f"no binding registered for {key}")
+
+
+def _type(t, text):
+    """Insert text the way a keystroke does (so `on_text_insert` fires),
+    minus `complete_while_typing` — the async completer wants a running
+    event loop and the Application is built but never run in these tests."""
+    from prompt_toolkit.filters import to_filter
+    t.input.buffer.complete_while_typing = to_filter(False)
+    t.input.buffer.auto_suggest = None
+    t.input.buffer.insert_text(text)
+
+
+def _press_enter(t):
+    """Drive the real `enter` binding. Needs an event carrying `.app` (the
+    exit-confirm branch calls `event.app.exit()`)."""
+    class _Ev:
+        arg = 1
+        app = t.app
+    for b in t.app.key_bindings.bindings:
+        if b.keys == (Keys.ControlM,):
+            b.handler(_Ev())
+            return
+    raise AssertionError("no binding registered for enter")
+
+
+def test_merge_char_runs_matches_the_naive_implementation():
+    """R148 rewrote this for speed (per-character string rebuild → one join
+    per run). It is only allowed to be faster, never different — every
+    linkify pass downstream depends on its exact output, and a fragment
+    carrying a mouse handler (a 3-tuple) must still pass through unmerged."""
+    import random
+
+    from prompt_toolkit.formatted_text import ANSI
+
+    def naive(frags):
+        out = []
+        for f in frags:
+            if out and out[-1][0] == f[0] and len(out[-1]) == 2 and len(f) == 2:
+                out[-1] = (f[0], out[-1][1] + f[1])
+            else:
+                out.append(f)
+        return out
+
+    random.seed(7)
+    texts = ["", "x", "x" * 4096, "\x1b[2mdim\x1b[0mplain\x1b[31mred\x1b[0m",
+             "\x1b[2m" + "y" * 4000 + "\x1b[0m", "a\x1b[31mb\x1b[0mc" * 300]
+    for _ in range(50):
+        texts.append("".join(
+            random.choice(["\x1b[2m", "\x1b[0m", "\x1b[31m", ""])
+            + "".join(random.choice("abc \n") for _ in range(random.randint(0, 30)))
+            for _ in range(random.randint(0, 40))))
+    for text in texts:
+        frags = ANSI(text).__pt_formatted_text__()
+        assert tui._merge_char_runs(frags) == naive(frags), repr(text[:40])
+
+    h = (lambda e: None)
+    for mixed in ([("class:a", "x"), ("class:a", "y"), ("class:a", "z", h),
+                   ("class:a", "w"), ("class:b", "q")],
+                  [("class:a", "x", h), ("class:a", "y"), ("class:a", "z")],
+                  [], [("c", "only")]):
+        assert tui._merge_char_runs(mixed) == naive(mixed)
+
+
 def _mouse_up():
-    from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton
     from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
     return MouseEvent(position=Point(x=0, y=0), event_type=MouseEventType.MOUSE_UP,
                       button=MouseButton.LEFT, modifiers=frozenset())
 
@@ -31,13 +109,17 @@ def _mouse_up():
 class _Stats:
     model, used, limit, pct, cost_usd, session_id, cost_known = \
         "m", 1200, 64000, 2.0, 0, "s1", False
+    compactions = 0          # R159: default "never folded" — the counter
+    # fragment is only rendered when this is non-zero
 
 
 class _FakeEngine:
+    compactions = 0          # R159 (read by _compactions_click)
     runtime = {}
     cfg = {"_base_dir": None}
     messages = []
     multiline = False
+    _last_resp = ""
 
     def context_stats(self):
         return _Stats()
@@ -50,6 +132,12 @@ class _FakeEngine:
 
     def set_multiline(self, on):
         self.multiline = on
+
+    def last_response(self):
+        return self._last_resp
+
+    def last_prompt(self):
+        return ""
 
 
 @pytest.fixture
@@ -143,6 +231,52 @@ def test_chat_writer_feeds_chat(t):
     w.flush()
     assert "abc" in "".join(t._chat)
     assert w.isatty()
+
+
+def test_chat_writer_coalesces_a_print_statements_two_writes(t, monkeypatch):
+    """R170k: print("hello") calls .write() TWICE (content, then the "\n"
+    end) — each used to be its own append() (lock + app.invalidate()). Both
+    writes of one print() must now land as ONE append() call."""
+    calls = []
+    monkeypatch.setattr(t, "append", lambda s: calls.append(s))
+    w = tui._ChatWriter(t)
+    w.write("hello")     # content — no newline yet, must NOT flush
+    assert calls == []
+    w.write("\n")         # print()'s separate end="\n" write
+    assert calls == ["hello\n"]
+
+
+def test_chat_writer_flushes_immediately_on_embedded_newline(t, monkeypatch):
+    calls = []
+    monkeypatch.setattr(t, "append", lambda s: calls.append(s))
+    w = tui._ChatWriter(t)
+    w.write("line one\nline two")   # a single multi-line write still flushes
+    assert calls == ["line one\nline two"]
+
+
+def test_chat_writer_flush_pushes_a_trailing_partial_line(t, monkeypatch):
+    """flush() used to be a total no-op; a caller doing print(x, end="")
+    for a progress indicator relies on flush() actually pushing what's
+    buffered so far — same contract a real terminal gives a partial line."""
+    calls = []
+    monkeypatch.setattr(t, "append", lambda s: calls.append(s))
+    w = tui._ChatWriter(t)
+    w.write("50%")
+    assert calls == []      # no newline yet — must stay buffered
+    w.flush()
+    assert calls == ["50%"]
+
+
+def test_chat_writer_is_a_real_io_textiobase(t):
+    """R171/B6: subclassing io.TextIOBase means any extension checking
+    `isinstance(sys.stdout, io.IOBase)` sees a real file-like object, and
+    `write()`'s return-chars-accepted contract matches a standard buffered
+    stream instead of being an undocumented surprise."""
+    import io
+    w = tui._ChatWriter(t)
+    assert isinstance(w, io.TextIOBase)
+    assert w.writable()
+    assert w.write("hi") == 2
 
 
 def test_think_entry_collapsed_then_toggle(t):
@@ -349,7 +483,8 @@ def test_run_bootstrap_sync_mode_does_not_spawn_a_thread(tmp_path, monkeypatch):
     """R96f: ui._run_bootstrap(sync=True) — what the TUI worker calls — must
     reach engine.send on the calling thread too, not through _run_turn's
     Ctrl+C thread wrapper."""
-    from aurora import ui, bootstrap as bootstrap_mod
+    from aurora import bootstrap as bootstrap_mod
+    from aurora import ui
     calling_thread = threading.current_thread()
     seen = {}
 
@@ -502,6 +637,59 @@ def test_down_arrow_really_moves_the_cursor_to_the_next_line(t):
     assert buf.text == "line one\nline two"
 
 
+# ── R102: status bar shows what's actually running, not just "thinking…" ──
+def test_running_note_set_on_command_tool_start_and_cleared_on_result(t):
+    t.fe.on_tool_start("run_command", {"command": "npm test"})
+    assert t._running_note == "running: npm test"
+    t.fe.on_tool_result("run_command", "ok")
+    assert t._running_note == ""
+
+
+def test_running_note_uses_a_distinct_label_for_wait_until(t):
+    t.fe.on_tool_start("wait_until", {"command": "curl -sf localhost:3000"})
+    assert t._running_note == "waiting on: curl -sf localhost:3000"
+    t.fe.on_tool_result("wait_until", "ok")
+    assert t._running_note == ""
+
+
+def test_running_note_is_untouched_by_non_command_tools(t):
+    """A read/grep/edit is near-instant — naming every tool call would be
+    status-bar churn, not a useful signal. Only run_command/wait_until get
+    a note at all."""
+    t._running_note = "should not change"
+    t.fe.on_tool_start("read_file", {"path": "x.py"})
+    assert t._running_note == "should not change"
+    t.fe.on_tool_result("read_file", "contents")
+    assert t._running_note == "should not change"
+
+
+def test_running_note_is_truncated(t):
+    long_cmd = "x" * 200
+    t.fe.on_tool_start("run_command", {"command": long_cmd})
+    assert len(t._running_note) <= len("running: ") + tui._RUNNING_NOTE_MAX
+    assert t._running_note.endswith("…")
+
+
+def test_running_note_collapses_embedded_newlines(t):
+    t.fe.on_tool_start("run_command", {"command": "echo one\necho two"})
+    assert "\n" not in t._running_note
+
+
+def test_running_note_cleared_at_begin_turn_and_end_turn(t):
+    """Safety net: a secret-challenge 'stop' mid-tool returns from run_turn
+    without ever calling on_tool_result for that call — begin_turn/end_turn
+    always fire exactly once per turn regardless, so both must clear it."""
+    t.fe.on_tool_start("run_command", {"command": "npm test"})
+    assert t._running_note
+    t.fe.begin_turn()
+    assert t._running_note == ""
+
+    t.fe.on_tool_start("run_command", {"command": "npm test"})
+    assert t._running_note
+    t.fe.end_turn()
+    assert t._running_note == ""
+
+
 def test_begin_think_is_idempotent_per_request(t):
     t.begin_think()
     t.begin_think()
@@ -548,8 +736,7 @@ def test_drag_select_freezes_range_and_offers_copy_button(t, monkeypatch):
     assert t._sel is None             # live drag cleared…
     assert t._sel_frozen == ((0, 6), (1, 5))  # …but stays frozen/highlighted
     # tapping "copy selected" does the actual copy
-    handler = t._copy_selected()
-    handler(_mouse_up())
+    _copy_via_menu(t, "selected")
     assert copied["text"] == "beta\ngamma"
     assert "copied" in t._sel_notice[0]
     assert t._sel_frozen is None      # button disappears after copying
@@ -563,8 +750,74 @@ def test_backwards_drag_normalizes(t, monkeypatch):
     t.sel_begin((0, 7))
     t.sel_drag((0, 4))                # dragged right-to-left
     t.sel_finish()
-    t._copy_selected()(_mouse_up())
+    _copy_via_menu(t, "selected")
     assert copied["text"] == "two"
+
+
+# ── R155: one "copy" button + a picker ──────────────────────────────────────
+def _copy_via_menu(t, key):
+    """Drive the copy picker the way a user does: click the status bar's
+    "copy" button, then pick a row. Goes through `_resolve_menu` (not
+    `_resolve_copy_menu` directly) so the UI-thread delivery path — the
+    `_menu_on_select` callback rather than the answers queue — is exercised
+    too."""
+    t._copy_menu_click()(_mouse_up())
+    keys = [k for k, _ in t._menu_options]
+    assert key in keys, f"{key!r} not offered: {keys}"
+    t._resolve_menu(keys.index(key))
+
+
+def _copy_menu_keys(t):
+    t._copy_menu_click()(_mouse_up())
+    keys = [k for k, _ in t._menu_options]
+    t._resolve_menu(keys.index("cancel"))     # close it again
+    return keys
+
+
+# ── "copy last" — LLM response vs. bash-mode command output (R109) ────────
+def _patched_clipboard(monkeypatch):
+    copied = {}
+    monkeypatch.setattr("aurora.clipboard.copy",
+                        lambda s: copied.update(text=s) or "OSC52")
+    return copied
+
+
+def test_copy_last_with_nothing_yet(t, monkeypatch):
+    copied = _patched_clipboard(monkeypatch)
+    _copy_via_menu(t, "last")
+    assert not copied
+    assert t._sel_notice[0] == "nothing to copy yet"
+
+
+def test_copy_last_copies_llm_response_when_no_bash_output(t, monkeypatch):
+    copied = _patched_clipboard(monkeypatch)
+    t.engine._last_resp = "the answer"
+    _copy_via_menu(t, "last")
+    assert copied["text"] == "the answer"
+    assert "raw response copied" in t._sel_notice[0]
+
+
+def test_copy_last_copies_bash_output_when_no_llm_response(t, monkeypatch):
+    copied = _patched_clipboard(monkeypatch)
+    t._last_bash_output = "total 0\ndrwxr-xr-x  script"
+    t._last_bash_at = 100.0
+    _copy_via_menu(t, "last")
+    assert copied["text"] == "total 0\ndrwxr-xr-x  script"
+    assert "command output copied" in t._sel_notice[0]
+
+
+def test_copy_last_prefers_whichever_is_more_recent(t, monkeypatch):
+    copied = _patched_clipboard(monkeypatch)
+    t.engine._last_resp = "the answer"
+    t._last_llm_at = 50.0
+    t._last_bash_output = "ls output"
+    t._last_bash_at = 100.0            # bash happened AFTER the LLM turn
+    _copy_via_menu(t, "last")
+    assert copied["text"] == "ls output"
+
+    t._last_bash_at = 10.0             # ...and now BEFORE it
+    _copy_via_menu(t, "last")
+    assert copied["text"] == "the answer"
 
 
 def test_new_drag_drops_pending_frozen_selection(t):
@@ -575,6 +828,257 @@ def test_new_drag_drops_pending_frozen_selection(t):
     assert t._sel_frozen is not None
     t.sel_begin((0, 4))               # starting a fresh drag…
     assert t._sel_frozen is None      # …drops the old pending selection
+
+
+# ── prompt-field selection: double-click + "copy selected" (R135a/b) ──────
+def _click_input(t, x=0, y=0, ev=None):
+    # set_app: BufferControl.mouse_handler reaches for the *ambient* app, not
+    # t.app — without it prompt_toolkit hands back its "No layout specified"
+    # dummy and focus lookups fail
+    from prompt_toolkit.application.current import set_app
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+    with set_app(t.app):
+        return t.input.control.mouse_handler(MouseEvent(
+            position=Point(x=x, y=y),
+            event_type=ev or MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT, modifiers=frozenset()))
+
+
+def _focus_input(t):
+    t.app.layout.focus(t.input)
+
+
+def test_double_click_in_the_prompt_selects_the_whole_draft(t):
+    """R135a: prompt_toolkit's default is select-the-word-under-the-cursor;
+    a draft is one thought you replace or copy wholesale."""
+    _focus_input(t)
+    t.input.buffer.text = "explain this bug to me"
+    t.input.buffer.cursor_position = 3
+    _click_input(t)                    # 1st click — no selection yet
+    assert t.input.buffer.selection_state is None
+    _click_input(t)                    # 2nd, inside the window → select all
+    assert t._input_sel_text() == "explain this bug to me"
+
+
+def test_two_slow_clicks_in_the_prompt_are_not_a_double_click(t, monkeypatch):
+    """The gesture is time-boxed — two unrelated clicks a second apart must
+    not silently select (and then let the next keystroke replace) the draft."""
+    _focus_input(t)
+    t.input.buffer.text = "keep me"
+    now = [1000.0]
+    monkeypatch.setattr(tui.time, "monotonic", lambda: now[0])
+    _click_input(t)
+    now[0] += tui._DOUBLE_CLICK_S + 0.1
+    _click_input(t)
+    assert t.input.buffer.selection_state is None
+
+
+def test_copy_selected_copies_the_prompt_selection(t, monkeypatch):
+    """R135b: the button serves the prompt field too, not just the chat."""
+    copied = _patched_clipboard(monkeypatch)
+    _focus_input(t)
+    t.input.buffer.text = "draft text"
+    _click_input(t)
+    _click_input(t)                   # double-click → whole draft selected
+    _copy_via_menu(t, "selected")
+    assert copied["text"] == "draft text"
+    assert t.input.buffer.selection_state is None   # button clears it
+    assert t.input.buffer.text == "draft text"      # …without eating the draft
+
+
+def test_backspace_after_double_click_deletes_the_whole_selection(t):
+    """R138x: backspace is custom-bound (bash-mode-exit-on-empty) and used to
+    call delete_before_cursor() unconditionally, ignoring an active selection
+    — so after a double-click selected the whole draft (R135a), backspace
+    only erased one character instead of the selection."""
+    _focus_input(t)
+    t.input.buffer.text = "draft text"
+    _click_input(t)
+    _click_input(t)                   # double-click → whole draft selected
+    assert t.input.buffer.selection_state is not None
+    # a real event is needed here, not _press's None: the else-branch this
+    # test is about reads event.arg (the repeat count)
+    _press_with_arg(t, Keys.ControlH)
+    assert t.input.buffer.text == ""
+    assert t.input.buffer.selection_state is None
+
+
+def test_copy_selected_row_is_offered_only_when_there_is_a_selection(t):
+    """R155: the selection-aware option moved from a fifth status-bar button
+    into a menu row, but the predicate behind it is unchanged — a prompt
+    selection must surface it, or the copy path is unreachable."""
+    _focus_input(t)
+    assert "selected" not in _copy_menu_keys(t)
+    t.input.buffer.text = "hello"
+    _click_input(t)
+    _click_input(t)
+    assert "selected" in _copy_menu_keys(t)
+
+
+def test_the_status_bar_shows_one_copy_button_not_four(t):
+    """R155: "session id", "copy last", "copy all" and "copy selected" were
+    four separate fixed-width buttons on a bar that kept running out of
+    room."""
+    bar = "".join(f[1] for f in _status_frags(t))
+    assert "copy" in bar
+    for gone in ("copy last", "copy all", "session id", "copy selected"):
+        assert gone not in bar, gone
+
+
+def test_opening_the_copy_menu_does_not_eat_the_draft(t, monkeypatch):
+    """`_open_ui_menu` resets the input buffer, which clears the TEXT and not
+    just the selection — so the picker would cost the user a half-typed
+    prompt. The button it replaced only ever dropped the selection."""
+    _patched_clipboard(monkeypatch)
+    _focus_input(t)
+    t.input.buffer.text = "half-typed prompt"
+    _copy_via_menu(t, "cancel")
+    assert t.input.buffer.text == "half-typed prompt"
+    t.input.buffer.text = "another draft"
+    _copy_via_menu(t, "id")
+    assert t.input.buffer.text == "another draft"
+
+
+def test_input_height_accounts_for_word_wrap_not_just_char_count(t, monkeypatch):
+    """R171/B5: a plain ceil-div on char count ignores `wrap_lines=True`'s
+    actual WORD wrap, which breaks before the column edge whenever a word
+    wouldn't fit whole — undercounting rows on a narrow terminal and
+    clipping the cursor below the visible input box (no scrollback there)."""
+    class _Size:
+        columns = 20
+    monkeypatch.setattr(t.app.output, "get_size", lambda: _Size())
+    # crafted so word-boundary wrapping needs one more row than a plain
+    # char-count ceil-div over the same (cols=20, "> " prompt) predicts
+    t.input.buffer.text = "aaa aaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaa aaaaaaaaaaaaaaaaa"
+    height_fn = t.input.window.height
+    dim = height_fn()
+    assert dim.preferred == 4    # old ceil-div formula would have said 3
+
+
+def test_open_ui_menu_preserves_a_half_typed_draft_generically(t):
+    """R171/B4: R155/R159 fixed this per-caller (copy menu, compactions
+    click) but `_open_ui_menu` itself still did an unconditional
+    `buffer.reset()` — every Esc-Esc confirm (cancel/leave-bash/quit) opens
+    through it with no draft save of its own. The fix moves the save/restore
+    into `_open_ui_menu`/`_resolve_menu` so EVERY caller gets it for free,
+    not just the ones that opted in."""
+    _focus_input(t)
+    t.input.buffer.text = "half-typed prompt"
+    fired = []
+    t._open_ui_menu("Quit Aurora?", [("yes", "Yes"), ("no", "No")],
+                    lambda key: fired.append(key))
+    assert t.input.buffer.text == ""    # reset while the menu is open
+    t._resolve_menu(1)                  # "no"
+    assert fired == ["no"]
+    assert t.input.buffer.text == "half-typed prompt"
+
+
+def test_copy_menu_defaults_to_the_selection_when_there_is_one(t):
+    """If you just selected text and clicked copy, that's the intent — Enter
+    should do it. Order stays fixed so the digit shortcuts don't shift."""
+    _focus_input(t)
+    t._copy_menu_click()(_mouse_up())
+    assert t._menu_options[t._menu_index][0] == "last"   # no selection
+    t._resolve_menu([k for k, _ in t._menu_options].index("cancel"))
+    t.input.buffer.text = "hello"
+    _click_input(t)
+    _click_input(t)
+    t._copy_menu_click()(_mouse_up())
+    assert t._menu_options[t._menu_index][0] == "selected"
+    assert [k for k, _ in t._menu_options][:3] == ["last", "session", "id"]
+
+
+def test_copy_menu_reports_a_selection_that_vanished(t, monkeypatch):
+    """The selection is captured at click time; if it's gone by the time the
+    row is picked, say so instead of silently copying nothing."""
+    copied = _patched_clipboard(monkeypatch)
+    t.append("alpha beta\n")
+    t.sel_begin((0, 0))
+    t.sel_drag((0, 5))
+    t.sel_finish()
+    t._copy_menu_click()(_mouse_up())
+    t._copy_menu_sel = ""             # e.g. a redraw dropped it
+    t._resolve_menu([k for k, _ in t._menu_options].index("selected"))
+    assert not copied
+    assert t._sel_notice[0] == "selection is gone"
+
+
+def test_rendering_the_button_does_not_destroy_the_prompt_selection(t):
+    """`Buffer.copy_selection()` drops the selection as a side effect, and the
+    status bar re-renders every tick — reading the text to decide whether to
+    show the button must not be what clears it."""
+    _focus_input(t)
+    t.input.buffer.text = "hello"
+    _click_input(t)
+    _click_input(t)
+    for _ in range(3):
+        _status_frags(t)
+    assert t._input_sel_text() == "hello"
+
+
+def test_only_one_selection_is_live_at_a_time(t):
+    """"copy selected" is a single button — it must never be ambiguous about
+    which pane it copies, so each new selection drops the other."""
+    _focus_input(t)
+    t.input.buffer.text = "draft"
+    _click_input(t)
+    _click_input(t)
+    t.append("alpha beta\n")
+    t.sel_begin((0, 0))               # a chat drag…
+    t.sel_drag((0, 5))
+    t.sel_finish()
+    assert t._input_sel_text() == ""  # …drops the prompt selection
+    _click_input(t)
+    _click_input(t)                   # and a prompt double-click…
+    assert t._sel_frozen is None      # …drops the frozen chat one
+
+
+def test_a_plain_drag_in_the_prompt_drops_a_frozen_chat_selection(t):
+    """R135f: R135b's "only one selection is ever live" invariant was only
+    enforced on the double-click branch — a plain click-drag inside the
+    prompt (MOUSE_DOWN then MOUSE_UP, no double-click) skipped it entirely,
+    so a frozen chat selection stayed lit up (and copyable) alongside a
+    fresh prompt one."""
+    from prompt_toolkit.mouse_events import MouseEventType
+    t.append("alpha beta\n")
+    t.sel_begin((0, 0))
+    t.sel_drag((0, 5))
+    t.sel_finish()
+    assert t._sel_frozen is not None
+    _focus_input(t)
+    _click_input(t, ev=MouseEventType.MOUSE_DOWN)   # a plain click/drag start
+    assert t._sel_frozen is None
+
+
+def test_third_click_after_a_double_click_does_not_reselect_everything(t, monkeypatch):
+    """R135f: firing the double-click used to leave `_input_click_at` set to
+    that very click's timestamp, so a third click shortly after (meant to
+    place the cursor) paired with it and re-selected the whole draft instead
+    of moving the cursor.
+
+    The headless test Application never runs a real render pass, so
+    `BufferControl`'s own MOUSE_UP handling is inert here (its position
+    translation needs `_last_get_processed_line`, which only gets set by an
+    actual render) — a real MOUSE_DOWN's `buffer.exit_selection()` is
+    simulated by hand to stand in for what a real terminal would do before
+    the third click's MOUSE_UP arrives. What this isolates and proves is the
+    actual fix: whether OUR wrapper re-fires the select-all branch a second
+    time, which it must not."""
+    _focus_input(t)
+    t.input.buffer.text = "explain this bug to me"
+    now = [1000.0]
+    monkeypatch.setattr(tui.time, "monotonic", lambda: now[0])
+    _click_input(t)                     # 1st click
+    now[0] += 0.05
+    _click_input(t)                     # 2nd, within window → selects all
+    assert t._input_sel_text() == "explain this bug to me"
+    assert t._input_click_at == 0.0, "the firing click must be consumed"
+    t.input.buffer.exit_selection()     # stand-in for a real MOUSE_DOWN
+    now[0] += 0.05                      # well within the double-click window
+    _click_input(t, x=3)                # 3rd click — meant to place the cursor
+    assert t._input_sel_text() == "", \
+        "third click re-selected everything instead of leaving the cursor placed"
 
 
 def test_plain_click_is_not_a_copy(t):
@@ -670,6 +1174,7 @@ def test_osc52_never_writes_to_redirected_stdout(monkeypatch):
     write there renders as visible garbage. It must go to /dev/tty or the
     real process stdout, never sys.stdout."""
     import io
+
     from aurora import clipboard
 
     class TtyLike(io.StringIO):
@@ -718,6 +1223,34 @@ def test_approve_comment_choice_prompts_for_guidance(monkeypatch):
     assert (key, note) == ("c", "please use rsync instead")
 
 
+def test_approve_offers_an_explain_choice(monkeypatch):
+    """R103: "e" is a plain pass-through answer at this layer — the
+    explain-then-reask LOOP lives in agent.py, which has provider access;
+    ui.approve() just needs to offer and return the choice."""
+    from aurora import ui
+    fe = ui.TerminalFrontend()
+    answers = iter(["e"])
+    monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+    key, note = fe.approve("run_command", {"command": "ls"}, "")
+    assert key == "e" and note == ""
+
+
+def test_approve_shows_wait_until_command_and_then(monkeypatch, capsys):
+    """Bug fix: wait_until used to fall through to the generic branch (which
+    only ever shows `path`, empty for wait_until) — the polled command, and
+    now its optional `then` follow-up, never appeared at the approval
+    prompt at all."""
+    from aurora import ui
+    fe = ui.TerminalFrontend()
+    answers = iter(["y"])
+    monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+    fe.approve("wait_until", {"command": "curl -sf localhost:8080/health",
+                              "then": "curl -s localhost:8080/version"}, "")
+    out = capsys.readouterr().out
+    assert "curl -sf localhost:8080/health" in out
+    assert "curl -s localhost:8080/version" in out
+
+
 def test_approve_menu_accepts_number_or_key(monkeypatch):
     from aurora import ui
     fe = ui.TerminalFrontend()
@@ -730,6 +1263,28 @@ def test_approve_menu_accepts_number_or_key(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
     key, _ = fe.approve("run_command", {"command": "ls"}, "")
     assert key == "y"
+
+
+def test_secret_challenge_v_toggles_masking_then_reasks(monkeypatch, capsys):
+    """The 'v' choice must re-render the challenge with the token
+    masked/shown and ask again — never a terminal answer on its own, same
+    shape as the approval gate's 'e'xplain loop."""
+    from aurora import secrets as secretscan
+    from aurora import ui
+    fe = ui.TerminalFrontend()
+    text = f"export AWS_ACCESS_KEY_ID={_AWS1}"
+    matches = secretscan.scan(text)
+    answers = iter(["v", "keep"])
+    monkeypatch.setattr(ui, "select", lambda *_a, **_k: next(answers))
+    result = fe.secret_challenge("tool:read_file", matches, source_text=text)
+    assert result == "keep"
+    out = capsys.readouterr().out
+    assert out.count("possible secret detected") == 2   # rendered twice: before/after toggle
+    assert _AWS1 in out              # first (unmasked) render shows it
+    assert "AWS access key hidden" in out   # second (masked) render doesn't
+
+
+_AWS1 = "AKIA" + "IOSFODNN7EXAMPLE"
 
 
 def test_ask_continue_comment_choice_is_guidance(monkeypatch):
@@ -773,6 +1328,103 @@ def test_select_menu_roundtrip_returns_chosen_key(t):
     th.join(timeout=2)
     assert got["key"] == "n"
     assert t._menu_options is None      # torn down after the answer
+
+def test_a_worker_menu_opened_over_an_esc_confirm_still_gets_its_answer(t):
+    """R142a: the Esc-Esc confirms (_open_ui_menu, UI thread) and the blocking
+    challenges (select_menu, worker thread) share ONE menu slot but resolve
+    differently, and _resolve_menu checks _menu_on_select FIRST. select_menu
+    overwrote _menu_prompt/_menu_options without clearing that callback, so
+    the answer to ITS menu was delivered to the Esc confirm's resolver and
+    never reached _answers — the worker blocked forever, mid-turn, with no
+    way out but quitting."""
+    got = {}
+    fired = []
+    # a turn is running and the user taps Esc-Esc → "Cancel this?" opens
+    t._open_ui_menu("Cancel this?", [("cancel", "Yes"), ("no", "No")],
+                    lambda key: fired.append(key))
+    assert t._menu_on_select is not None
+
+    def worker():                      # …then the agent hits an approval gate
+        got["key"] = t.select_menu("Approve?", _OPTS)
+
+    # daemon: on the PRE-fix code this thread never wakes, and a non-daemon
+    # one would hang the whole suite at exit instead of failing the assert
+    th = threading.Thread(target=worker, daemon=True)
+    th.start()
+    while t._menu_prompt != "Approve?":
+        pass
+    t._resolve_menu(1)                 # the user answers the APPROVAL menu
+    th.join(timeout=2)
+    assert not th.is_alive(), "worker never woke — select_menu deadlocked"
+    assert got["key"] == "n"           # the answer reached its real caller
+    assert fired == []                 # and was NOT fed to the Esc resolver
+
+
+def test_opening_the_editor_closes_the_help_overlay(t, tmp_path):
+    """R150b: help and the editor both occupy the chat area but their
+    visibility filters are independent, so `?` then `/nano <file>` drew BOTH,
+    splitting the screen — and help was then undismissable, since `?` and its
+    click target need `self._editor is None` while Escape is
+    `filter=_no_editor`."""
+    f = tmp_path / "notes.md"
+    f.write_text("hello\n")
+    t._help_visible = True
+    t.open_nano(f, check_busy=False)
+    assert t._editor is not None
+    assert not t._help_visible
+
+
+def test_an_out_of_range_digit_does_not_leak_into_the_hidden_buffer(t):
+    """R150c: a digit past the menu's option count fell through to
+    insert_text, into the buffer the menu is drawn over — invisible, because
+    the input line collapses to one hidden row while a menu is open. The
+    Keys.Any fallback exists to swallow exactly this, but a digit binding is
+    more specific and wins."""
+    t._open_ui_menu("Cancel this?", [("cancel", "Yes"), ("no", "No")],
+                    lambda key: None)
+    for b in t.app.key_bindings.bindings:
+        if b.keys == ("5",):
+            b.handler(None)
+            break
+    else:
+        raise AssertionError("no binding for digit 5")
+    assert t.input.buffer.text == ""
+    assert t._menu_options is not None      # menu untouched, still awaiting
+
+
+def test_esc_closes_a_completion_popup_before_arming_leave_bash(t):
+    """R150d: the bash-mode branch sat ahead of the completion branch,
+    contradicting _on_escape's own documented priority. In bash mode with
+    `cd Doc<Tab>`'s popup open, Esc armed the leave-bash gesture instead of
+    dismissing the popup."""
+    from prompt_toolkit.buffer import CompletionState
+    from prompt_toolkit.completion import Completion
+
+    t._bash_mode = True
+    _type(t, "cd Doc")
+    buf = t.input.buffer
+    # a real CompletionState — cancel_completion() drives it, so a stub
+    # without go_to_index() would only prove the stub is wrong
+    buf.complete_state = CompletionState(
+        original_document=buf.document,
+        completions=[Completion("Documents", start_position=-3)])
+    assert buf.complete_state
+    t._on_escape(lambda: None)
+    assert buf.complete_state is None       # popup dismissed…
+    assert t._esc_armed != "bash"           # …and the gesture NOT armed
+    assert t._bash_mode                     # still in bash mode
+
+
+def test_esc_in_bash_mode_clears_a_typed_command_before_arming(t):
+    """The `elif buf.text` clear-the-draft branch was unreachable in bash
+    mode, so Esc on an unwanted shell command never cleared it."""
+    t._bash_mode = True
+    _type(t, "rm -rf something")
+    t._on_escape(lambda: None)
+    assert t.input.buffer.text == ""
+    assert t._esc_armed != "bash"
+    assert t._bash_mode
+
 
 def test_select_menu_pointer_tracks_index(t):
     # a label can carry raw ANSI colour (e.g. /model's tags), so a row is now
@@ -831,17 +1483,23 @@ def _status_line2(t):
     from prompt_toolkit.layout.controls import FormattedTextControl
     ctrl = next(c for c in t.app.layout.find_all_controls()
                 if isinstance(c, FormattedTextControl)
-                and any("session " in f[1] for f in
+                # R155: anchored on the ctx gauge, not the (removed) session-id
+                # button — a label that only one control ever renders
+                and any("ctx " in f[1] for f in
                         (c.text() if callable(c.text) else c.text)))
     text = "".join(f[1] for f in ctrl.text())
-    return text.split("\n")[1].strip()
+    # R137: a blank row sits between line 1 and line 2 now (status window
+    # grew 2 rows -> 3), so the tooltip/hint content is index 2, not 1.
+    return text.split("\n")[2].strip()
 
 
 def _status_line1(t):
     from prompt_toolkit.layout.controls import FormattedTextControl
     ctrl = next(c for c in t.app.layout.find_all_controls()
                 if isinstance(c, FormattedTextControl)
-                and any("session " in f[1] for f in
+                # R155: anchored on the ctx gauge, not the (removed) session-id
+                # button — a label that only one control ever renders
+                and any("ctx " in f[1] for f in
                         (c.text() if callable(c.text) else c.text)))
     text = "".join(f[1] for f in ctrl.text())
     return text.split("\n")[0].strip()
@@ -897,7 +1555,9 @@ def test_agentic_report_shown_and_underlined_when_detected(t, tmp_path):
     from prompt_toolkit.layout.controls import FormattedTextControl
     ctrl = next(c for c in t.app.layout.find_all_controls()
                 if isinstance(c, FormattedTextControl)
-                and any("session " in f[1] for f in
+                # R155: anchored on the ctx gauge, not the (removed) session-id
+                # button — a label that only one control ever renders
+                and any("ctx " in f[1] for f in
                         (c.text() if callable(c.text) else c.text)))
     frag = next(f for f in ctrl.text() if f[1] == "agentic report")
     # class:status.id carries "underline" in the app's Style.from_dict —
@@ -913,6 +1573,33 @@ def test_agentic_report_click_queues_the_command(t, tmp_path):
     t._agentic_report_click()(_mouse_up())
     assert t._inbox.get_nowait() == "/agentic_report"
     assert any("/agentic_report" in e for e in t._chat if isinstance(e, str))
+
+
+def test_copy_all_click_queues_the_command_instead_of_working_inline(t, monkeypatch):
+    """R129: the "copy all" button's work is UNBOUNDED — it parses the whole
+    session JSONL (which only grows, R20) and then spawns a clipboard
+    subprocess with a 5s timeout, all from a mouse handler on the UI
+    event-loop thread. It now queues `/copy-all` for the worker instead,
+    same as the agentic-report button (R89).
+
+    Asserted by proving neither expensive call happens on the calling
+    thread: a failure here is a frozen UI, which no output assertion would
+    catch."""
+    from aurora import clipboard
+    from aurora import session as sessions
+
+    called = []
+    monkeypatch.setattr(sessions, "export_markdown",
+                        lambda *a, **k: called.append("export") or "")
+    monkeypatch.setattr(clipboard, "copy",
+                        lambda *a, **k: called.append("clipboard") or "x")
+
+    _copy_via_menu(t, "session")
+
+    assert t._inbox.get_nowait() == "/copy-all"
+    assert called == [], f"ran on the UI thread: {called}"
+    # echoed into the chat, same feedback shape as the agentic-report click
+    assert any("/copy-all" in e for e in t._chat if isinstance(e, str))
 
 
 def test_click_dismisses_copy_notice_early(t):
@@ -932,6 +1619,34 @@ def test_click_prompt_leaves_bash_mode(t):
     t.input.buffer.document = t.input.buffer.document.__class__("some typed command")
     handler = t._leave_bash_mode_click()
     handler(_mouse_up())
+    assert t._bash_mode is False
+    assert t.input.buffer.text == ""
+
+
+def _mode_label_frag(t):
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    ctrl = next(c for c in t.app.layout.find_all_controls()
+                if isinstance(c, FormattedTextControl)
+                # R155: anchored on the ctx gauge, not the (removed) session-id
+                # button — a label that only one control ever renders
+                and any("ctx " in f[1] for f in
+                        (c.text() if callable(c.text) else c.text)))
+    return next(f for f in ctrl.text() if f[1] in ("prompt mode", "bash mode"))
+
+
+def test_click_mode_label_enters_bash_mode(t):
+    frag = _mode_label_frag(t)
+    assert frag[1] == "prompt mode"
+    frag[2](_mouse_up())
+    assert t._bash_mode is True
+
+
+def test_click_mode_label_leaves_bash_mode(t):
+    t._bash_mode = True
+    t.input.buffer.document = t.input.buffer.document.__class__("some typed command")
+    frag = _mode_label_frag(t)
+    assert frag[1] == "bash mode"
+    frag[2](_mouse_up())
     assert t._bash_mode is False
     assert t.input.buffer.text == ""
 
@@ -1030,6 +1745,7 @@ def test_esc_confirm_is_reset_when_state_changes(t):
 
 def test_bash_mode_toggle_run_and_exit(t):
     import time
+
     from prompt_toolkit.input.defaults import create_pipe_input
     from prompt_toolkit.output import DummyOutput
     with create_pipe_input() as pipe:
@@ -1058,8 +1774,8 @@ def test_completion_menu_ignores_stray_mouse_when_no_completion(monkeypatch):
     # prompt_toolkit crashes if a MOUSE_UP hits the completion menu while
     # complete_state is None (stray click after returning to the window). The
     # guarded control must swallow it instead of asserting.
-    from prompt_toolkit.mouse_events import MouseEvent, MouseEventType, MouseButton
     from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
     ctrl = tui._SafeCompletionsMenuControl()
 
     class _Buf: complete_state = None
@@ -1069,6 +1785,872 @@ def test_completion_menu_ignores_stray_mouse_when_no_completion(monkeypatch):
     ev = MouseEvent(position=Point(x=0, y=0), event_type=MouseEventType.MOUSE_UP,
                     button=MouseButton.LEFT, modifiers=frozenset())
     assert ctrl.mouse_handler(ev) is None      # no AssertionError
+
+
+def test_bash_mode_cd_persists_across_commands(t, tmp_path, monkeypatch):
+    # regression: subprocess.run's own `cd` only affects that throwaway
+    # child process, so a second `!` command used to land back in the
+    # original directory — `cd` must be intercepted and tracked ourselves.
+    from aurora import ui
+    (tmp_path / "script").mkdir()
+    monkeypatch.setattr(t, "_banner", lambda: None)
+    monkeypatch.setattr("aurora.bootstrap.load", lambda cwd: ("", None))
+    monkeypatch.setattr(t.app, "exit", lambda: None)
+    monkeypatch.setattr(ui, "_send_turn", lambda *a, **k: None)
+
+    t._bash_cwd = str(tmp_path)
+    t._inbox.put("!cd script")
+    t._inbox.put("!pwd")
+    t._inbox.put("/exit")
+    th = threading.Thread(target=t._worker, daemon=True)
+    th.start()
+    th.join(timeout=2)
+    assert not th.is_alive()
+    assert t._bash_cwd == str(tmp_path / "script")
+
+
+def test_bash_mode_cd_to_missing_dir_reports_error(t, monkeypatch):
+    from aurora import ui
+    monkeypatch.setattr(t, "_banner", lambda: None)
+    monkeypatch.setattr("aurora.bootstrap.load", lambda cwd: ("", None))
+    monkeypatch.setattr(t.app, "exit", lambda: None)
+    monkeypatch.setattr(ui, "_send_turn", lambda *a, **k: None)
+
+    before = t._bash_cwd
+    t._inbox.put("!cd does-not-exist")
+    t._inbox.put("/exit")
+    th = threading.Thread(target=t._worker, daemon=True)
+    th.start()
+    th.join(timeout=2)
+    assert not th.is_alive()
+    assert t._bash_cwd == before
+
+
+def test_bash_mode_command_is_timeout_and_process_group_safe(t, monkeypatch):
+    # R125c regression: bash mode used a bare subprocess.run(shell=True)
+    # with no timeout and no process-group ownership, unlike run_command/
+    # wait_until — a hung `!` command wedged _worker (the TUI's sole inbox
+    # consumer) forever. It must now go through tools._run_command_once,
+    # the same hardened path.
+    from aurora import tools as _tools
+    from aurora import ui
+    calls = []
+    monkeypatch.setattr(_tools, "_run_command_once",
+                        lambda command, workdir, timeout=None:
+                        (calls.append((command, workdir)) or ("hi", 0)))
+    monkeypatch.setattr(t, "_banner", lambda: None)
+    monkeypatch.setattr("aurora.bootstrap.load", lambda cwd: ("", None))
+    monkeypatch.setattr(t.app, "exit", lambda: None)
+    monkeypatch.setattr(ui, "_send_turn", lambda *a, **k: None)
+
+    t._inbox.put("!echo hi")
+    t._inbox.put("/exit")
+    th = threading.Thread(target=t._worker, daemon=True)
+    th.start()
+    th.join(timeout=2)
+    assert not th.is_alive()
+    assert calls == [("echo hi", t._bash_cwd)]
+
+
+def test_bash_mode_reports_a_timed_out_command(t, monkeypatch):
+    from aurora import tools as _tools
+    from aurora import ui
+    monkeypatch.setattr(_tools, "_run_command_once",
+                        lambda command, workdir, timeout=None: ("partial", None))
+    monkeypatch.setattr(t, "_banner", lambda: None)
+    monkeypatch.setattr("aurora.bootstrap.load", lambda cwd: ("", None))
+    monkeypatch.setattr(t.app, "exit", lambda: None)
+    monkeypatch.setattr(ui, "_send_turn", lambda *a, **k: None)
+
+    t._inbox.put("!sleep 999")
+    t._inbox.put("/exit")
+    th = threading.Thread(target=t._worker, daemon=True)
+    th.start()
+    th.join(timeout=2)
+    assert not th.is_alive()
+    assert "timeout after" in t._last_bash_output
+
+
+def test_bash_mode_clear_wipes_scrollback(t, monkeypatch):
+    # regression (R116): `clear`/`cls` in bash mode used to fall through to
+    # subprocess.run, whose captured stdout (an ANSI escape blob, since
+    # there's no real tty) got dumped into the transcript instead of
+    # actually clearing anything.
+    from aurora import ui
+    monkeypatch.setattr(t, "_banner", lambda: None)
+    monkeypatch.setattr("aurora.bootstrap.load", lambda cwd: ("", None))
+    monkeypatch.setattr(t.app, "exit", lambda: None)
+    monkeypatch.setattr(ui, "_send_turn", lambda *a, **k: None)
+
+    t.append("some prior chat output\n")
+    t._fragments()                      # force-populate _text_cache, like a real render
+    assert t._chat
+    t._inbox.put("!clear")
+    t._inbox.put("/exit")
+    th = threading.Thread(target=t._worker, daemon=True)
+    th.start()
+    th.join(timeout=2)
+    assert not th.is_alive()
+    assert t._chat == []
+    assert t._cache == []
+    # regression: clear_screen() used to reset _chat/_cache but leave
+    # _text_cache (what _fragments() actually returns to the renderer)
+    # untouched, so the pre-clear screen kept rendering forever.
+    assert t._fragments() == []
+
+
+def test_bash_cd_target_parsing():
+    from aurora.tui import Tui
+    assert Tui._bash_cd_target("cd foo") == "foo"
+    assert Tui._bash_cd_target("cd") == "~"
+    assert Tui._bash_cd_target("ls -la") is None
+    assert Tui._bash_cd_target("cd foo && ls") is None
+    assert Tui._bash_cd_target("cdfoo") is None       # not a "cd" word
+
+
+def test_bash_cd_target_handles_unquoted_spaces(t):
+    # bug fix: cd only ever takes one path argument, so an unquoted
+    # multi-word remainder is the target (a real folder name with a
+    # space), not "too many arguments" — this is exactly what
+    # PathCompleter's Tab-completion inserts (it does not escape spaces),
+    # so this was reachable just by typing `cd Del<Tab>` in bash mode
+    from aurora.tui import Tui
+    assert Tui._bash_cd_target("cd Delete Latter") == "Delete Latter"
+    assert Tui._bash_cd_target("cd foo bar") == "foo bar"
+
+
+def test_bash_cd_target_strips_matching_quotes():
+    from aurora.tui import Tui
+    assert Tui._bash_cd_target('cd "Delete Latter"') == "Delete Latter"
+    assert Tui._bash_cd_target("cd 'Delete Latter'") == "Delete Latter"
+
+
+def test_bash_mode_cd_into_folder_with_space(t, tmp_path, monkeypatch):
+    from aurora import ui
+    (tmp_path / "Delete Latter").mkdir()
+    monkeypatch.setattr(t, "_banner", lambda: None)
+    monkeypatch.setattr("aurora.bootstrap.load", lambda cwd: ("", None))
+    monkeypatch.setattr(t.app, "exit", lambda: None)
+    monkeypatch.setattr(ui, "_send_turn", lambda *a, **k: None)
+
+    t._bash_cwd = str(tmp_path)
+    t._inbox.put("!cd Delete Latter")
+    t._inbox.put("/exit")
+    th = threading.Thread(target=t._worker, daemon=True)
+    th.start()
+    th.join(timeout=2)
+    assert not th.is_alive()
+    assert t._bash_cwd == str(tmp_path / "Delete Latter")
+
+
+# ── /nano — built-in editor (R110) ─────────────────────────────────────────
+def test_nano_opens_valid_file(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    assert t._editor is not None
+    assert t._editor["path"] == p
+    assert t._editor_area.buffer.text == "hello"
+    assert not t._nano_dirty()
+
+
+def test_nano_opens_shell_script(t, tmp_path):
+    p = tmp_path / "deploy.sh"
+    p.write_text("#!/usr/bin/env bash\necho hi\n")
+    t.open_nano(p)
+    assert t._editor is not None
+    assert t._editor["path"] == p
+
+
+def test_nano_status_button_order(t, tmp_path):
+    # close/save come before page up/page down (per explicit ordering request)
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    labels = [f[1] for f in t._nano_status_fragments() if f[1].strip() not in ("", "·")]
+    assert labels.index("close") < labels.index("page up") < labels.index("page down")
+
+    t._editor_area.buffer.text = "hello world"
+    labels = [f[1] for f in t._nano_status_fragments() if f[1].strip() not in ("", "·")]
+    assert (labels.index("save") < labels.index("save and close")
+            < labels.index("close") < labels.index("page up") < labels.index("page down"))
+
+
+def test_nano_status_actions_on_line1_underlined_filename_on_line2_plain(t, tmp_path):
+    p = tmp_path / "sub" / "notes.txt"
+    p.parent.mkdir()
+    p.write_text("hello")
+    t.open_nano(p)
+    frags = t._nano_status_fragments()
+    # R137: the separator is "\n\n" (a blank row) now that the status window
+    # is 3 rows, not a bare "\n"
+    nl = next(i for i, f in enumerate(frags) if f[1] == "\n\n")
+    line1, line2 = frags[:nl], frags[nl + 1:]
+
+    line1_labels = {f[1] for f in line1}
+    assert {"close", "page up", "page down"} <= line1_labels
+    for f in line1:
+        if f[1].strip() and f[1].strip() != "·":
+            assert f[0] == "class:status.id", f  # underlined, tappable
+
+    line2_text = "".join(f[1] for f in line2)
+    assert "notes.txt" in line2_text
+    assert str(p) not in line2_text          # bare filename only, no path
+    assert all(f[0] != "class:status.id" for f in line2)  # not underlined
+
+
+def test_nano_refuses_bad_extension(t, tmp_path, capsys):
+    p = tmp_path / "script.py"
+    p.write_text("print(1)")
+    t.open_nano(p)
+    assert t._editor is None
+    assert "unsupported file type" in capsys.readouterr().out
+
+
+def test_nano_refuses_missing_file(t, tmp_path, capsys):
+    t.open_nano(tmp_path / "ghost.txt")
+    assert t._editor is None
+    assert "no such file" in capsys.readouterr().out
+
+
+def test_nano_refuses_oversized_file(t, tmp_path, capsys):
+    p = tmp_path / "big.txt"
+    p.write_bytes(b"x" * (tui._NANO_MAX_BYTES + 1))
+    t.open_nano(p)
+    assert t._editor is None
+    assert "too large" in capsys.readouterr().out
+
+
+def test_nano_edit_marks_dirty(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    t._editor_area.buffer.text = "hello world"
+    assert t._nano_dirty()
+
+
+def test_nano_save_writes_and_clears_dirty(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    t._editor_area.buffer.text = "hello world"
+    t._nano_save_click()(_mouse_up())
+    assert p.read_text() == "hello world"
+    assert not t._nano_dirty()
+    assert t._editor is not None          # save keeps the editor open
+
+
+def test_nano_close_while_clean_closes_on_the_first_click(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    t._nano_close_click()(_mouse_up())
+    assert t._editor is None
+
+
+def test_nano_close_while_dirty_requires_a_second_click_to_discard(t, tmp_path):
+    """R125c: closing over unsaved edits must not be a single silent click
+    — it's the only way out of the editor and had no confirm at all before.
+    First click arms it (editor stays open, nothing written); second click
+    actually discards and closes."""
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    t._editor_area.buffer.text = "hello world"
+
+    t._nano_close_click()(_mouse_up())     # first click: arms, doesn't close
+    assert t._editor is not None
+    assert t._nano_close_confirm
+    assert p.read_text() == "hello"
+
+    t._nano_close_click()(_mouse_up())     # second click: actually closes
+    assert t._editor is None
+    assert p.read_text() == "hello"        # discarded, not written
+
+
+def test_nano_editing_after_arming_close_disarms_it(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    t._editor_area.buffer.text = "hello world"
+    t._nano_close_click()(_mouse_up())     # arm
+    assert t._nano_close_confirm
+    t._editor_area.buffer.text = "hello world!"   # further edit disarms it
+    assert not t._nano_close_confirm
+
+
+def test_nano_saving_after_arming_close_disarms_it(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    t._editor_area.buffer.text = "hello world"
+    t._nano_close_click()(_mouse_up())     # arm
+    assert t._nano_close_confirm
+    t._nano_save_click()(_mouse_up())
+    assert not t._nano_close_confirm
+
+
+def test_nano_save_and_close(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    t._editor_area.buffer.text = "hello world"
+    t._nano_save_close_click()(_mouse_up())
+    assert t._editor is None
+    assert p.read_text() == "hello world"
+
+
+def test_nano_status_shows_only_close_when_clean(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    frags = t._nano_status_fragments()
+    labels = [f[1] for f in frags]
+    assert "close" in labels
+    assert "save" not in labels
+    assert "save and close" not in labels
+
+
+def test_nano_status_shows_save_buttons_when_dirty(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    t._editor_area.buffer.text = "hello world"
+    frags = t._nano_status_fragments()
+    labels = [f[1] for f in frags]
+    assert "save" in labels
+    assert "save and close" in labels
+
+
+def test_nano_status_always_shows_page_up_down(t, tmp_path):
+    # scrolling isn't a save/close action — must be present clean OR dirty
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    assert {"page up", "page down"} <= {f[1] for f in t._nano_status_fragments()}
+    t._editor_area.buffer.text = "hello world"
+    assert {"page up", "page down"} <= {f[1] for f in t._nano_status_fragments()}
+
+
+def test_nano_status_shows_cursor_line_and_dirty_mark(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("a\nb\nc\n")
+    t.open_nano(p)
+    doc = t._editor_area.buffer.document
+    t._editor_area.buffer.cursor_position = doc.translate_row_col_to_index(2, 0)
+    line1 = "".join(f[1] for f in t._nano_status_fragments()
+                    if f[0] in ("class:status", "class:status.id"))
+    assert "line 3/4" in line1
+    assert "[modified]" not in line1
+
+    t._editor_area.buffer.text = "a\nCHANGED\nc\n"
+    line1 = "".join(f[1] for f in t._nano_status_fragments()
+                    if f[0] in ("class:status", "class:status.id"))
+    assert "[modified]" in line1
+
+
+def test_nano_editor_has_line_numbers(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    from prompt_toolkit.layout.margins import NumberedMargin
+    assert any(isinstance(m, NumberedMargin)
+               for m in t._editor_area.window.left_margins)
+
+
+def test_nano_page_click_handlers_call_scroll_page_functions(t, tmp_path, monkeypatch):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    calls = []
+    from prompt_toolkit.key_binding.bindings import scroll as pt_scroll
+    monkeypatch.setattr(pt_scroll, "scroll_page_up", lambda event: calls.append("up"))
+    monkeypatch.setattr(pt_scroll, "scroll_page_down", lambda event: calls.append("down"))
+    t._nano_page_down_click()(_mouse_up())
+    t._nano_page_up_click()(_mouse_up())
+    assert calls == ["down", "up"]
+
+
+def test_nano_page_click_noop_when_editor_not_open(t, tmp_path, monkeypatch):
+    from prompt_toolkit.key_binding.bindings import scroll as pt_scroll
+    calls = []
+    monkeypatch.setattr(pt_scroll, "scroll_page_down", lambda event: calls.append("down"))
+    t._nano_page_down_click()(_mouse_up())     # no editor open — must not call through
+    assert calls == []
+
+
+def test_nano_page_down_then_up_scrolls_editor_window(tmp_path):
+    # end-to-end against a real running Application: prompt_toolkit's
+    # scroll_page_up/down need an actual render pass (render_info) to know
+    # the window's visible line range, so this can't be verified with the
+    # headless `t` fixture alone.
+    import asyncio
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    tui.memory.find_context_root = lambda *_a, **_k: None
+    p = tmp_path / "notes.txt"
+    p.write_text("\n".join(f"line {i}" for i in range(200)))
+
+    with create_pipe_input() as inp:
+        tui_ = tui.Tui(_FakeEngine())
+        tui_.app.input = inp
+        tui_.app.output = DummyOutput()
+        tui_.open_nano(p)
+
+        async def main():
+            fut = asyncio.ensure_future(tui_.app.run_async())
+            await asyncio.sleep(0.1)
+            assert tui_._editor_area.window.vertical_scroll == 0
+            tui_._nano_page_down_click()(_mouse_up())
+            await asyncio.sleep(0.05)
+            down_scroll = tui_._editor_area.window.vertical_scroll
+            tui_._nano_page_up_click()(_mouse_up())
+            await asyncio.sleep(0.05)
+            up_scroll = tui_._editor_area.window.vertical_scroll
+            tui_.app.exit()
+            await fut
+            return down_scroll, up_scroll
+
+        down_scroll, up_scroll = asyncio.run(main())
+        assert down_scroll > 0            # scrolled forward
+        assert up_scroll < down_scroll    # and back up again
+
+
+def test_nano_rapid_page_up_clicks_reach_the_top(tmp_path):
+    # regression: scroll_page_up/down compute against Window.render_info,
+    # which only updates on an actual render pass — app.invalidate() alone
+    # just SCHEDULES one, so clicking faster than a redraw can keep up (the
+    # obvious way to reach the top of a long file quickly) made every click
+    # after the first compute against the SAME stale render_info: each one
+    # only nudged the cursor up by a single line instead of a full page,
+    # so reaching row 0 took dozens of clicks instead of a handful.
+    # _nano_scroll must force a synchronous redraw so rapid clicks each see
+    # fresh render_info.
+    import asyncio
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    tui.memory.find_context_root = lambda *_a, **_k: None
+    p = tmp_path / "notes.txt"
+    p.write_text("\n".join(f"line {i}" for i in range(200)))
+
+    with create_pipe_input() as inp:
+        tui_ = tui.Tui(_FakeEngine())
+        tui_.app.input = inp
+        tui_.app.output = DummyOutput()
+        tui_.open_nano(p)
+
+        async def main():
+            fut = asyncio.ensure_future(tui_.app.run_async())
+            await asyncio.sleep(0.1)
+            buf = tui_._editor_area.buffer
+            buf.cursor_position = len(buf.text)
+            await asyncio.sleep(0.05)
+            # RAPID clicks, deliberately no await/yield between them — no
+            # chance for a scheduled invalidate() to actually redraw
+            for _ in range(10):
+                tui_._nano_page_up_click()(_mouse_up())
+            row = buf.document.cursor_position_row
+            tui_.app.exit()
+            await fut
+            return row
+
+        row = asyncio.run(main())
+        assert row == 0     # 10 page-ups over 200 lines must reach the top
+
+
+def test_nano_wheel_scroll_up_reaches_the_true_top_on_wrapped_lines(tmp_path):
+    # regression: reported as "I can scroll full down, but only to about
+    # half [way] when going back up" on a file with long lines that wrap
+    # (ARCHITECTURE.md's own 260-char lines at 80 columns). Window's
+    # DEFAULT wheel-scroll (_scroll_up/_scroll_down) decides whether to
+    # move the cursor along with the view via a screen-position heuristic
+    # that prompt_toolkit's own source admits is incomplete for wrapped
+    # lines; when it fails to track the cursor, every subsequent render's
+    # "keep cursor visible" pass drags the view back down mid-scroll,
+    # capping how far up you can actually get. _nano_wheel_scroll (which
+    # replaces the Window's default _scroll_up/_scroll_down at construction
+    # time) must not have this problem: it derives the target line from
+    # the same wrap-aware first_visible_line()/last_visible_line()
+    # translation the (already-correct) page up/down buttons use.
+    import asyncio
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    tui.memory.find_context_root = lambda *_a, **_k: None
+    p = tmp_path / "notes.md"
+    # long lines that force wrapping at DummyOutput's 80-column width
+    p.write_text("\n".join(f"paragraph {i} " + "x" * 200 for i in range(60)))
+
+    with create_pipe_input() as inp:
+        tui_ = tui.Tui(_FakeEngine())
+        tui_.app.input = inp
+        tui_.app.output = DummyOutput()
+        tui_.open_nano(p)
+
+        async def main():
+            fut = asyncio.ensure_future(tui_.app.run_async())
+            await asyncio.sleep(0.1)
+            w = tui_._editor_area.window
+            buf = tui_._editor_area.buffer
+            for _ in range(400):
+                w._scroll_down()                # via the installed override
+            down_scroll = w.vertical_scroll
+            for _ in range(400):
+                w._scroll_up()
+            up_scroll, up_row = w.vertical_scroll, buf.document.cursor_position_row
+            tui_.app.exit()
+            await fut
+            return down_scroll, up_scroll, up_row
+
+        down_scroll, up_scroll, up_row = asyncio.run(main())
+        assert down_scroll > 0
+        assert up_scroll == 0      # must reach the TRUE top, not partway
+        assert up_row == 0
+
+
+def test_strip_dangerous_escapes_removes_osc52_clipboard_hijack():
+    """R170l: OSC 52 (clipboard write) is BEL-terminated; must be removed
+    entirely, surrounding text kept."""
+    payload = "before\x1b]52;c;bG9va2F0dGhpcw==\x07after"
+    assert tui._strip_dangerous_escapes(payload) == "beforeafter"
+
+
+def test_strip_dangerous_escapes_removes_st_terminated_osc():
+    """OSC can also be terminated by ST (ESC \\) instead of BEL."""
+    payload = "before\x1b]0;window title\x1b\\after"
+    assert tui._strip_dangerous_escapes(payload) == "beforeafter"
+
+
+def test_strip_dangerous_escapes_removes_dcs():
+    payload = "before\x1bPsome dcs payload\x1b\\after"
+    assert tui._strip_dangerous_escapes(payload) == "beforeafter"
+
+
+def test_strip_dangerous_escapes_leaves_plain_csi_color_codes_alone():
+    """CSI (\\x1b[...m) is how ANSI colors work — must survive untouched,
+    only OSC/DCS/APC/PM/SOS are stripped."""
+    payload = "\x1b[31mred text\x1b[0m"
+    assert tui._strip_dangerous_escapes(payload) == payload
+
+
+def test_append_bash_output_strips_dangerous_escapes(t):
+    t.append_bash_output("before\x1b]52;c;bG9va2F0dGhpcw==\x07after\n")
+    stored = next(e for e in t._chat if isinstance(e, dict)
+                  and e.get("kind") == "bash_output")
+    assert "\x1b]52" not in stored["text"]
+    assert "before" in stored["text"] and "after" in stored["text"]
+
+
+# ── R171/S1: unterminated OSC/DCS must also be stripped ────────────────────
+def test_strip_dangerous_escapes_removes_unterminated_osc52():
+    """A crashed binary, a truncated capture, or a deliberately malformed
+    payload can emit an OSC 52 with NO terminator at all — the BEL/ST
+    alternatives both require one, so this used to pass straight through."""
+    payload = "before\x1b]52;c;CLIPBOARDPAYLOAD"
+    out = tui._strip_dangerous_escapes(payload)
+    assert "\x1b]52" not in out
+    assert out == "before"
+
+
+def test_strip_dangerous_escapes_removes_unterminated_dcs():
+    payload = "before\x1bPunterminated dcs body"
+    out = tui._strip_dangerous_escapes(payload)
+    assert "\x1bP" not in out
+    assert out == "before"
+
+
+def test_append_strips_dangerous_escapes_from_llm_text(t):
+    """R170l only stripped bash_output — a compromised/prompt-injected model
+    can put an OSC 52 clipboard write in its own reply just as easily as a
+    subprocess can, and `append()` is the path that reply renders through."""
+    t.append("before\x1b]52;c;bG9va2F0dGhpcw==\x07after")
+    assert "\x1b]52" not in t._chat[-1]
+
+
+def test_nano_click_in_bash_output_opens_editor(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("bash-opened")
+    t._bash_cwd = str(tmp_path)
+    t.append_bash_output("notes.txt\n")
+    frags = t._fragments()
+    handler = next(f[2] for f in frags if f[1] == "notes.txt")
+    handler(_mouse_up())
+    assert t._editor is not None
+    assert t._editor_area.buffer.text == "bash-opened"
+
+
+def test_nano_click_in_bash_output_resolves_against_bash_cwd(t, tmp_path):
+    # regression companion to R107: a filename click must resolve against
+    # the TRACKED bash cwd, not the process's real cwd
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "notes.txt").write_text("in sub")
+    t._bash_cwd = str(sub)
+    t.append_bash_output("notes.txt\n")
+    frags = t._fragments()
+    handler = next(f[2] for f in frags if f[1] == "notes.txt")
+    handler(_mouse_up())
+    assert t._editor["path"] == sub / "notes.txt"
+
+
+def test_nano_click_refuses_while_menu_is_active(t, tmp_path):
+    # regression: the chat pane's visibility isn't gated on
+    # self._menu_options, only on self._editor/help — so a filename click
+    # was reachable while e.g. /model's picker was open. Opening the editor
+    # there made Enter/arrows/digits (needed to resolve the menu)
+    # ineligible via filter=_no_editor, permanently deadlocking the worker
+    # thread on select_menu()'s blocking self._answers.get().
+    p = tmp_path / "notes.txt"
+    p.write_text("hi")
+    t._bash_cwd = str(tmp_path)
+    t.append_bash_output("notes.txt\n")
+    t._menu_prompt, t._menu_options, t._menu_index = "Select model", [("a", "A")], 0
+    frags = t._fragments()
+    handler = next(f[2] for f in frags if f[1] == "notes.txt")
+    handler(_mouse_up())
+    assert t._editor is None               # refused, didn't open
+    assert t._menu_options is not None     # menu untouched, still resolvable
+
+
+def test_nano_open_nano_refuses_during_question(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hi")
+    t._question = "some blocking question: "
+    t.open_nano(p)
+    assert t._editor is None
+
+
+def test_nano_open_nano_refuses_while_worker_busy(t, tmp_path):
+    # regression: a background LLM turn/bash command with no menu/question
+    # active YET can still reach one moments later (e.g. a tool-call
+    # approval gate) — self._busy is a broader, simpler guard than trying
+    # to enumerate every individual blocking state at open time.
+    p = tmp_path / "notes.txt"
+    p.write_text("hi")
+    t._busy = True
+    t.open_nano(p)
+    assert t._editor is None
+
+
+def test_nano_command_opens_file_despite_worker_busy_flag(t, tmp_path):
+    # regression (R117): the worker sets self._busy = True for a line
+    # BEFORE dispatching it, so `/nano <file>` — reached via
+    # ui._handle_command on the worker thread — always found itself
+    # "busy" and refused to open anything. check_busy=False on that call
+    # site fixes it; check_busy still defaults to True for the OTHER entry
+    # point (a mouse click on the UI thread racing an unrelated command).
+    from aurora import ui
+    p = tmp_path / "notes.txt"
+    p.write_text("hi")
+    fe = type("FE", (), {"_tui": t})()
+    t._busy = True
+    ui._handle_command(object(), fe, f"/nano {p}")
+    assert t._editor is not None
+    assert t._editor["path"] == p
+
+
+def test_nano_path_completion_offered_in_prompt_mode(t, tmp_path, monkeypatch):
+    # regression (R117): SlashCompleter.get_completions returns nothing once
+    # the text has a space in it, so `/nano <partial><Tab>` never offered a
+    # single path — unlike `cd` in bash mode, which gets PathCompleter.
+    from prompt_toolkit.document import Document
+
+    from aurora import ui
+    (tmp_path / "notes.txt").write_text("hi")
+    monkeypatch.chdir(tmp_path)
+    completer = tui._ModeCompleter(t, ui.SlashCompleter(None))
+    doc = Document("/nano no")
+    completions = list(completer.get_completions(doc, None))
+    # PathCompleter's .text is just the completed suffix (e.g. "tes.txt"
+    # for "no"), not the whole filename — reconstruct to check the match.
+    assert any(("no" + c.text) == "notes.txt" for c in completions)
+
+
+def test_filenames_not_linkified_outside_bash_output(t, tmp_path):
+    # only bash-mode command output gets filename-click — plain chat text
+    # (e.g. the LLM mentioning a filename) must stay plain
+    t.append("see notes.txt for details\n")
+    frags = t._fragments()
+    assert not any(f[1] == "notes.txt" and len(f) > 2 for f in frags)
+
+
+def test_url_click_works_after_char_run_merge_fix(t):
+    # regression: ANSI(...).__pt_formatted_text__() emits one fragment per
+    # character, so URL_RE could never match against a single-char fragment
+    # until fragments are merged back into same-style runs first
+    t.append("visit https://example.com now\n")
+    frags = t._fragments()
+    link = next((f for f in frags if len(f) > 2), None)
+    assert link is not None
+    assert link[1] == "https://example.com"
+
+
+def test_nano_filename_regex_does_not_match_longer_token_prefix():
+    # regression: "notes.txtbak"/"archive.txt.bak" must NOT linkify as
+    # "notes.txt"/"archive.txt" — nothing forced the match to consume the
+    # rest of the token, so a wrong (or worse, coincidentally real but
+    # unrelated) file could get opened instead
+    found = tui._NANO_FILENAME_RE.findall(
+        "notes.txtbak config.ymlbak archive.txt.bak plain.txt done")
+    assert found == ["plain.txt"]
+
+
+def test_nano_refuses_when_already_open(t, tmp_path, capsys):
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    a.write_text("A")
+    b.write_text("B")
+    t.open_nano(a)
+    t.open_nano(b)
+    assert t._editor["path"] == a               # still editing the first
+    out = capsys.readouterr().out
+    assert "already editing" in out and str(a) in out
+
+
+def test_nano_open_reports_decode_error_instead_of_raising(t, tmp_path, capsys):
+    p = tmp_path / "bad.txt"
+    p.write_bytes(b"\xff\xfe\x00\x01not valid utf-8 \xfa")
+    t.open_nano(p)
+    assert t._editor is None
+    assert "can't open" in capsys.readouterr().out
+
+
+def test_nano_save_reports_write_error_instead_of_raising(t, tmp_path, monkeypatch, capsys):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    t._editor_area.buffer.text = "hello world"
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(type(p), "write_text", _boom)
+    ok = t._nano_save()
+    assert ok is False
+    assert "can't save" in capsys.readouterr().out
+    assert t._nano_dirty()                       # not silently marked clean
+
+
+def test_nano_save_and_close_keeps_editor_open_on_failed_save(t, tmp_path, monkeypatch):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    t._editor_area.buffer.text = "hello world"
+    monkeypatch.setattr(type(p), "write_text",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("nope")))
+    t._nano_save_close_click()(_mouse_up())
+    assert t._editor is not None                  # did NOT close/discard
+    assert p.read_text() == "hello"                # nothing written either
+
+
+def test_nano_dirty_cache_invalidated_on_edit_and_reset_on_save(t, tmp_path):
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    t.open_nano(p)
+    assert t._nano_dirty_cache is False            # set clean right on open
+    t._editor_area.buffer.text = "hello world"
+    assert t._nano_dirty_cache is None             # invalidated by the edit
+    assert t._nano_dirty() is True                 # recomputes...
+    assert t._nano_dirty_cache is True              # ...and caches the result
+    t._nano_save()
+    assert t._nano_dirty_cache is False             # save resets it directly
+
+
+def test_nano_focus_hops_thread_when_opened_off_the_ui_thread(t, tmp_path, monkeypatch):
+    # /nano reaches open_nano() from the WORKER thread; layout.focus() has
+    # no documented thread-safety contract of its own (unlike app.invalidate,
+    # which every worker-thread caller already relies on), so it must be
+    # dispatched via call_soon_threadsafe when called off the UI thread —
+    # same mechanism already used for /quit's app.exit().
+    p = tmp_path / "notes.txt"
+    p.write_text("hello")
+    calls = []
+    monkeypatch.setattr(t.app, "layout", type(t.app.layout)(t.app.layout.container))
+    monkeypatch.setattr(t.app.layout, "focus", lambda *_a, **_k: calls.append("direct"))
+    fake_loop = type("L", (), {"call_soon_threadsafe": lambda self, fn: (calls.append("threadsafe"), fn())})()
+    monkeypatch.setattr(t.app, "loop", fake_loop, raising=False)
+    other_thread = threading.Thread(target=lambda: None)
+    other_thread.start()
+    other_thread.join()
+    t._ui_thread = other_thread                   # pretend caller is off-thread
+    t.open_nano(p)
+    assert calls == ["threadsafe", "direct"]       # hopped, then focused
+
+    t._editor = None                               # reset for a same-thread open
+    calls.clear()
+    t._ui_thread = threading.current_thread()
+    t.open_nano(p)
+    assert calls == ["direct"]                     # no hop needed on the UI thread
+
+
+def test_editing_keys_reach_the_editor_not_the_hidden_input():
+    # regression: every REPL-muscle-memory global binding (space, enter,
+    # backspace, arrows, digits, `!`) used to act on self.input.buffer
+    # UNCONDITIONALLY, regardless of what was actually focused — while
+    # /nano owned focus, typing a space silently vanished into the hidden
+    # input buffer instead of the file, Enter could submit whatever had
+    # piled up there as a stray chat message, and arrow keys couldn't
+    # navigate the file at all. filter=_no_editor must let these fall
+    # through to the focused editor's own default key handling instead.
+    import asyncio
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    tui.memory.find_context_root = lambda *_a, **_k: None
+    with create_pipe_input() as inp:
+        eng = _FakeEngine()
+        tui_ = tui.Tui(eng)
+        tui_.app.input = inp
+        tui_.app.output = DummyOutput()
+        p = _tmp_nano_file()
+        tui_.open_nano(p)
+
+        async def main():
+            fut = asyncio.ensure_future(tui_.app.run_async())
+            await asyncio.sleep(0.05)
+            inp.send_text(" wor1d\r!more")
+            await asyncio.sleep(0.05)
+            tui_.app.exit()
+            await fut
+
+        asyncio.run(main())
+        assert tui_.input.buffer.text == ""        # nothing leaked in here
+        assert tui_._inbox.empty()                 # nothing submitted either
+        assert tui_._bash_mode is False             # "!" didn't toggle bash mode
+        assert "wor1d" in tui_._editor_area.buffer.text
+        assert "more" in tui_._editor_area.buffer.text
+        p.unlink()
+
+
+def _tmp_nano_file():
+    import tempfile
+    d = tempfile.mkdtemp()
+    p = Path(d) / "scratch.txt"
+    p.write_text("x")
+    return p
+
+
+def test_bash_mode_completes_paths_not_slash_commands(t, tmp_path):
+    (tmp_path / "Xxxanadu").mkdir()
+    t._bash_mode = True
+    t._bash_cwd = str(tmp_path)
+    from prompt_toolkit.document import Document
+    doc = Document("cd Xxx")
+    completions = list(t.input.completer.get_completions(doc, None))
+    assert any(c.text == "anadu" for c in completions)
+
+
+def test_prompt_mode_still_completes_slash_commands(t):
+    t._bash_mode = False
+    from prompt_toolkit.document import Document
+    doc = Document("/mod")
+    completions = list(t.input.completer.get_completions(doc, None))
+    assert any("model" in c.text for c in completions)
 
 
 def test_challenge_menu_has_no_background(t):
@@ -1108,6 +2690,9 @@ def test_select_menu_preserves_and_restores_input_draft(t):
     th.join(timeout=2)
     assert got["key"] == "y"
     assert t.input.buffer.text == "half-typed thought"  # restored after the menu
+    # R170d: cursor must land at the END of the restored draft, where the
+    # user actually left off — not at 0, where buffer.reset() put it
+    assert t.input.buffer.cursor_position == len("half-typed thought")
 
 
 def test_ask_preserves_and_restores_input_draft(t):
@@ -1126,6 +2711,8 @@ def test_ask_preserves_and_restores_input_draft(t):
     th.join(timeout=2)
     assert got["answer"] == "y"
     assert t.input.buffer.text == "half-typed thought"  # restored after the ask
+    # R170d: cursor must land at the END of the restored draft, not at 0
+    assert t.input.buffer.cursor_position == len("half-typed thought")
 
 
 def test_short_transcript_bottom_anchors(t):
@@ -1179,6 +2766,53 @@ def test_closed_rows_reenable_the_render_cache(t):
     assert t._fragments() is first               # cache hit — no rebuild
 
 
+# ── bash_output entries must not break think-row bookkeeping (R110 regr.) ──
+# R110 introduced a SECOND dict chat-entry kind ({"kind": "bash_output"}),
+# but every "is this an open think row?" check elsewhere in this file
+# assumed ANY dict entry was a think row and indexed straight into
+# item["done"] — a real production crash: KeyError: 'done' inside
+# _close_think_locked, reported live after a `!` bash command was followed
+# by an LLM turn (bash_output entry precedes a think entry in self._chat).
+def test_bash_output_entry_does_not_crash_finish_think(t):
+    t.append_bash_output("some ls output\n")
+    t.fe.begin_turn()
+    t.begin_think(live=False)
+    t.think_chunk("reasoning...")
+    t.finish_think()                              # used to raise KeyError
+    kinds = [e.get("kind") for e in t._chat if isinstance(e, dict)]
+    assert kinds == ["bash_output", "think"]
+    think = next(e for e in t._chat if e.get("kind") == "think")
+    assert think["done"] is True
+
+
+def test_bash_output_entry_does_not_crash_live_clock_key(t):
+    t.append_bash_output("some ls output\n")
+    t.begin_think(live=True)
+    key = t._live_clock_key()                     # used to raise KeyError
+    assert key == (0,)
+    frags = t._fragments()                         # exercises the same path
+    assert frags
+
+
+# ── R171/P3: _live_clock_key stops walking the whole scrollback ───────────
+def test_live_clock_key_uses_tracked_open_rows_not_a_full_scan(t):
+    """Before the fix, `_live_clock_key` did `for item in self._chat` every
+    render — O(scrollback) to find rows that are almost always 0 or 1.
+    `_open_think_items` is now maintained at create/close time instead, so
+    it should track exactly the currently-open rows without a scan."""
+    for i in range(500):
+        t.append(f"line {i}\n")
+    assert t._live_clock_key() == ()
+    assert t._open_think_items == []
+    t.begin_think(live=True)
+    assert len(t._open_think_items) == 1
+    key = t._live_clock_key()
+    assert len(key) == 1
+    t.finish_think()
+    assert t._open_think_items == []
+    assert t._live_clock_key() == ()
+
+
 # ── R62: the first Esc shows an "Esc again to …" hint on status line 2 ─────
 def test_esc_armed_shows_cancel_hint(t):
     t._busy = True
@@ -1186,15 +2820,42 @@ def test_esc_armed_shows_cancel_hint(t):
     assert "Esc again to cancel this" in _status_line2(t)
 
 
-def test_esc_armed_shows_quit_hint(t):
+def test_esc_armed_shows_no_quit_hint(t):
+    """R104: the quit variant's status-bar hint was removed on request — an
+    idle empty prompt is unambiguous enough on its own. The gesture itself
+    (double-Esc opens the Yes/No quit menu) is unchanged; only the line-2
+    reminder text during the arm window is gone. Cancel/leave-bash-mode
+    keep their hints (see the tests above/below) — this is quit-only."""
     t._on_escape(lambda: None)                  # idle empty prompt: arms exit
-    assert "Esc again to quit" in _status_line2(t)
+    assert t._exit_confirm and t._esc_armed == "exit"   # gesture still arms
+    assert "Esc again" not in _status_line2(t)          # but no line-2 text
 
 
 def test_esc_armed_shows_leave_bash_hint(t):
     t._bash_mode = True
     t._on_escape(lambda: None)
     assert "Esc again to leave bash mode" in _status_line2(t)
+
+
+def test_typing_dismisses_a_pending_exit_confirm(t):
+    """R142b: one Esc on an idle empty prompt arms the quit question, and
+    NOTHING cleared it except the next Enter. R104 removed the line-2 hint,
+    so the state was invisible: the user typed a real message and Enter fed
+    it to the quit question instead of sending it — discarded outright, not
+    even recallable with up-arrow."""
+    t._on_escape(lambda: None)                  # idle empty prompt: arms exit
+    assert t._exit_confirm
+    _type(t, "explain this traceback")
+    assert not t._exit_confirm, "typing must dismiss the pending quit question"
+
+
+def test_a_message_typed_after_a_stray_esc_is_actually_sent(t):
+    """The symptom the fix is really about: the message must reach the
+    worker, not vanish into `· staying`."""
+    t._on_escape(lambda: None)
+    _type(t, "explain this traceback")
+    _press_enter(t)
+    assert t._inbox.get_nowait() == "explain this traceback"
 
 
 def test_esc_hint_expires_back_to_tooltips(t):
@@ -1227,3 +2888,255 @@ def test_drag_select_render_overlay_shifts_back_by_pad(t, monkeypatch):
     frags = t._render_fragments()
     sel_text = "".join(s for style, s, *_ in frags if "reverse" in style)
     assert sel_text == "beta"
+
+
+def test_cost_tree_click_queues_the_command_instead_of_working_inline(t, monkeypatch):
+    """R134: the "cost tree" link walks the whole session JSONL, which only
+    grows (R20). Doing that in a mouse handler freezes the UI event loop —
+    the same defect R129 fixed for "copy all", so it gets the same shape.
+
+    Proven by showing the render never happens on the calling thread; an
+    output assertion alone would not catch a frozen UI."""
+    from aurora import ctxtree
+
+    called = []
+    monkeypatch.setattr(ctxtree, "render",
+                        lambda *a, **k: called.append("render") or "")
+
+    t._cost_tree_click()(_mouse_up())
+
+    assert t._inbox.get_nowait() == "/context"
+    assert called == [], f"ran on the UI thread: {called}"
+    assert any("/context" in e for e in t._chat if isinstance(e, str))
+
+
+def test_cost_report_click_queues_the_command_instead_of_working_inline(
+        t, monkeypatch):
+    """R168: same shape as `_cost_tree_click` — `/cost` reads every session
+    log on the machine (R20's unbounded logs), so it must not run on the
+    UI thread either."""
+    from aurora import ui
+
+    called = []
+    monkeypatch.setattr(ui, "_cost_report", lambda *a, **k: called.append("report") or "")
+
+    t._cost_report_click()(_mouse_up())
+
+    assert t._inbox.get_nowait() == "/cost"
+    assert called == [], f"ran on the UI thread: {called}"
+    assert any("/cost" in e for e in t._chat if isinstance(e, str))
+
+
+def _status_frags(t):
+    """Line 1+2 of the status bar, as the app would render them."""
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    for ctrl in t.app.layout.find_all_controls():
+        if isinstance(ctrl, FormattedTextControl) and callable(ctrl.text):
+            got = ctrl.text()
+            if any("ctx " in f[1] for f in got):
+                return got
+    raise AssertionError("no status bar found")
+
+
+def test_status_bar_ctx_gauge_is_the_cost_tree_link(t):
+    """R135c: R134 spelled the link out as a separate " cost tree" label next
+    to the price. The ctx gauge already names what the tree breaks down, so
+    the gauge IS the link now — one word less on a row that must fit 80 cols
+    (R134g). It has to be its OWN fragment or it can't carry a handler (R56)."""
+    frags = _status_frags(t)
+    labels = [f[1] for f in frags]
+    assert not any("cost tree" in s for s in labels), \
+        "the separate 'cost tree' label should be gone"
+    i = next(i for i, s in enumerate(labels) if s.startswith("ctx "))
+    assert frags[i][0] == "class:status.id" and len(frags[i]) == 3
+    # still sits on the price it explains — _Stats reports cost_known False
+    # here, so the preceding fragment is the (empty) price slot
+    assert "$" in labels[i - 1] or labels[i - 1].strip() == "│"
+
+
+def test_status_bar_separates_the_model_from_the_ctx_gauge(t):
+    """R135c: the two click targets on line 1 read as two buttons, not one
+    run-on label — and the separator never doubles up when the price slot is
+    empty (local models report no cost, the case _Stats reports)."""
+    frags = _status_frags(t)
+    line1 = "".join(f[1] for f in frags).split("\n")[0]
+    assert " │ ctx " in line1, line1
+    assert "│  │" not in line1, f"empty price left a doubled separator: {line1}"
+
+
+def test_status_bar_gives_the_price_its_own_bare_section(t, monkeypatch):
+    """R135e: the price is a `│` section of its own, with no parentheses —
+    they said "aside" about the one number on the row that's real money."""
+    monkeypatch.setattr(_Stats, "cost_known", True)
+    monkeypatch.setattr(_Stats, "cost_usd", 1.5)
+    line1 = "".join(f[1] for f in _status_frags(t)).split("\n")[0]
+    assert " │ $1.50 │ ctx " in line1, line1
+    assert "($" not in line1, f"price is still parenthesised: {line1}"
+
+
+def test_status_bar_price_is_clickable_and_runs_cost(t, monkeypatch):
+    """R168: tapping the `$` price is /cost, same as tapping the ctx gauge
+    is /context — it needs its own fragment (with a handler) to be
+    clickable at all (R56), and `class:status.id` is what makes it render
+    underlined, same as every other status-bar link."""
+    monkeypatch.setattr(_Stats, "cost_known", True)
+    monkeypatch.setattr(_Stats, "cost_usd", 1.5)
+    frags = _status_frags(t)
+    price = next(f for f in frags if f[1] == "$1.50")
+    assert price[0] == "class:status.id"   # underlined, same class as every link
+    assert len(price) == 3                 # has a click handler
+
+    price[2](_mouse_up())
+    assert t._inbox.get_nowait() == "/cost"
+
+
+def test_status_bar_undo_button_hidden_until_a_checkpoint_exists(t):
+    """Feature request (2026-07-27): the `undo` button appears once the
+    FIRST file has been changed this session, not before — `_has_checkpoints`
+    starts False and only `on_tool_result` (a mutating tool) can flip it."""
+    labels = [f[1] for f in _status_frags(t)]
+    assert not any(s == "undo" for s in labels)
+    t._has_checkpoints = True
+    labels = [f[1] for f in _status_frags(t)]
+    assert any(s == "undo" for s in labels)
+
+
+def test_status_bar_undo_click_queues_the_command(t):
+    """The click itself does no git plumbing and shows no detail — it just
+    queues `/undo`, whose OWN handler (`ui._undo_cmd`) previews the affected
+    paths and confirms against those (see the incident this replaced: a
+    generic status-bar confirm with no file list let a click meant to undo
+    one file silently revert a different, unrelated batch of work instead —
+    see `_undo_click`'s docstring)."""
+    t._has_checkpoints = True
+    undo = next(f for f in _status_frags(t) if f[1] == "undo")
+    assert undo[0] == "class:status.id" and len(undo) == 3   # clickable
+    undo[2](_mouse_up())
+    assert t._inbox.get_nowait() == "/undo"
+
+
+def test_on_tool_result_flips_has_checkpoints_only_for_mutating_tools(t, monkeypatch, tmp_path):
+    from aurora import tui as tui_mod
+    monkeypatch.setattr(tui_mod.rewind, "undo_preview",
+                        lambda cwd=".": ("uncommitted", ["x"]))
+    fe = tui_mod.TuiFrontend(t)
+    fe.on_tool_result("read_file", "x")
+    assert not t._has_checkpoints          # read-only tool never checks
+    fe.on_tool_result("write_file", "ok")
+    assert t._has_checkpoints
+
+
+def test_model_name_and_ctx_gauge_run_their_own_commands(t):
+    """R135c: tapping the model name is /model, tapping the ctx gauge is
+    /context — the two links must not share a handler."""
+    frags = _status_frags(t)
+    model = next(f for f in frags if len(f) == 3)   # first link on the row
+    ctx = next(f for f in frags if f[1].startswith("ctx "))
+
+    model[2](_mouse_up())
+    assert t._inbox.get_nowait() == "/model"
+    ctx[2](_mouse_up())
+    assert t._inbox.get_nowait() == "/context"
+
+
+def test_status_bar_drops_the_vendor_prefix_from_the_model(t):
+    """R134g: line 1 is identity (R56) and had grown past 80 columns with a
+    real model id, where prompt_toolkit clips it and the rightmost links stop
+    being clickable. The vendor prefix disambiguates nothing on screen."""
+    assert t._short_model("moonshotai/kimi-k2.7-code") == "kimi-k2.7-code"
+    assert t._short_model("local") == "local"           # nothing to drop
+
+
+def test_status_bar_keeps_the_vendor_prefix_when_it_disambiguates(t):
+    """...unless two configured models share a short name, in which case a
+    status bar that can't tell you which one you're on is worse than a long
+    one."""
+    t.engine.models = [{"model": "vendor-a/kimi-k2"},
+                       {"model": "vendor-b/kimi-k2"}]
+    assert t._short_model("vendor-a/kimi-k2") == "vendor-a/kimi-k2"
+    t.engine.models = [{"model": "vendor-a/kimi-k2"}, {"model": "local"}]
+    assert t._short_model("vendor-a/kimi-k2") == "kimi-k2"
+
+
+# ── R152: scrollback is bounded ────────────────────────────────────────────
+def _chat_lines(t):
+    """Counted here rather than via t._entry_lines so the cap assertions fail
+    on unbounded growth on the pre-R152 code, not on a missing attribute."""
+    total = 0
+    for e in t._chat:
+        text = e if isinstance(e, str) else (e.get("text") or "")
+        total += text.count("\n") + 1
+    return total
+
+
+def test_scrollback_is_capped_and_keeps_the_newest_content(t):
+    """R152: `_chat`/`_cache` only ever grew — nothing but bash-mode `clear`
+    ever emptied them. prompt_toolkit's create_content is linear in fragment
+    count and runs before its own cache, every frame, so a long session
+    degraded steadily. Trim the OLDEST; the newest must survive intact."""
+    for i in range(4000):
+        t.append(f"line {i}\n" * 5)
+    assert _chat_lines(t) <= 12_000   # the cap, plus slack for the estimate
+    # the most recent output is still there, in order
+    text = "".join(e for e in t._chat if isinstance(e, str))
+    assert "line 3999" in text
+    assert "line 0\n" not in text          # the oldest is gone
+
+
+def test_eviction_leaves_a_consistent_renderable_transcript(t):
+    """The cap is worthless if trimming corrupts the render. `_offsets` and
+    `_text_cache` are absolute, so they must be rebuilt — a stale offset would
+    index into the wrong fragment or past the end."""
+    for i in range(3000):
+        t.append(f"entry {i}\n" * 6)
+    frags = t._fragments()                 # full re-flatten after eviction
+    assert frags
+    assert len(t._offsets) == len(t._chat)
+    assert len(t._cache) == len(t._chat)
+    # _nlines must agree with what was actually flattened
+    assert t._nlines == sum(f[1].count("\n") for f in frags if len(f) >= 2)
+    # and it renders again cleanly (cache fast path) without raising
+    assert t._fragments() is not None
+
+
+def test_eviction_invalidates_a_selection_rather_than_misreporting_it(t):
+    """Selections are absolute (line, col) coords, so trimming shifts them.
+    Dropping them is correct; silently keeping them would make "copy selected"
+    return whatever text now sits at those coordinates."""
+    t.append("alpha\nbeta\ngamma\n")
+    t._fragments()
+    t.sel_begin((0, 0))
+    t.sel_drag((1, 4))
+    t.sel_finish()
+    assert t._sel_frozen is not None
+    for i in range(3000):
+        t.append(f"filler {i}\n" * 6)
+    assert t._sel_frozen is None and t._sel is None
+
+
+def test_no_eviction_for_an_ordinary_session(t):
+    """A normal session must be untouched — this is a backstop, not a policy
+    that trims what anyone actually scrolls back through."""
+    for i in range(50):
+        t.append(f"turn {i}: a few lines of output\n" * 4)
+    n = len(t._chat)
+    assert n > 0
+    assert "turn 0" in "".join(e for e in t._chat if isinstance(e, str))
+    assert _chat_lines(t) < 10_000
+
+
+def test_eviction_never_drops_the_entry_still_being_written(t):
+    """think_chunk/append hold a live reference to `_chat[-1]` and keep
+    appending into it, so the newest entry must never be evicted."""
+    for i in range(3000):
+        t.append(f"bulk {i}\n" * 6)
+    t.think_chunk("thinking hard ")
+    last = t._chat[-1]
+    for i in range(3000):
+        t.append(f"more {i}\n" * 6)
+        t.think_chunk("x")
+    assert t._chat, "everything was evicted"
+    # whatever is last is a real entry and still writable
+    t.think_chunk("final")
+    assert isinstance(t._chat[-1], (str, dict))
+    del last

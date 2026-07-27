@@ -8,8 +8,8 @@ first (compact.flatten_history), so a provider only ever sees its own shape.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 
 @dataclass
@@ -30,6 +30,14 @@ class TurnResult:
     # (usage.prompt_tokens_details.cached_tokens). 0 when the provider doesn't
     # report it — never assume "no cache hit", only "not reported".
     cached_input_tokens: int = 0
+    # R133a: the part of output_tokens the model spent on reasoning
+    # (usage.completion_tokens_details.reasoning_tokens). A SUBSET of
+    # output_tokens, never additive to it. 0 when unreported.
+    reasoning_tokens: int = 0
+    # R133a: characters streamed as `reasoning_content`. Local llama.cpp
+    # backends stream thinking but report no reasoning_tokens, so this is the
+    # only signal there — exact as a char count, an ESTIMATE as tokens.
+    reasoning_chars: int = 0
 
 
 class ProviderError(Exception):
@@ -56,10 +64,12 @@ def cancellable_sse(open_stream, cancel: Callable[[], bool],
     generation instead of burning GPU on a dead client.
 
     `open_stream`: () -> httpx streaming-response context manager.
-    Yields ("status", code, error_body) once headers arrive (error_body is
-    the read body only when code >= 400, else None), then ("line", text)
-    per SSE line. Ends silently on cancel. Reader-side exceptions re-raise
-    here unless we cancelled."""
+    Yields ("status", code, error_body, headers) once response headers
+    arrive (error_body is the read body only when code >= 400, else None;
+    headers is the response's `httpx.Headers`, e.g. so a 429's `Retry-
+    After` can inform backoff), then ("line", text, None, None) per SSE
+    line. Ends silently on cancel. Reader-side exceptions re-raise here
+    unless we cancelled."""
     import queue
     import socket
     import threading
@@ -92,14 +102,14 @@ def cancellable_sse(open_stream, cancel: Callable[[], bool],
                 resp_box.append(resp)
                 if resp.status_code >= 400:
                     resp.read()
-                    q.put(("status", resp.status_code, resp.text[:300]))
+                    q.put(("status", resp.status_code, resp.text[:300], resp.headers))
                     q.put(_END)
                     return
-                q.put(("status", resp.status_code, None))
+                q.put(("status", resp.status_code, None, resp.headers))
                 for line in resp.iter_lines():
                     if cancel():
                         break
-                    q.put(("line", line, None))
+                    q.put(("line", line, None, None))
         except Exception as e:
             q.put(e)
         q.put(_END)
@@ -143,6 +153,11 @@ class Provider(ABC):
         # rather than a turn() parameter, same as extra_body/on_think, so the
         # Provider signature (and every fake provider in the tests) is unchanged.
         self.cache_prompt: bool = False
+        # R171/P1: optional retry-visibility callback, same set-per-turn
+        # pattern as on_think — a connection-retry (openai_compat.turn) was
+        # otherwise a silent extra billed attempt with nothing telling the
+        # user why the request seemed to restart.
+        self.notify = None
 
     @staticmethod
     def _urls(raw) -> list[str]:

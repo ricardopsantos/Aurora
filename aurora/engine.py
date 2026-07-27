@@ -15,13 +15,43 @@ import platform
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import (agent, compact, config, context, keystore, rewind, todo,
-               tokens, tools)
+from . import (
+    agent,
+    compact,
+    config,
+    context,
+    extensions,
+    keystore,
+    rewind,
+    tokens,
+    tools,
+)
 from . import secrets as secretscan
 from .config import load_config, persist_runtime_value
 from .frontend import Frontend
 from .providers import make_provider
+from .providers.base import ProviderError
 from .session import Session
+
+
+# R156: how much of the window a compaction's INPUT may occupy. The fold has
+# to leave room for the ask's own wrapper, the summary coming back, and the
+# recent tail being kept — half the window is the conservative split that
+# holds on a 65k local context as well as a 200k remote one.
+_COMPACT_INPUT_FRACTION = 0.5
+# Used only while the real limit is still unknown (`_context_limit_nonblocking`
+# returns 0 until /props answers). Sized for the smallest context Aurora
+# realistically runs against, since guessing high here is what breaks.
+_COMPACT_INPUT_TOKENS_FALLBACK = 16_000
+# R158: room reserved for the reply the summarization request generates and
+# for the ask's own wrapper text — the budget below sizes the summary INPUT,
+# and the output has to land somewhere too.
+_COMPACT_HEADROOM_TOKENS = 4_000
+# A floor, so a session whose kept tail nearly fills the window still gets a
+# usable summary rather than a one-line stub. Deliberately small: at this
+# point the tail is the context that matters, and the alternative to a short
+# summary is no fold at all.
+_COMPACT_MIN_SUMMARY_TOKENS = 2_000
 
 
 def _base_system() -> str:
@@ -48,6 +78,8 @@ class ContextStats:
     limit: int
     cost_usd: float
     session_id: str
+    compactions: int = 0       # R159: folds so far THIS session, including
+    # ones replayed from a resumed log — the status bar reads it live
     cost_known: bool = False   # only render the $ badge when this is True —
     # an unpriced model (local, or a remote model missing from
     # remote_context_limits.json) always has cost_usd == 0.0, which is
@@ -63,24 +95,83 @@ class Engine:
     def __init__(self, config_path: str, session_id: str | None = None):
         self.cfg = load_config(config_path)
         self.session = Session(session_id)
-        self.models: list[dict] = self.cfg.get("models", [])
+        # R150e: coerce a YAML null. A bare `models:` line parses as None, and
+        # `load_config`'s `cfg.setdefault("models", [])` does NOT replace it —
+        # the key exists, so setdefault is a no-op. `_default_model`'s
+        # `next(m for m in self.models …)` then raised TypeError during
+        # construction: a crash at startup, on a hand-edited config.
+        # `remove_model_entries` already guarded this exact None case, on one
+        # side only.
+        #
+        # Also assigns THROUGH cfg rather than from a `.get()` default, so
+        # `self.models` provably aliases `cfg["models"]` — the invariant
+        # `add_model` depends on, since `config.persist_model_entry` appends
+        # via `cfg.setdefault("models", []).append(...)`. That aliasing is not
+        # currently breakable (load_config guarantees the key exists), so this
+        # half is an invariant made explicit, not a bug being fixed.
+        if not isinstance(self.cfg.get("models"), list):
+            self.cfg["models"] = []
+        self.models: list[dict] = self.cfg["models"]
         self.runtime = self.cfg.get("runtime", {})
         self.max_iterations = int(self.runtime.get("max_iterations", 5))
         self.web = bool(self.runtime.get("web_search", True))
         self.timeout = float(self.runtime.get("timeout", 300))
         tools.set_command_timeout(self.timeout)  # run_command honours it too (R90g)
-        tools.set_todo_enabled(self.runtime.get("todo_tool", True))       # R93
         tools.set_parallel_tools(self.runtime.get("parallel_tools", True))  # R94
+        # R119: extensions (bundled — e.g. MCP — + user's ~/.aurora/extensions/).
+        # Loaded once per Engine lifetime: an MCP extension's register() may
+        # spawn child server processes, which must not happen on every turn.
+        self._mcp_manager = None
+        ext_specs, ext_runners, ext_warnings = extensions.discover(self)
+        ext_warnings += tools.set_extensions(ext_specs, ext_runners)
+        if self._mcp_manager is not None:
+            ext_warnings += [f"mcp: {e}" for e in self._mcp_manager.errors]
+        self.extension_warnings = ext_warnings
         self.redact_secrets = bool(self.runtime.get("redact_secrets", True))
         self.prompt_cache = bool(self.runtime.get("prompt_cache", True))  # R91
+        # R118: silently fold OLDER history once context usage gets close to
+        # the limit, instead of only ever showing the manual ">80%" hint and
+        # letting a long session run into a hard context error.
+        #
+        # R154 turned this ON by default and moved the threshold to 80%. It
+        # was opt-in ("it changes what the model can see without being
+        # asked") and end-of-turn only, which is precisely the shape that
+        # cannot save a long tool-heavy turn: the turn that overflows dies
+        # BEFORE reaching the end-of-turn check, so the safety net only ever
+        # ran on turns that didn't need it. A tool result the user never sees
+        # accounted for is a worse surprise than a fold.
+        self.auto_compact = bool(self.runtime.get("auto_compact", True))
+        self.auto_compact_threshold_pct = float(
+            self.runtime.get("auto_compact_threshold_pct", 80))
+        self.compact_keep_recent_tokens = int(
+            self.runtime.get("compact_keep_recent_tokens", 20_000))
         # R58: hashes of confirmed false positives (secrets.hash_value) —
         # never the raw values, so config.yaml stays safe to commit/share
         self.secret_allowlist: set[str] = set(self.runtime.get("secret_allowlist", []))
         self.multiline = bool(self.runtime.get("multiline", False))
+        # R162: on a hard provider failure, retry the SAME turn against the
+        # next configured model with a usable key before giving up — off by
+        # default, since silently switching models mid-session is a real
+        # behavior change some setups don't want (e.g. a fixed-model CI job).
+        self.model_fallback = bool(self.runtime.get("model_fallback", False))
         self.system = _base_system()  # + context bootstrap when present
         self.messages: list[dict] = []
         self._used = 0
+        self.compactions = 0   # R159
+        # /diff: the shadow-repo checkpoint HEAD as of the START of the last
+        # turn (None if no checkpoint existed yet) — set in `send()` before
+        # the turn runs, so /diff can show exactly what THAT turn's approved
+        # mutations changed, not the whole project's checkpoint history.
+        self.last_turn_diff_base: str | None = None
         self._cost = 0.0
+        # R171/I8: whether ANY of the accrued `_cost` came from a round with
+        # real pricing — `context_stats`'s `cost_known` used to ask only
+        # whether the CURRENT model is priced, so a real accrued $ figure
+        # from an earlier model went invisible (badge just disappears) the
+        # moment `/model` switched to an unpriced one mid-session, reading
+        # as "this session cost $0" instead of "the current model's rounds
+        # are unpriced, on top of $X already spent".
+        self._cost_priced = False
         self._key_ok: dict[str, bool] = {}  # provider → key available (/model picker)
         self._provider = None
         self._provider_key = None
@@ -98,6 +189,16 @@ class Engine:
         # must never become something the UI thread can block on.
         import threading
         self._limit_pending_lock = threading.Lock()
+        # R170j: same nonblocking-cache shape as _limit_cache/_limit_pending
+        # above, for live_model_name() instead of live_context_limit() — the
+        # /model picker used to call live_model_name() directly and
+        # synchronously to label the "local" entry, which is a live /props
+        # probe behind an endpoint pick; a dead/unreachable local server
+        # froze picker construction for up to 4s. See
+        # _live_model_name_nonblocking.
+        self._live_name_cache: dict = {}
+        self._live_name_pending: set = set()
+        self._live_name_pending_lock = threading.Lock()
         # starting model: last one used on this machine, else the first
         # configured model that already has a usable key (never nags for a
         # key on a model nobody selected — see _default_model)
@@ -115,8 +216,9 @@ class Engine:
 
     def _restore_last_model(self) -> dict | None:
         """The entry matching state.yaml's last_model — an exact config match,
-        or (for a LlamaDesk library model that has no config entry) the last
-        provider's entry re-labelled. None when unknown or the key is gone."""
+        or (for a local model with no config entry of its own, e.g. reloaded
+        outside Aurora) the last provider's entry re-labelled. None when
+        unknown or the key is gone."""
         st = config.load_state()
         name, pkey = st.get("last_model"), st.get("last_provider")
         if not name:
@@ -145,6 +247,13 @@ class Engine:
             env = pcfg.get("api_key_env")
             if env and not pcfg.get("api_key"):
                 pcfg["api_key"] = keystore.get_key(env, interactive=interactive) or ""
+            # R145b: the provider being replaced owns a dict of pooled
+            # httpx.Clients, one per endpoint, each holding live keep-alive
+            # sockets. Dropping the reference never closed them. R96j already
+            # closes the losing racer one level down in `_client_for`, for the
+            # same reason — the whole provider needs it too, or every
+            # cross-provider `/model` switch strands a pool of open fds.
+            _close_provider(self._provider)
             self._provider = make_provider(pkey, pcfg, self.timeout)
             self._provider_key = pkey
         return self._provider
@@ -251,11 +360,86 @@ class Engine:
         self.prompt_cache = on
         persist_runtime_value(self.cfg, "prompt_cache", on)
 
+    def set_auto_compact(self, on: bool) -> None:
+        self.auto_compact = on
+        persist_runtime_value(self.cfg, "auto_compact", on)
+
+    def set_model_fallback(self, on: bool) -> None:
+        self.model_fallback = on
+        persist_runtime_value(self.cfg, "model_fallback", on)
+
+    def _fallback_models(self) -> list[dict]:
+        """Other configured models with a usable key, in `config.yaml`'s
+        `models:` order — same list `/model`'s picker walks — excluding
+        whichever one is current."""
+        cur = self.current.get("model")
+        return [m for m in self.valid_models() if m.get("model") != cur]
+
     def valid_models(self) -> list[dict]:
         """Configured models whose provider has a key available (no prompt)."""
         return [m for m in self.models if self._has_key(m.get("provider"))]
 
     # ── the turn ────────────────────────────────────────────────────────
+    def _run_turn_with_fallback(self, provider, model, cb, tools_enabled, fe):
+        """R162: run the turn; on a hard provider failure and `model_fallback`
+        is on, retry the SAME messages against the next configured model with
+        a usable key instead of failing the turn outright. Two failure shapes
+        both count: a `ProviderError` that escapes `run_turn` (R143a's
+        corrective-retry path), and the more common case where `run_turn`
+        catches it internally, notifies, and returns a turn that produced
+        NOTHING (`len(self.messages)` unchanged — the first request never
+        got a reply). A failure part-way through a multi-round turn is left
+        alone: messages already grew, so the turn made real progress on the
+        current model and switching underneath it would be the surprising
+        move, not the safe one.
+
+        `self.current`/`self.system` stay on the model that actually
+        answered — a silent switch, same as any other `/model` pick, logged
+        so `/context` shows where the turn really ran."""
+        candidates = [None] + (self._fallback_models() if self.model_fallback
+                               else [])
+        before = len(self.messages)
+        last_error: BaseException | None = None
+        turn = None
+        for i, entry in enumerate(candidates):
+            if entry is not None:
+                fe.notify(f"· {model} failed"
+                         + (f" ({last_error.__class__.__name__}: {last_error})"
+                            if last_error else "")
+                         + f" — falling back to {entry.get('model')}")
+                self.switch_model(entry)
+                provider = self._provider_for(self.current, interactive=True)
+                provider.extra_body = self.current.get("extra_body") or {}
+                provider.on_think = getattr(fe, "on_think", None)
+                provider.notify = fe.notify
+                provider.cache_prompt = self.cache_enabled()
+                model = self.current.get("model", "")
+            last = (i == len(candidates) - 1)
+            try:
+                turn = agent.run_turn(provider, model, self.messages,
+                                      self.system, cb, self.max_iterations,
+                                      tools_enabled)
+            except ProviderError as e:
+                last_error = e
+                if last:
+                    raise
+                continue
+            if turn.cancelled:
+                # R171: a user cancel (Ctrl+C / Esc) also leaves `messages`
+                # unchanged, same shape as a dead provider — but it means
+                # "stop", not "retry elsewhere". Falling back here would fire
+                # a brand-new request against another model behind the
+                # user's back, the opposite of what cancel means.
+                return turn
+            if len(self.messages) > before:
+                return turn   # made progress — stop here, even if imperfect
+            if last:
+                return turn   # nothing left to fall back to
+            last_error = ProviderError(
+                (turn.events[-1].get("error") if turn.events else None)
+                or "no reply")
+        return turn
+
     def send(self, user_text: str, fe: Frontend, *, bootstrap: bool = False) -> None:
         """Run one user turn against the current model, streaming/prompting
         through the front end. Mutates conversation state; logs everything.
@@ -269,6 +453,7 @@ class Engine:
         provider = self._provider_for(self.current, interactive=True)
         provider.extra_body = self.current.get("extra_body") or {}
         provider.on_think = getattr(fe, "on_think", None)
+        provider.notify = fe.notify
         provider.cache_prompt = self.cache_enabled()
         model = self.current.get("model", "")
         tools_enabled = self.current.get("tools", True)
@@ -290,19 +475,48 @@ class Engine:
         self.messages.append(user_msg)
         self.session.log("user", text=user_text, model=model,
                          **({"bootstrap": True} if bootstrap else {}))
+        # /diff: capture the checkpoint HEAD as it stood BEFORE this turn's
+        # first mutation — must happen here, before run_turn, not after
+        self.last_turn_diff_base = rewind.head(".")
 
         cb = agent.AgentCallbacks(
             on_text=fe.on_text,
             on_tool_start=fe.on_tool_start,
-            on_tool_result=lambda n, o: (fe.on_tool_result(n, o),
-                                         self.session.log("tool", name=n, output=o[:4000])),
+            # R133b: `output` stays truncated (a 60KB result must not be
+            # written twice), so `chars` carries the REAL size — without it a
+            # capped result and a 4000-char one are indistinguishable on disk.
+            on_tool_result=lambda n, o: (
+                fe.on_tool_result(n, o),
+                self.session.log("tool", name=n, output=o[:4000],
+                                 chars=len(o),
+                                 status=tools.result_status(o)),
+                # R154: the result is in history now — count it now too
+                self._count_tool_output(fe, len(o))),
             approve=fe.approve,
             ask_continue=fe.ask_continue,
             notify=fe.notify,
             cancelled=fe.cancelled,
-            on_usage=getattr(fe, "on_usage", None),
-            # R47: label each pre-mutation snapshot with the causing prompt
-            checkpoint=lambda tool: rewind.checkpoint(f"[{tool}] {user_text}"),
+            # R154: routed through the engine so the context gauge tracks the
+            # live number mid-turn, not just at the end; still forwards to
+            # the frontend's own on_usage exactly as before
+            on_usage=lambda i, o: self._live_usage(fe, i, o),
+            maybe_compact=lambda: self._maybe_auto_compact_mid_turn(fe),
+            # R133c: session.py has always claimed approvals were logged; they
+            # never were. Every gate outcome now lands in the JSONL, including
+            # the allowlisted ones that are never asked about.
+            on_approval=lambda tool, decision, detail: self.session.log(
+                "approval", tool=tool, decision=decision,
+                **({"detail": detail} if detail else {})),
+            # R47: label each pre-mutation snapshot with the causing prompt.
+            # R181: ALSO snapshot the single target file (write_file/
+            # edit_file/apply_patch all take `path`) regardless of whether
+            # it's inside this checkpointed tree — see rewind.
+            # snapshot_before_write's docstring for why the whole-tree
+            # checkpoint alone isn't enough.
+            checkpoint=lambda tool, args: (
+                rewind.checkpoint(f"[{tool}] {user_text}"),
+                rewind.snapshot_before_write(str(args["path"]))
+                if args.get("path") else None),
             on_request=getattr(fe, "on_request", None),
             # R58: None (feature off) short-circuits scanning in the agent loop
             secret_challenge=(lambda ctx, m, source_text="":
@@ -311,8 +525,22 @@ class Engine:
             secret_allowlist=self.secret_allowlist,
         )
         before = len(self.messages)
-        turn = agent.run_turn(provider, model, self.messages, self.system, cb,
-                              self.max_iterations, tools_enabled, self.web)
+        try:
+            turn = self._run_turn_with_fallback(
+                provider, model, cb, tools_enabled, fe)
+        except BaseException:
+            # R143a: `run_turn` deliberately lets some exceptions out — a
+            # ProviderError raised by the corrective retry INSIDE `except
+            # MalformedToolCall` (the outer handler can't see it), and the
+            # bare re-raise when tools are already degraded. Those skipped
+            # the dangling-user-message cleanup below, leaving `messages`
+            # ending on a `user` entry; the next send appended a second one,
+            # and two consecutive user turns is exactly what R44/R95e/R128
+            # all exist to prevent — most APIs reject the request outright,
+            # one turn away from the cause.
+            if self.messages and self.messages[-1] is user_msg:
+                self.messages.pop()
+            raise
         # R95e: did this turn actually produce anything? The user message is
         # popped below when it didn't, which leaves messages[-1] pointing at
         # the PREVIOUS turn's assistant reply — logging that as a fresh
@@ -339,14 +567,25 @@ class Engine:
         # basis for COST below — that really is billed per round.
         if turn.input_tokens or turn.output_tokens:
             self._used = turn.input_tokens + turn.last_output_tokens
-        if hasattr(provider, "cost"):
-            # billed_input sums EVERY iteration's prompt — a multi-tool turn
-            # pays for the context on each round, not just the last one
-            self._cost += provider.cost(model, turn.billed_input, turn.output_tokens)
+        # R163: cost is now accrued LIVE, per round, inside `_live_usage` —
+        # no end-of-turn addition here (it would double-count what streaming
+        # already added; see `_live_usage`'s docstring for why the two are
+        # mathematically the same total, not just close).
         # capture the final assistant text for /copy + session log
         if not produced:
             return   # nothing to log — see R95e above
-        last = self.messages[-1] if self.messages else {}
+        # R143b: on every early-return path (`_flush()` then `return turn` —
+        # iteration cap, "stop" at the approval gate, interrupt, secret-stop)
+        # the LAST message is a `tool` result, not the reply. `_assistant_text`
+        # happily returns its string content, so the session recorded
+        # `assistant text="[skipped: user stopped the turn]"` — the skip
+        # marker shown as the model's answer, in the markdown export and,
+        # worse, replayed as a real assistant message by `--continue`.
+        # Take the last actual ASSISTANT message instead (on a normal turn
+        # that IS `messages[-1]`, so nothing changes); the record is still
+        # written, because the tokens were really spent and /cost reads it.
+        last = next((m for m in reversed(self.messages)
+                     if m.get("role") == "assistant"), {})
         text = _assistant_text(last)
         self.session.log("assistant", text=text, model=model,
                          input_tokens=turn.input_tokens,
@@ -356,12 +595,148 @@ class Engine:
                          # alone is only the last round's prompt
                          billed_input=turn.billed_input,
                          cached_input=turn.cached_input,
-                         degraded=turn.degraded)
+                         # R133a: a SUBSET of output_tokens, never additive.
+                         # reasoning_chars is the streamed fallback for
+                         # backends that report no reasoning_tokens.
+                         reasoning_tokens=turn.reasoning_tokens,
+                         reasoning_chars=turn.reasoning_chars,
+                         # /model picker (feature request, 2026-07-27): the
+                         # last successful request's wall time this turn —
+                         # session.last_latency_by_model() reads it back so
+                         # the picker can show "how fast is this model right
+                         # now" without a live probe.
+                         latency_s=round(turn.last_request_latency, 3),
+                         degraded=turn.degraded,
+                         # R171: `provider.extra_body` is a plain mutable
+                         # attribute on a shared provider object — a
+                         # `tools.set_extensions` runner holding a reference
+                         # to `engine` can mutate it for a LATER turn with no
+                         # trace anywhere. Logging the keys (not values, which
+                         # could carry secrets) at least makes an
+                         # extension-injected payload visible after the fact.
+                         extra_body_keys=sorted(self._provider.extra_body)
+                         if getattr(self._provider, "extra_body", None)
+                         else [])
+        self._maybe_auto_compact(fe)
+
+    def _live_usage(self, fe: Frontend, input_tokens: int,
+                    output_tokens: int) -> None:
+        """R154 (task 1): move the context gauge to the REAL number as each
+        round reports it, instead of once when the whole turn is over.
+
+        The gauge read `self._used`, which was assigned in exactly one place
+        — after `run_turn` returned. So for the entire duration of a
+        tool-heavy turn the status bar showed the size of the PREVIOUS turn's
+        prompt while the live context climbed past it, and the first sign of
+        trouble was the provider rejecting the request. Same basis as the
+        end-of-turn assignment (this round's prompt + this round's reply, not
+        the summed output — each earlier reply is already inside the next
+        round's prompt, R90d), so the number the user watches during a turn
+        and the number left behind after it agree.
+
+        The `or` guard matters: a provider that reports no usage for a round
+        must not blank a gauge that was correct — keep the last real value.
+
+        R163: `self._cost` is accrued HERE too, per round, instead of once
+        at the end of `send()` — the same move R154 made for `self._used`,
+        for the same reason (a tool-heavy turn ran the whole request before
+        the user saw a dollar figure move). Summing `provider.cost(round_in,
+        round_out)` across every round equals `provider.cost(sum_in,
+        sum_out)` — pricing is linear in tokens (`openai_compat.py`'s
+        `cost()`) — so this is the exact same total the old end-of-turn line
+        computed via `turn.billed_input`/`turn.output_tokens`, just visible
+        as it happens instead of only after."""
+        if input_tokens or output_tokens:
+            self._used = input_tokens + output_tokens
+            if hasattr(self._provider, "cost"):
+                model = self.current.get("model", "")
+                self._cost += self._provider.cost(model, input_tokens, output_tokens)
+                if (getattr(self._provider, "has_pricing", None)
+                        and self._provider.has_pricing(model)):
+                    self._cost_priced = True
+        on_usage = getattr(fe, "on_usage", None)
+        if on_usage is not None:
+            on_usage(input_tokens, output_tokens)
+
+    def _count_tool_output(self, fe: Frontend, chars: int) -> None:
+        """R154 (task 1, second half): a tool result enters history NOW but
+        is only *measured* by the provider on the next round's prompt. A
+        single 60KB result (`tools.TOOL_OUTPUT_LIMIT`) is ~15k tokens that
+        the gauge, and therefore the auto-compact check, could not see until
+        after the request carrying it had already been built and rejected.
+
+        Estimated, not authoritative — it's replaced by the provider's real
+        count on the next `_live_usage`. Erring high is the useful direction:
+        it makes the fold happen a round early rather than a round late."""
+        self._used += tokens.estimate_tokens_from_chars(chars)
+        invalidate = getattr(fe, "invalidate_status", None)
+        if invalidate is not None:
+            invalidate()
+
+    def _maybe_auto_compact_mid_turn(self, fe: Frontend) -> None:
+        """R154 (task 2): the same fold as `_maybe_auto_compact`, but at a
+        round boundary inside a running turn — called by `agent.run_turn` via
+        `AgentCallbacks.maybe_compact` before it builds each request after
+        the first.
+
+        Why this is where it belongs: the failure being fixed is a turn that
+        overflows the window BEFORE it finishes, so nothing that runs after
+        the turn can help. The end-of-turn check (R118) stays as-is for the
+        session that creeps up over many small turns.
+
+        Self-limiting by construction, which is why there's no attempt
+        counter: after a successful fold, everything foldable has become the
+        summary merged into `messages[0]`, so `compact.cut_index` finds no
+        older-than-the-tail region and `compact_history` returns 0 — BEFORE
+        spending a summarization request. A turn whose own recent tail is
+        what blew the window therefore pays for one summarization at most,
+        not one per round."""
+        if not self.auto_compact:
+            return
+        stats = self.context_stats()
+        if not stats.limit or stats.pct < self.auto_compact_threshold_pct:
+            return
+        folded = self.compact_history(
+            keep_recent_tokens=self.compact_keep_recent_tokens, notify=fe.notify)
+        if folded:
+            fe.notify(f"auto-compact: context was at {stats.pct:.0f}% mid-task "
+                     f"— folded {folded} older message(s) and continued")
+
+    def _maybe_auto_compact(self, fe: Frontend) -> None:
+        """R118: fold older history once usage crosses
+        `auto_compact_threshold_pct` — deliberately above the manual ">80%"
+        hint's threshold, so a user who acts on that hint never even notices
+        this firing; it's the safety net for the session that keeps going
+        past it. `context_stats()` never blocks (R95i): `limit == 0` just
+        means the real limit isn't known yet, so this quietly no-ops rather
+        than guessing."""
+        if not self.auto_compact:
+            return
+        stats = self.context_stats()
+        if not stats.limit or stats.pct < self.auto_compact_threshold_pct:
+            return
+        folded = self.compact_history(
+            keep_recent_tokens=self.compact_keep_recent_tokens, notify=fe.notify)
+        if folded:
+            fe.notify(f"auto-compact: folded {folded} older message(s) — "
+                     f"context was at {stats.pct:.0f}%")
 
     def last_response(self) -> str:
         for m in reversed(self.messages):
             if m.get("role") == "assistant":
                 return _assistant_text(m)
+        return ""
+
+    def last_prompt(self) -> str:
+        """The user text that started the last turn — R124's `/copy-last`
+        includes it alongside thinking + the response. A "user" message's
+        `content` is always a plain string here (never the tool_calls shape
+        assistant messages can have), so no `_assistant_text`-style
+        unwrapping is needed."""
+        for m in reversed(self.messages):
+            if m.get("role") == "user":
+                content = m.get("content")
+                return content if isinstance(content, str) else ""
         return ""
 
     def nth_response(self, n: int) -> str:
@@ -375,12 +750,15 @@ class Engine:
             # no model configured (possible after /model remove of the last
             # entry, R81) — don't build a keyless, URL-less provider on every
             # status render just to ask it for a limit it can't know (R90g)
-            return ContextStats("", self._used, 0, self._cost, self.session.id)
+            return ContextStats("", self._used, 0, self._cost, self.session.id,
+                                compactions=self.compactions)
         provider = self._provider_for(self.current)
         limit = self._context_limit_nonblocking(provider, model)
-        known = bool(getattr(provider, "has_pricing", None)) and provider.has_pricing(model)
+        known = (bool(getattr(provider, "has_pricing", None))
+                and provider.has_pricing(model)) or self._cost_priced
         return ContextStats(model, self._used, limit, self._cost,
-                            self.session.id, cost_known=known)
+                            self.session.id, compactions=self.compactions,
+                            cost_known=known)
 
     def _context_limit_nonblocking(self, provider, model: str) -> int:
         """The context limit for the gauge, WITHOUT ever blocking the caller
@@ -394,11 +772,11 @@ class Engine:
         freeze; only the remote half had been fixed.
 
         So: serve the cache immediately and refresh it on a daemon thread.
-        The 120s TTL is unchanged (LlamaDesk can reload the same model at a
-        different ctx, so a live n_ctx must not be cached forever) — only the
-        waiting moved off the render path. A failed refresh caches the static
-        fallback, so a down backend backs off for the TTL instead of spawning
-        a probe per render.
+        The 120s TTL is unchanged (the server can be reloaded with a
+        different ctx outside Aurora, so a live n_ctx must not be cached
+        forever) — only the waiting moved off the render path. A failed
+        refresh caches the static fallback, so a down backend backs off for
+        the TTL instead of spawning a probe per render.
         """
         import threading
         import time as _time
@@ -436,10 +814,49 @@ class Engine:
         except Exception:
             return 128_000
 
+    def _live_model_name_nonblocking(self, provider) -> str | None:
+        """R170j: same nonblocking-cache shape as `_context_limit_nonblocking`
+        above, for `live_model_name()` — the `/model` picker used to call it
+        directly and synchronously to label the "local" entry, which is a
+        live `/props` call behind an endpoint pick. A dead/unreachable local
+        server made every `/props` GET wait out its own 4s timeout, freezing
+        picker construction before the menu could even render. Serves the
+        cache immediately (`None` on the very first call, same as before —
+        the picker just shows "local" with no live name that one time) and
+        refreshes on a daemon thread; TTL matches `_limit_cache`'s 120s
+        since both track the same "is the local server up, and what's
+        loaded" fact."""
+        import threading
+        import time as _time
+        if not hasattr(provider, "live_model_name"):
+            return None
+        key = self._provider_key
+        cached = self._live_name_cache.get(key)
+        if cached and _time.time() - cached[1] < 120:
+            return cached[0]
+
+        with self._live_name_pending_lock:
+            already_pending = key in self._live_name_pending
+            if not already_pending:
+                self._live_name_pending.add(key)
+
+        if not already_pending:
+
+            def _refresh() -> None:
+                try:
+                    name = provider.live_model_name()
+                except Exception:
+                    name = None
+                self._live_name_cache[key] = (name, _time.time())
+                self._live_name_pending.discard(key)
+
+            threading.Thread(target=_refresh, daemon=True).start()
+
+        return cached[0] if cached else None
+
     def clear(self) -> None:
         self.messages = []
         self._used = 0
-        todo.clear()   # R93: the task list belongs to the conversation
         self.session.log("clear")
 
     def reset(self, cwd: str = ".") -> None:
@@ -450,40 +867,151 @@ class Engine:
         self.system = _base_system()
         self.session.log("reset")
 
-    def compact_history(self) -> int:
-        """/compact (R14): summarize the conversation with the CURRENT model
-        and carry only the summary — a flatten barely shrinks anything, so it
-        is the fallback, not the mechanism. Returns messages folded away."""
+    def compact_history(self, keep_recent_tokens: int = 0, notify=None) -> int:
+        """/compact (R14) and auto-compact (R118): summarize OLDER history
+        with the CURRENT model and carry only the summary — a flatten barely
+        shrinks anything, so it is the fallback, not the mechanism.
+
+        `notify`, if given, is wired onto the summarization request's
+        provider (R171m) so a connection retry during this request is
+        visible the same way a normal turn's retry is — this call site was
+        missed when `provider.notify` was introduced, so a retry here
+        stayed silent. Every caller now passes `fe.notify`; `None` stays a
+        safe default since the provider's own default is `None`.
+
+        `keep_recent_tokens=0` (the manual `/compact` default, unchanged
+        behavior): fold the ENTIRE history — a deliberate "start fresh from
+        a summary" action, not a trim.
+
+        `keep_recent_tokens > 0` (auto-compact): fold only messages old
+        enough to fall outside that budget, via `compact.cut_index` — auto-
+        compact fires mid-session without being asked, so losing fidelity on
+        the turns you're most likely still actively using would defeat the
+        point; only the recent-tail turns are excluded from what's already
+        the fallback path.
+
+        Returns messages folded away (0 if nothing needed folding)."""
         n = len(self.messages)
         if not n:
             return 0
-        transcript = compact.flatten_history(self.messages)
+        cut = compact.cut_index(self.messages, keep_recent_tokens) \
+            if keep_recent_tokens else n
+        older, recent = self.messages[:cut], self.messages[cut:]
+        if not older:
+            return 0
+        transcript = compact.flatten_history(older)
+        # R156: both the request below and the fallback under it have to FIT.
+        # The case auto-compact exists for is a history already bigger than
+        # the window, so an unclipped summarization request is rejected with
+        # the very `exceed_context_size_error` that triggered the fold, and
+        # the unclipped fallback carries back exactly what it removed — a
+        # "fold" that frees nothing. Budget is a fraction of the real window
+        # so the ask, the reply and the kept tail all still fit; when the
+        # limit isn't known yet (`_context_limit_nonblocking` → 0) fall back
+        # to a figure safe on the smallest local context Aurora targets.
+        # ONE `_provider_for` for both the budget and the request: it is the
+        # call that can raise (no key, no model configured) and the call a
+        # turn is charged for, so asking twice would both double-build the
+        # provider and misreport how many summarizations a fold costs.
+        budget = _COMPACT_INPUT_TOKENS_FALLBACK
         summary = ""
         try:
             provider = self._provider_for(self.current)
+            provider.notify = notify
+            limit = self._context_limit_nonblocking(
+                provider, self.current.get("model", ""))
+            if limit:
+                # R158: budget against what the NEXT request actually carries,
+                # not against the window alone. A flat fraction ignored the two
+                # things sitting beside the summary — the system prompt (~12k
+                # on a bootstrapped session) and the raw tail being kept — so
+                # "half the window" could still add up to more than the window.
+                # Size the summary to the room genuinely left over, and keep
+                # the fraction as a ceiling so a huge window doesn't produce an
+                # absurdly long summary.
+                room = (limit
+                        - tokens.estimate_tokens(self.system or "")
+                        - sum(tokens.estimate_tokens(str(m.get("content", "")))
+                              for m in recent)
+                        - _COMPACT_HEADROOM_TOKENS)
+                budget = max(_COMPACT_MIN_SUMMARY_TOKENS,
+                             min(int(limit * _COMPACT_INPUT_FRACTION), room))
             ask = ("Summarize this conversation for your own continued use. "
                    "Keep: decisions made, exact file paths and commands, open "
                    "tasks, constraints the user stated. Drop: pleasantries, "
                    "superseded attempts, full file dumps. Reply with ONLY the "
-                   "summary.\n\n" + transcript)
+                   "summary.\n\n" + compact.clip_transcript(transcript, budget))
             msg = [{"role": "user", "content": ask}]
             result = provider.turn(self.current.get("model", ""), msg,
                                    "", None, lambda _s: None, lambda: False)
             summary = (result.text or "").strip()
         except Exception:
-            pass  # model unreachable → plain flatten below
+            pass  # model unreachable → clipped flatten below
         if summary:
             body = "[Summary of the earlier conversation:]\n\n" + summary
-            self.messages = [{"role": "user", "content": body}]
         else:
-            self.messages = [compact.flattened_as_user_message(self.messages)]
+            # clipped, NOT verbatim: this path runs precisely when the model
+            # couldn't be reached, which includes "the window is already
+            # blown", so it is the one that most needs to actually shrink.
+            body = compact.clip_transcript(
+                compact.flattened_as_user_message(older)["content"], budget)
+        if recent and recent[0].get("role") == "user":
+            # bug fix: when recent[0] is a "user" message, prepending a
+            # separate {"role": "user", ...} summary message in front of it
+            # produced two consecutive user turns, which providers that
+            # enforce strict user/assistant alternation (Anthropic-family
+            # models via OpenRouter) reject outright on the next request.
+            # Folding the summary into recent[0]'s own content instead keeps
+            # the sequence strictly alternating.
+            merged_first = dict(recent[0])
+            merged_first["content"] = body + "\n\n" + merged_first.get("content", "")
+            # R154: IN PLACE (`[:]`), not a rebind. `agent.run_turn` is handed
+            # `self.messages` and mutates that same list object for the whole
+            # turn, so once compaction can happen mid-turn, rebinding here
+            # would silently split them: the engine would hold the folded
+            # history while the loop kept appending to — and sending — the
+            # unfolded one, i.e. the compaction would have no effect on the
+            # very requests it exists to shrink.
+            self.messages[:] = [merged_first] + recent[1:]
+        elif recent:
+            # R156: mid-turn, `cut_index` may legally cut at an assistant
+            # message that OPENS a tool round (`is_cut_boundary`). The
+            # summary must NOT be merged into that message's content — it
+            # would put the summary in the assistant's own mouth and sit
+            # beside the `tool_calls` its `tool` results answer. A separate
+            # user message in front of it is both correct and still strictly
+            # alternating (user -> assistant -> tool), which is exactly the
+            # shape the alternation fix above exists to protect.
+            self.messages[:] = [{"role": "user", "content": body}] + recent
+        else:
+            self.messages[:] = [{"role": "user", "content": body}]
         # the gauge reflects the LAST turn's billed prompt size, which no
         # longer exists once history is folded — re-estimate from what
         # actually survives so it (and the >80% /compact hint) drop with it
-        self._used = tokens.estimate_tokens(
-            str(self.messages[0].get("content", "")))
-        self.session.log("compact", folded=n, summarized=bool(summary))
-        return n
+        before = self._used
+        # R158: the system prompt counts. `_used` is otherwise set from the
+        # provider's own input_tokens (`_live_usage`), which BILLS the system
+        # prompt — so re-estimating from messages alone silently dropped it
+        # here, and on a bootstrapped `.agentic_context` session that is ~12k
+        # tokens of AGENTS.md + three INDEX.md + every [CORE] doc. The gauge
+        # then read low, `_maybe_auto_compact_mid_turn` saw headroom that did
+        # not exist, and the next request went out over the limit. Counting it
+        # keeps the two sources of `_used` measuring the same thing.
+        self._used = (tokens.estimate_tokens(self.system or "")
+                      + sum(tokens.estimate_tokens(str(m.get("content", "")))
+                            for m in self.messages))
+        # R134a: the whole point of a fold is the drop, and until now the only
+        # record of it was a message COUNT. `/context`'s spine is context
+        # size, so a fold logged without its before/after renders as a gap in
+        # the one place a reader is looking for the descent.
+        # R159: incremented HERE, beside the log record it must agree with —
+        # this is the one point that knows a fold actually happened. Every
+        # early `return 0` above (nothing foldable) correctly skips it.
+        self.compactions += 1
+        self.session.log("compact", folded=len(older), summarized=bool(summary),
+                         kept_recent=len(recent),
+                         used_before=before, used_after=self._used)
+        return len(older)
 
     def provider_health(self, timeout: float = 4.0) -> dict:
         """Live health of the current model's backend, hard-bounded to
@@ -523,9 +1051,10 @@ class Engine:
         # instead of silently reporting the wrong (locally-loaded) model.
         if self.current.get("model") != "local":
             return {"ok": bool(provider.api_key),
-                    "detail": "remote API (no health endpoint)"}
+                    "detail": "remote API"}
         try:
             import httpx
+
             from .providers.openai_compat import _is_bare_ip
             base = provider.base_url.removesuffix("/v1")
             headers = {"Authorization": f"Bearer {provider.api_key}"} \
@@ -538,7 +1067,7 @@ class Engine:
             model = (props.get("model_path") or "?").rsplit("/", 1)[-1]
             # degrade LOUDLY: a llama.cpp upgrade that moves n_ctx/model_path
             # in /props must read as "schema changed", never as a blank field
-            # (see AURORA.md "Upgrade surfaces")
+            # (see documents/CHANGELOG_TECHNICAL.md "Upgrade surfaces")
             if n_ctx is None or model == "?":
                 return {"ok": True,
                         "detail": (f"{model} ready, ctx unknown — /props "
@@ -601,12 +1130,50 @@ class Engine:
             ev, text = r.get("event"), r.get("text", "")
             if ev not in ("user", "assistant") or not text:
                 continue
-            msgs.append({"role": ev if ev == "user" else "assistant",
-                         "content": text})
-            restored += 1
-        if restored:
+            role = ev if ev == "user" else "assistant"
+            # R128: never restore two consecutive messages of the same role.
+            # `send()` logs its `user` event unconditionally, but R95e
+            # deliberately skips the `assistant` log when a turn produced
+            # nothing (provider error, interrupt, cancel) — so a failed turn
+            # followed by a retry leaves two adjacent `user` records in the
+            # log, and replaying them verbatim rebuilds exactly the invalid
+            # sequence R44/R95e/R125 each prevent on the LIVE path. Providers
+            # that enforce strict role alternation (Anthropic-family models
+            # via OpenRouter) reject it on the first send after --continue.
+            # Merge rather than drop: the earlier prompt is real context the
+            # user typed, and losing it silently would be its own surprise.
+            if msgs and msgs[-1]["role"] == role:
+                msgs[-1]["content"] += "\n\n" + text
+                continue
+            msgs.append({"role": role, "content": text})
+            # R171: count TURNS (one per user message), not messages — the
+            # caller (`__main__`'s "(N turns)" print) means a user/assistant
+            # exchange, and counting both roles doubled it.
+            if role == "user":
+                restored += 1
+        # R170c: a session that crashed mid-turn (provider error, kill -9,
+        # power loss) logs its `user` record and never reaches the
+        # `assistant` reply, so the log's last record is a dangling `user`.
+        # R128 above only merges CONSECUTIVE same-role records within this
+        # replay — it has nothing to merge here, since there's no second
+        # `user` record yet. Left alone, `send()` appends its own new `user`
+        # message unconditionally, producing two adjacent `user` turns that
+        # strict-alternation providers (Anthropic-family, via OpenRouter)
+        # reject on the very first request after `--continue`. Drop it
+        # before restoring — the prompt is still in the log for `/context`
+        # or a human reading the JSONL, just not replayed into live history
+        # where it would never get an answer anyway.
+        had_any = restored > 0
+        if msgs and msgs[-1]["role"] == "user":
+            msgs.pop()
+            restored -= 1
+        if had_any:
+            # still resume the SESSION (keep appending to the same log) even
+            # if the only record was the dangling prompt just dropped above
+            # — restarting into a brand-new session id would silently fork
+            # the log the user thinks they're continuing.
             self.messages = msgs
-            self.session = past  # keep appending to the same log
+            self.session = past
             # the gauge would otherwise read 0 on a resumed session until the
             # first new turn, while a full history is already loaded (R90g).
             # Estimated, not exact: the real count only comes back with the
@@ -617,7 +1184,38 @@ class Engine:
             # transient full-history copy on a long resumed session.
             total_chars = sum(len(str(m.get("content", ""))) for m in msgs)
             self._used = total_chars // 4
+            # R159: a resumed session keeps appending to the SAME log, so its
+            # earlier folds are part of this session's count — a `--continue`
+            # that reported 0 after ten folds would make the counter mean
+            # "since this process started", which is not what the bar claims.
+            # Counted from the log rather than carried in state because the
+            # log is the only thing that survives the restart.
+            self.compactions = sum(1 for r in past.iter_records()
+                                   if r.get("event") == "compact")
+            # R171: seed the live $ gauge from the resumed session's own
+            # logged usage — otherwise `self._cost` (constructor default 0.0)
+            # only counts spend from turns run AFTER --continue, while
+            # `/context <id>` (which reads the same log fresh each time)
+            # shows the session's true total. Same pricing basis as
+            # `/context`'s per-model breakdown, so the two never disagree.
+            from .ctxtree import model_breakdown_lines
+            from .providers.openai_compat import price_for
+            from .session import usage_by_model
+            usage = usage_by_model(session_id)
+            _, self._cost = model_breakdown_lines(usage)
+            self._cost_priced = any(price_for(m) for m in usage)
         return restored
+
+
+def _close_provider(provider) -> None:
+    """Release a discarded provider's pooled HTTP connections (R145b). Must
+    never raise: this runs on the `/model` switch path, and failing to tidy
+    up an old provider is not a reason to fail building the new one."""
+    for client in getattr(provider, "_http", {}).values():
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def _assistant_text(msg: dict) -> str:

@@ -5,13 +5,18 @@ MalformedToolCall so agent.py can retry-then-degrade (R5)."""
 import ipaddress
 import json
 from pathlib import Path
-from typing import Callable
 from urllib.parse import urlparse
 
 import httpx
 
-from .base import (MalformedToolCall, Provider, ProviderError, ToolCall,
-                   TurnResult, cancellable_sse)
+from .base import (
+    MalformedToolCall,
+    Provider,
+    ProviderError,
+    ToolCall,
+    TurnResult,
+    cancellable_sse,
+)
 from .happy_eyeballs import HappyEyeballsTransport
 
 _REMOTE_CONTEXT_LIMITS_PATH = Path(__file__).parent / "remote_context_limits.json"
@@ -27,11 +32,53 @@ class _RateLimited(Exception):
     (not reusing ProviderError) so the retry logic in `turn()` can tell a
     429 apart from a generic 4xx/5xx without parsing the message text."""
 
+    def __init__(self, body: str, retry_after: float | None = None):
+        super().__init__(body)
+        self.retry_after = retry_after
+
 
 # R99: exponential, not the connection-retry's flat 0.3*(attempt+1) — a
 # shared free-tier limit clears on the order of seconds, a stale pooled
 # connection resets instantly. One entry per retry (len == _ATTEMPTS - 1).
+# Used only when the server doesn't send its own `Retry-After` (R125c).
 _RATE_LIMIT_BACKOFF = (1.0, 3.0)
+# A server-provided Retry-After is honoured up to this ceiling — long
+# enough to respect a real cooldown, short enough that Aurora doesn't sit
+# silently for minutes on a turn the user is watching.
+_RATE_LIMIT_BACKOFF_CAP = 30.0
+
+# same cadence cancellable_sse polls at — short enough that Esc feels
+# immediate, long enough not to spin
+_CANCEL_POLL_S = 0.15
+
+
+def _sleep_unless_cancelled(wait: float, cancel) -> bool:
+    """Sleep `wait` seconds in short hops, returning True as soon as `cancel()`
+    goes true (R147). A rate-limit backoff can legitimately be 30 seconds; a
+    single `time.sleep(30)` makes the app unresponsive to Esc for all of it."""
+    import time
+    deadline = time.monotonic() + wait
+    while True:
+        if cancel():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_CANCEL_POLL_S, remaining))
+
+
+def _parse_retry_after(headers) -> float | None:
+    """`Retry-After` is either a delay in seconds or an HTTP-date (RFC
+    9110 §10.2.3) — only the seconds form is worth honouring here; an
+    HTTP-date is rare from these providers and parsing it adds a timezone
+    edge case for little benefit, so it's treated as absent."""
+    raw = headers.get("retry-after") if headers else None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return None
 
 
 def _load_remote_context_limits() -> dict[str, dict]:
@@ -54,51 +101,104 @@ def _load_remote_context_limits() -> dict[str, dict]:
 REMOTE_CONTEXT_LIMITS = _load_remote_context_limits()
 
 
-def fetch_openrouter_model_info(model_id: str) -> tuple[dict | None, bool]:
-    """Look a model up in OpenRouter's public catalog (`/api/v1/models`, no
-    key needed). Returns (info, catalog_ok): info is
-    {context_size, price_in_per_mtok, price_out_per_mtok, description}, or
-    None when the model ISN'T in the catalog; catalog_ok is False when the
-    catalog itself couldn't be fetched (offline/API error) — so the caller
-    can tell "no such model" (refuse) apart from "can't verify" (proceed,
-    warn). Prices are the API's listed route price ($/token, converted to
-    $/Mtok) — NOT the usage-weighted average the hand-maintained table
-    entries use (close enough for a fresh add; edit
-    remote_context_limits.json to refine)."""
-    def _mtok(v):
-        try:
-            return round(float(v) * 1_000_000, 3)
-        except (TypeError, ValueError):
-            return None
+def _mtok(v):
+    try:
+        return round(float(v) * 1_000_000, 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _model_info_from_catalog_entry(m: dict) -> dict:
+    pricing = m.get("pricing") or {}
+    return {"context_size": m.get("context_length"),
+            "price_in_per_mtok": _mtok(pricing.get("prompt")),
+            "price_out_per_mtok": _mtok(pricing.get("completion")),
+            "description": (m.get("description") or "").strip()}
+
+
+def _fetch_openrouter_catalog() -> tuple[list[dict] | None, bool]:
+    """The raw `/api/v1/models` list (no key needed), or (None, False) if it
+    couldn't be fetched (offline/API error). Split out of
+    `fetch_openrouter_model_info` so a batch refresh (R136) costs one HTTP
+    call for N models instead of N."""
     try:
         r = httpx.get("https://openrouter.ai/api/v1/models", timeout=10)
         r.raise_for_status()
-        data = r.json().get("data", [])
+        return r.json().get("data", []), True
     except Exception:
+        return None, False
+
+
+def fetch_openrouter_model_info(model_id: str) -> tuple[dict | None, bool]:
+    """Look a model up in OpenRouter's public catalog. Returns (info,
+    catalog_ok): info is {context_size, price_in_per_mtok,
+    price_out_per_mtok, description}, or None when the model ISN'T in the
+    catalog; catalog_ok is False when the catalog itself couldn't be fetched
+    (offline/API error) — so the caller can tell "no such model" (refuse)
+    apart from "can't verify" (proceed, warn). Prices are the API's listed
+    route price ($/token, converted to $/Mtok) — NOT the usage-weighted
+    average the hand-maintained table entries use (close enough for a fresh
+    add; edit remote_context_limits.json to refine)."""
+    data, catalog_ok = _fetch_openrouter_catalog()
+    if not catalog_ok:
         return None, False
     for m in data:
         if m.get("id") == model_id:
-            pricing = m.get("pricing") or {}
-            return {"context_size": m.get("context_length"),
-                    "price_in_per_mtok": _mtok(pricing.get("prompt")),
-                    "price_out_per_mtok": _mtok(pricing.get("completion")),
-                    "description": (m.get("description") or "").strip()}, True
+            return _model_info_from_catalog_entry(m), True
     return None, True
+
+
+def refresh_prices_for(model_ids: list[str]) -> tuple[dict[str, dict], bool]:
+    """Batch counterpart to `fetch_openrouter_model_info` (R136): one catalog
+    fetch, matched against every id in `model_ids` — used by the
+    price-refresh extension to refresh all of config.yaml's configured
+    OpenRouter models without one HTTP round-trip per model. Returns ({model_id:
+    info, ...} for ids found in the catalog, catalog_ok); an id missing from
+    the returned dict was either not found or duplicated, not an error."""
+    data, catalog_ok = _fetch_openrouter_catalog()
+    if not catalog_ok:
+        return {}, False
+    by_id = {m.get("id"): m for m in data}
+    return ({mid: _model_info_from_catalog_entry(by_id[mid])
+             for mid in model_ids if mid in by_id}, True)
+
+
+def _merge_model_entry(model_id: str, info: dict) -> dict:
+    """Fold `info` (from a catalog lookup) onto the existing
+    `remote_context_limits.json` entry for `model_id`, or a fresh skeleton if
+    there isn't one yet. Only fields the catalog actually returned are
+    touched — an unpriced-in-the-catalog model keeps whatever price it had.
+
+    R136 review: numeric fields must use `is not None`, not truthiness — a
+    genuinely FREE model (`price_in_per_mtok == 0.0`) was previously
+    indistinguishable from "the catalog didn't say," so its $0 price was
+    silently dropped and any stale non-zero price from before stuck around.
+    `description` stays a truthiness check on purpose: the catalog's default
+    for a missing description is `""`, and an empty string overwriting a
+    real one would be a regression, not a fix — there's no "explicitly
+    blank" case for a description the way `0.0` is a real price."""
+    entry = dict(REMOTE_CONTEXT_LIMITS.get(model_id) or
+                 {"model": model_id, "provider": "openrouter",
+                  "code": model_id.rsplit("/", 1)[-1],
+                  "pricing_url": f"https://openrouter.ai/{model_id}#pricing"})
+    if info.get("context_size") is not None:
+        try:
+            entry["context_size"] = int(info["context_size"])
+        except (TypeError, ValueError):
+            pass   # malformed catalog data — don't let it crash the caller
+    for k in ("price_in_per_mtok", "price_out_per_mtok"):
+        if info.get(k) is not None:
+            entry[k] = info[k]
+    if info.get("description"):
+        entry["description"] = info["description"]
+    return entry
 
 
 def save_remote_model_info(model_id: str, info: dict) -> None:
     """Add/refresh one model's entry in remote_context_limits.json AND the
     in-memory table, so the footer's ctx gauge and $ badge (R71/R73) work
-    for a just-added model without a restart. Only known fields are set."""
-    entry = dict(REMOTE_CONTEXT_LIMITS.get(model_id) or
-                 {"model": model_id, "provider": "openrouter",
-                  "code": model_id.rsplit("/", 1)[-1],
-                  "pricing_url": f"https://openrouter.ai/{model_id}#pricing"})
-    if info.get("context_size"):
-        entry["context_size"] = int(info["context_size"])
-    for k in ("price_in_per_mtok", "price_out_per_mtok", "description"):
-        if info.get(k):
-            entry[k] = info[k]
+    for a just-added model without a restart."""
+    entry = _merge_model_entry(model_id, info)
     REMOTE_CONTEXT_LIMITS[model_id] = entry
     try:
         entries = json.loads(_REMOTE_CONTEXT_LIMITS_PATH.read_text())
@@ -106,6 +206,29 @@ def save_remote_model_info(model_id: str, info: dict) -> None:
         entries = []
     entries = [e for e in entries if e.get("model") != model_id] + [entry]
     _REMOTE_CONTEXT_LIMITS_PATH.write_text(json.dumps(entries, indent=2) + "\n")
+
+
+def save_remote_model_infos(infos: dict[str, dict]) -> None:
+    """Batch counterpart to `save_remote_model_info` (R136 review): one read
+    + one write for N models, not N of each. `refresh_model_prices` used to
+    call the single-model function in a loop — N configured models meant N
+    full-file read-modify-writes of remote_context_limits.json, and a crash
+    or Ctrl+C between any two of them left the file (and every OTHER
+    already-refreshed model's price, not just the one in flight) in a
+    half-written state."""
+    if not infos:
+        return
+    try:
+        entries = json.loads(_REMOTE_CONTEXT_LIMITS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        entries = []
+    by_model = {e.get("model"): e for e in entries}
+    for model_id, info in infos.items():
+        entry = _merge_model_entry(model_id, info)
+        REMOTE_CONTEXT_LIMITS[model_id] = entry
+        by_model[model_id] = entry
+    _REMOTE_CONTEXT_LIMITS_PATH.write_text(
+        json.dumps(list(by_model.values()), indent=2) + "\n")
 
 
 def price_for(model: str) -> tuple[float, float] | None:
@@ -387,7 +510,7 @@ class OpenAICompatProvider(Provider):
             result = TurnResult()
             pending: dict[int, dict] = {}   # index -> {id, name, args-fragments}
             try:
-                for kind, a, _b in cancellable_sse(
+                for kind, a, _b, _headers in cancellable_sse(
                         lambda: client.stream(
                             "POST", f"{base}/chat/completions",
                             headers=self._auth_headers(), json=payload),
@@ -402,7 +525,8 @@ class OpenAICompatProvider(Provider):
                             # again" onto the user that this loop can do
                             # itself.
                             if a == 429:
-                                raise _RateLimited(body)
+                                raise _RateLimited(
+                                    body, retry_after=_parse_retry_after(_headers))
                             # llama.cpp surfaces template/parse failures as
                             # 500s with "Failed to parse" — gpt-oss mode
                             if "parse" in body.lower():
@@ -429,6 +553,12 @@ class OpenAICompatProvider(Provider):
                         details = usage.get("prompt_tokens_details") or {}
                         result.cached_input_tokens = details.get(
                             "cached_tokens", 0) or 0
+                        # R133a: reasoning is a SUBSET of completion_tokens —
+                        # never add the two. Same "0 means unreported" rule as
+                        # cached_tokens above.
+                        out_details = usage.get("completion_tokens_details") or {}
+                        result.reasoning_tokens = out_details.get(
+                            "reasoning_tokens", 0) or 0
                     choices = chunk.get("choices") or []
                     if not choices:
                         continue
@@ -440,8 +570,12 @@ class OpenAICompatProvider(Provider):
                     # route it to on_think (UI decides how to show it); it never
                     # enters the stored/copyable text
                     rc = delta.get("reasoning_content")
-                    if rc and self.on_think:
-                        self.on_think(rc)
+                    if rc:
+                        # R133a: measured even with no on_think listener —
+                        # the count is accounting, not display.
+                        result.reasoning_chars += len(rc)
+                        if self.on_think:
+                            self.on_think(rc)
                     if delta.get("content"):
                         result.text += delta["content"]
                         on_text(delta["content"])
@@ -479,16 +613,41 @@ class OpenAICompatProvider(Provider):
                 # shared quota needs seconds to free up" aren't the same.
                 if isinstance(e, _RateLimited):
                     if _attempt + 1 < _ATTEMPTS:
-                        import time
-                        time.sleep(_RATE_LIMIT_BACKOFF[_attempt])
+                        wait = _RATE_LIMIT_BACKOFF[_attempt]
+                        if e.retry_after is not None:
+                            wait = min(e.retry_after, _RATE_LIMIT_BACKOFF_CAP)
+                        # R147: a plain sleep(wait) here was the ONE blocking
+                        # point in this file that ignored `cancel` — up to 30s
+                        # (the cap) during which Esc-Esc did nothing while the
+                        # spinner kept animating, which reads as a hang.
+                        # `cancellable_sse` polls every 0.15s precisely so the
+                        # caller always unblocks promptly; this now matches.
+                        if _sleep_unless_cancelled(wait, cancel):
+                            result.stop_reason = "cancelled"
+                            return result
                         continue
                     raise ProviderError(
                         f"{self.name} rate-limited (429): {e}") from e
                 # nothing streamed yet: a transient connection failure (stale
                 # pooled keep-alive reset after idle) is safe to retry fresh
                 if _attempt + 1 < _ATTEMPTS and isinstance(e, _RETRIABLE):
+                    import random
                     import time
-                    time.sleep(0.3 * (_attempt + 1))
+                    # R171/P1: each attempt re-sends the whole prompt — a
+                    # real cost on a remote model — with nothing telling the
+                    # user why the request appears to restart. A flat
+                    # `0.3 * attempt` delay also had no jitter, so a
+                    # provider-side outage hitting many Aurora instances at
+                    # once would have them all retry in lockstep.
+                    if self.notify:
+                        try:
+                            self.notify(
+                                f"· {e.__class__.__name__} — retrying "
+                                f"(attempt {_attempt + 2}/{_ATTEMPTS})")
+                        except Exception:
+                            pass
+                    delay = 0.3 * (_attempt + 1) + random.uniform(0, 0.2)
+                    time.sleep(delay)
                     continue
                 # the cached "working" URL may have gone down mid-turn — force
                 # a re-probe on the next send so failover can try other URLs.

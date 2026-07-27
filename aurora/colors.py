@@ -7,7 +7,14 @@ import sys
 
 # bare (unbracketed) URL — stop before trailing punctuation/closing brackets
 # that are almost always part of the surrounding sentence, not the link.
-URL_RE = re.compile(r'https?://[^\s<>"\')\]]+[^\s<>"\')\].,!?:;]')
+# P-6: control chars (\x00-\x1f, \x7f) are excluded too, not just \s — \s
+# doesn't cover ESC (0x1b), so a URL copied verbatim from fetched content
+# (e.g. by the model, into its own reply) could carry a raw ESC byte through
+# unmatched by `\s`. linkify() below wraps the match in an OSC-8 hyperlink
+# escape with the URL text spliced in verbatim; an embedded ESC there lets a
+# "URL" smuggle an arbitrary terminal escape sequence (e.g. an OSC-52
+# clipboard write) into what the terminal actually interprets.
+URL_RE = re.compile(r'https?://[^\s<>"\')\]\x00-\x1f\x7f]+[^\s<>"\')\].,!?:;\x00-\x1f\x7f]')
 
 # Set True by tui.py: the full-screen TUI redirects stdout into its own
 # buffer and re-parses it with prompt_toolkit's ANSI parser, which only

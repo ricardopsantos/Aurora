@@ -160,6 +160,27 @@ def scan(text: str, allowlist: set[str] | None = None) -> list[Match]:
     def _claim(s: int, e: int) -> None:
         claimed[s:e] = b"\x01" * (e - s)
 
+    def _unclaimed_subspans(s: int, e: int) -> list[tuple[int, int]]:
+        """R170b: contiguous unclaimed runs inside [s, e). A candidate that
+        starts inside an already-claimed region (e.g. a UUID pattern that
+        matched a span partly swallowed by an earlier PRIVATE KEY block) used
+        to be dropped wholesale by the entropy fallback below — including any
+        unclaimed tail that was itself a genuine secret. Splitting the
+        candidate at claim boundaries lets each still-unclaimed run be judged
+        on its own merits instead of silently disappearing."""
+        spans = []
+        i = s
+        while i < e:
+            if claimed[i]:
+                i += 1
+                continue
+            j = i
+            while j < e and not claimed[j]:
+                j += 1
+            spans.append((i, j))
+            i = j
+        return spans
+
     for name, pat in PATTERNS:
         guard = _LITERAL_GUARD.get(name)
         if guard is not None and not any(lit in text for lit in guard):
@@ -173,22 +194,28 @@ def scan(text: str, allowlist: set[str] | None = None) -> list[Match]:
 
     for m in _CANDIDATE_RE.finditer(text):
         s, e = m.span()
-        if _overlaps(s, e):
-            continue
-        token = m.group(0)
-        if _is_hash_or_uuid(token):
-            continue
-        if _is_date_or_timestamp(token):
-            continue   # dated filenames / timestamps are not secrets
-        has_digit = any(c.isdigit() for c in token)
-        has_lower = any(c.islower() for c in token)
-        has_upper = any(c.isupper() for c in token)
-        if not (has_digit and has_lower and has_upper):
-            continue   # real tokens are mixed-case+digit; kills long slugs/paths
-        if _shannon_entropy(token) < _ENTROPY_THRESHOLD:
-            continue
-        _claim(s, e)
-        found.append(Match("High-entropy token", s, e, token))
+        # R170b: a fully unclaimed candidate is judged as-is (the common,
+        # cheap case); a partially-claimed one is split at claim boundaries
+        # so an unclaimed tail/head still gets its own chance instead of
+        # being dropped along with the whole span.
+        subspans = [(s, e)] if not _overlaps(s, e) else _unclaimed_subspans(s, e)
+        for cs, ce in subspans:
+            token = text[cs:ce]
+            if not token:
+                continue
+            if _is_hash_or_uuid(token):
+                continue
+            if _is_date_or_timestamp(token):
+                continue   # dated filenames / timestamps are not secrets
+            has_digit = any(c.isdigit() for c in token)
+            has_lower = any(c.islower() for c in token)
+            has_upper = any(c.isupper() for c in token)
+            if not (has_digit and has_lower and has_upper):
+                continue   # real tokens are mixed-case+digit; kills long slugs/paths
+            if _shannon_entropy(token) < _ENTROPY_THRESHOLD:
+                continue
+            _claim(cs, ce)
+            found.append(Match("High-entropy token", cs, ce, token))
 
     found.sort(key=lambda mm: mm.start)
     if allowlist:
@@ -245,11 +272,21 @@ def _line_span(text: str, start: int, end: int, context: int = 40):
 
 
 def format_matches(text: str, matches: list[Match],
-                   context: int = 40, max_items: int = 10) -> list[str]:
+                   context: int = 40, max_items: int = 10,
+                   mask: bool = False) -> list[str]:
     """Return human-readable lines for a secret challenge: one line per
     match showing the surrounding context with the matched token in bold
     (using ANSI escape codes so it stands out in both the classic REPL and
-    the TUI's chat pane)."""
+    the TUI's chat pane).
+
+    `mask` (feature request, 2026-07-27): the secret challenge is the ONE
+    place in Aurora that prints a detected secret in full, unconditionally
+    — worse than the transcript itself, which at least redacts on the
+    user's own "redact" choice. `mask=True` shows the surrounding context
+    and which KIND matched (still the useful part for deciding
+    keep/redact/stop) but never the token itself, so the challenge is safe
+    to run on a shared screen. A toggle, not the default, so the existing
+    "show me exactly what matched" behavior is unchanged unless asked for."""
     BOLD = "\x1b[1m"
     RESET = "\x1b[0m"
     lines: list[str] = []
@@ -258,7 +295,8 @@ def format_matches(text: str, matches: list[Match],
         before = text[ls:m.start]
         token = text[m.start:m.end]
         after = text[m.end:le]
-        lines.append(f"  {i}. {m.kind}: {before}{BOLD}{token}{RESET}{after}")
+        shown = f"<{m.kind} hidden>" if mask else token
+        lines.append(f"  {i}. {m.kind}: {before}{BOLD}{shown}{RESET}{after}")
     if len(matches) > max_items:
         lines.append(f"  … and {len(matches) - max_items} more")
     return lines

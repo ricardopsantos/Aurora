@@ -39,6 +39,10 @@ def test_set_from_real_url_then_refresh(tmp_path, monkeypatch):
     assert "Session bootstrap" in text
     assert bootstrap.source_url(tmp_path) == REAL_URL
 
+    # R171/S3: refresh_from_source now skips the rewrite (and any confirm)
+    # when the fetched content matches the cache exactly — force a stale
+    # cache so there's a real diff to refresh.
+    (tmp_path / "bootstrap.md").write_text("stale placeholder\n")
     refreshed = bootstrap.refresh_from_source(tmp_path)
     assert refreshed is not None
     new_text, path = refreshed
@@ -46,3 +50,6 @@ def test_set_from_real_url_then_refresh(tmp_path, monkeypatch):
     assert path == tmp_path / "bootstrap.md"
     # sidecar URL survives the refresh, unchanged
     assert bootstrap.source_url(tmp_path) == REAL_URL
+
+    # a second refresh with nothing changed is now a no-op
+    assert bootstrap.refresh_from_source(tmp_path) is None

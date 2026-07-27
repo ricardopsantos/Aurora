@@ -212,6 +212,33 @@ def test_remember_falls_back_to_home_aurora_pfcs_when_no_context(tmp_path, monke
     assert any("AURORA_PFCS" in n for n in fe.notices)
 
 
+# ── R171/I3: redraft loop must notify when it runs out of attempts ────────
+_ONE_REPLY = """GROUP: aurora
+TITLE: Esc owns cancel
+SUMMARY: Esc is the single control key; Ctrl+C only clears input.
+BODY:
+## Finding
+Keys must never quit instantly.
+"""
+
+
+def test_remember_notifies_when_redraft_limit_reached(tmp_path, monkeypatch):
+    root = tmp_path / ".agentic_context"
+    (root / "MEMORY").mkdir(parents=True)
+    (root / "KNOWLEDGE").mkdir(parents=True)
+    (root / "MEMORY" / "SKILL.md").write_text("x")
+    (root / "KNOWLEDGE" / "SKILL.md").write_text("x")
+    monkeypatch.chdir(tmp_path)
+    # "c" with guidance on every attempt (y/n/s or two redrafts max) — the
+    # loop should give up after 3 attempts with a visible notice instead of
+    # silently falling out
+    fe = _FakeFE([("c", "make it punchier")] * 3)
+    memory.remember(_FakeEngine(_ONE_REPLY), fe)
+    assert any("redraft limit" in n for n in fe.notices)
+    written = [p for p in (root / "MEMORY").rglob("*.md") if p.name != "SKILL.md"]
+    assert written == []
+
+
 def test_fallback_root_is_under_home():
     assert memory._fallback_root() == Path.home() / "AURORA_PFCS" / "MEMORY"
 

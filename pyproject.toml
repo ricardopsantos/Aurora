@@ -18,7 +18,52 @@ dependencies = [
 aurora = "aurora.__main__:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# ruff is pinned because its DEFAULT ruleset widens between releases — an
+# unpinned lint is a different check on every machine, which is how the repo
+# ended up with a .ruff_cache but no agreed ruleset (R132).
+dev = ["pytest>=8.0", "ruff>=0.16,<0.17"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# Everything ruff enables by default, minus the rules below — each of which
+# flags a pattern this codebase uses ON PURPOSE. They are listed with the
+# reason rather than silenced file-by-file, so a future reader can tell
+# "deliberate" from "not looked at yet".
+ignore = [
+    # A tool/checkpoint/persistence failure must NEVER kill the turn (R42,
+    # R47, R51): these paths swallow everything and feed the error back as a
+    # result string. That is the documented contract, not sloppiness.
+    "BLE001",   # blind-except
+    "S110",     # try-except-pass
+    "S112",     # try-except-continue
+    # agent.py's `_flush`/`_finish` close over the loop variable, but are
+    # CALLED inside the same iteration — never deferred past it. Verified by
+    # hand; the rule can't see the call site.
+    "B023",     # function-uses-loop-variable
+    # subprocess.run(check=False) is deliberate wherever a non-zero exit is
+    # an expected outcome to inspect (rewind's "nothing to commit", git
+    # probes), not an error to raise on.
+    "PLW1510",  # subprocess-run-without-check
+    # Config/spec dicts and dataclass defaults are read-only by convention.
+    "RUF012",   # mutable-class-default
+    # `ready, _, _ = select.select(...)` and friends: naming the unused half
+    # of an unpack is clearer than indexing.
+    "RUF059",   # unused-unpacked-variable
+    # tests/fixtures/*.py carry a #! line for documentation; they are run as
+    # `python <path>`, never executed directly.
+    "EXE001",   # shebang-not-executable
+    # Session listing/log display deliberately uses LOCAL time — it is shown
+    # to a human sitting at this machine. The JSONL itself is UTC-aware.
+    "DTZ001", "DTZ005", "DTZ006",
+    # Multi-line f-strings inside list/tuple literals are wrapped for width,
+    # not missing a comma (checked: all six sites).
+    "ISC004",   # implicit-string-concatenation-in-collection-literal
+    # session.log appends one line per event and closes immediately; the
+    # single-writer design is documented in ARCHITECTURE.md.
+    "SIM115",   # open-file-with-context-handler
+]
 
 [build-system]
 requires = ["setuptools>=68"]

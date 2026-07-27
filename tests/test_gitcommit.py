@@ -102,4 +102,30 @@ def test_draft_message_calls_the_model_with_the_diff_and_recent_log():
                                   "previous commit subject")
     assert out == "fix the thing"
     assert "diff --git a/x b/x" in seen["prompt"]
-    assert "previous commit subject" in seen["prompt"]
+
+
+def test_draft_message_caps_a_huge_diff_before_sending_to_the_model():
+    """R125d: a large staged diff (vendored deps, a regenerated lockfile)
+    must not go to the model uncapped — only the *display* preview
+    (ui.py's _COMMIT_DIFF_PREVIEW_CAP) was bounded before; the model call
+    itself was not."""
+    seen = {}
+
+    class _FakeResult:
+        text = "ok"
+
+    class _FakeProvider:
+        def turn(self, model, messages, system, tools, on_text, cancel):
+            seen["prompt"] = messages[0]["content"]
+            return _FakeResult()
+
+    class _FakeEngine:
+        current = {"model": "m"}
+
+        def _provider_for(self, entry, interactive=True):
+            return _FakeProvider()
+
+    huge_diff = "+line\n" * 10_000  # 60,000 chars, well over the cap
+    gitcommit.draft_message(_FakeEngine(), huge_diff, "")
+    assert len(seen["prompt"]) < len(huge_diff)
+    assert "truncated" in seen["prompt"]

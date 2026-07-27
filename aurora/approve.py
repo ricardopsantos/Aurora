@@ -8,6 +8,17 @@ Allowlist file: AURORA_HOME/allowlist.yaml
   apply_patch:   list of path globs auto-approved (R97)
   wait_until:    list of command *prefixes* auto-approved (R100) — its own
                  bucket, separate from run_command's
+  mcp_<server>_<tool>: same shape (path/command matching, whichever
+                 applies) — extension tools use their own full name as the
+                 bucket key, auto-created on first "always allow" (R119/R120)
+
+Denylist file: AURORA_HOME/denylist.yaml (R120) — same shape and matching
+rules as the allowlist, but for "always DENY this" instead: a match skips
+the approval prompt entirely and auto-refuses, no question asked. Checked
+BEFORE the allowlist on every gated call — deny always wins, matching
+pi-permission-system's fail-closed design (a case both an allow and a deny
+rule ever match is a config mistake, not a case worth defining new
+precedence rules for; deny winning is the conservative choice either way).
 """
 
 import difflib
@@ -19,7 +30,8 @@ from pathlib import Path
 
 import yaml
 
-from .paths import aurora_home
+from . import rewind
+from .paths import aurora_home, write_text_atomic
 
 
 @functools.lru_cache(maxsize=512)
@@ -57,28 +69,152 @@ SAFE_COMMANDS = frozenset({
     "head", "tail", "file",
 })
 
+# R149: the exact MIRROR of SAFE_COMMANDS. Where a safe command generalizes
+# across any args, these generalize across none — an "always allow" on one
+# covers that whole command string and nothing else.
+#
+# The bug this closes is not a missing list entry, it's the direction the
+# two-token rule generalizes in. `_rule_for` stores the first two tokens,
+# which for a destructive command is precisely the HARMLESS half, leaving the
+# target free to vary:
+#
+#   "always allow" on `rm -rf ./build`          stores `rm -rf`
+#       → thereafter auto-approves `rm -rf /` and `rm -rf ~`, unprompted
+#   "always allow" on `dd if=/dev/zero of=./f`  stores `dd if=/dev/zero`
+#       → thereafter auto-approves `of=/dev/disk0`
+#
+# The old code comment claimed two-token storage was "correct for anything
+# that can write/delete/execute, since a bare `rm` must never auto-approve
+# `rm -rf /`" — but that guard only ever covered the SINGLE-token legacy
+# case. The two-token case walked straight into it.
+DANGEROUS_COMMANDS = frozenset({
+    # disk/device writers — the `dd`-as-disk-destroyer family
+    "dd", "mkfs", "fdisk", "parted", "shred", "hdparm", "diskutil", "newfs",
+    # deleters
+    "rm", "rmdir", "unlink", "srm",
+    # interpreters: the ARGS are the program, so no prefix of them is safe
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", "exec",
+    "python", "python2", "python3", "perl", "ruby", "node", "osascript",
+    # privilege escalation and permission changes. `sudo` matters most: it
+    # makes the REST of the line dangerous whatever that line is
+    "sudo", "su", "doas", "chown", "chmod", "chgrp", "launchctl", "systemctl",
+    # fetch-to-shell — the classic `curl … | sh`, and a plain download that
+    # overwrites a file is a write either way
+    "curl", "wget",
+})
+
+# families whose real binary name carries a suffix: mkfs.ext4, newfs_hfs
+_DANGEROUS_PREFIXES = ("mkfs.", "newfs_")
+
+# R141: shell syntax that turns one command string into several, or into a
+# write. Checked against the RAW command, never its tokens: `run_command`
+# executes with `shell=True`, but `shlex.split` — what the allowlist matches
+# on — treats `&&`, `||`, `|`, `>` as ordinary WORDS and a newline as plain
+# whitespace. So `ls && rm -rf ~` tokenizes to ("ls", "&&", "rm", …) and
+# prefix-matched a stored `ls` rule: every token-boundary guarantee the
+# matcher advertises silently stopped at the first operator.
+#
+# `$` alone is deliberately absent — `echo $HOME` is expansion, not
+# execution, and is far too common to force a re-prompt on; `$(` is the
+# substitution form and IS listed. Quoted-but-harmless uses (`grep 'a|b' f`)
+# do get caught by the raw-string check and will re-prompt. That is the
+# intended trade: on a security gate, a false prompt costs a keystroke and a
+# false auto-approval costs the user's filesystem.
+_SHELL_OPS = ("&", "|", ";", "<", ">", "`", "$(", "\n", "\r")
+
+
+def _is_dangerous(toks: tuple) -> bool:
+    """Does any token name a command that must never match by prefix (R149)?
+
+    EVERY token is checked, not just the first, and by BASENAME. `sudo dd …`,
+    `/bin/rm -rf /`, `xargs rm -rf`, `env dd …`, `nice rm …` and
+    `find . -exec rm {} +` all put the dangerous name somewhere other than
+    position zero, and a first-token-only test would generalize the two-token
+    rule right over the top of them (`xargs rm` covering `xargs rm -rf /`).
+
+    Scanning every token does over-trigger — `grep dd .` has a bare `dd`
+    token and gets treated as dangerous. That costs one re-approval when the
+    args change and nothing else, which is the right side to err on. Note it
+    only fires on a token that IS the name: `git commit -m "remove dd stuff"`
+    is a single token and does not match."""
+    for t in toks:
+        base = os.path.basename(t)
+        if base in DANGEROUS_COMMANDS or base.startswith(_DANGEROUS_PREFIXES):
+            return True
+    return False
+
+
+def _is_compound(cmd: str) -> bool:
+    """Does this command string contain shell syntax that could chain,
+    redirect, or substitute another command into it?"""
+    return any(op in cmd for op in _SHELL_OPS)
+
 _FILE = "allowlist.yaml"
+_DENY_FILE = "denylist.yaml"
 
 
 def _path() -> Path:
     return aurora_home() / _FILE
 
 
+def _deny_path() -> Path:
+    return aurora_home() / _DENY_FILE
+
+
 _TOOLS = ("run_command", "write_file", "edit_file", "apply_patch", "wait_until")
 
 
-def load() -> dict:
-    p = _path()
-    if not p.exists():
-        return {k: [] for k in _TOOLS}
-    data = yaml.safe_load(p.read_text()) or {}
-    for k in _TOOLS:
-        data.setdefault(k, [])
+class ApproveLoadError(Exception):
+    """R170a: a present-but-unparseable allowlist/denylist file used to
+    collapse to `{}` via `yaml.safe_load(...) or {}` (or crash on a non-dict
+    result with an unrelated AttributeError downstream), which made
+    `is_denied` silently return `False` — a corrupt denylist.yaml disabled
+    ALL deny enforcement with no visible error. Raised instead so callers can
+    fail CLOSED (block gated calls) rather than fail open, matching R120's
+    'deny always wins' guarantee. A genuinely missing or truly empty file is
+    NOT an error — that's the documented "no rules yet" case."""
+
+
+def _load(path: Path, prepopulate: bool) -> dict:
+    """Shared by load()/load_deny(). `prepopulate`: the allowlist always
+    pre-creates the 5 known gated tools' buckets (existing behavior,
+    depended on by callers that assume the key exists); the denylist
+    doesn't need to, since a fresh install has no deny rules for anything.
+    Either way, an unknown tool name (an extension's, e.g. `mcp_github_x`)
+    still round-trips fine — `_add_rule`/`is_allowed`/`is_denied` all use
+    `.get`/`setdefault` rather than assuming the key pre-exists (R120 bug
+    fix: `add_rule` used to KeyError on any tool name outside the fixed
+    `_TOOLS` tuple, so "always allow" on an extension tool crashed the
+    turn instead of persisting)."""
+    if not path.exists():
+        return {k: [] for k in _TOOLS} if prepopulate else {}
+    try:
+        data = yaml.safe_load(path.read_text()) or {}
+    except yaml.YAMLError as e:
+        raise ApproveLoadError(f"{path}: {e}") from e
+    if not isinstance(data, dict):
+        raise ApproveLoadError(
+            f"{path}: expected a mapping, got {type(data).__name__}")
+    if prepopulate:
+        for k in _TOOLS:
+            data.setdefault(k, [])
     return data
 
 
+def load() -> dict:
+    return _load(_path(), prepopulate=True)
+
+
+def load_deny() -> dict:
+    return _load(_deny_path(), prepopulate=False)
+
+
 def save(data: dict) -> None:
-    _path().write_text(yaml.safe_dump(data, sort_keys=False))
+    write_text_atomic(_path(), yaml.safe_dump(data, sort_keys=False))
+
+
+def save_deny(data: dict) -> None:
+    write_text_atomic(_deny_path(), yaml.safe_dump(data, sort_keys=False))
 
 
 def _norm_path(path: str) -> str:
@@ -108,37 +244,84 @@ def _signature(tool: str, args: dict) -> str:
     return _norm_path(args.get("path", ""))
 
 
-def is_allowed(tool: str, args: dict, data: dict | None = None) -> bool:
-    data = data or load()
+def _matches(tool: str, args: dict, data: dict, strict: bool = False) -> bool:
+    """Shared by is_allowed/is_denied — same pattern rules, different file.
+    A rule from an allowlist means "always approve"; the identical rule
+    shape in a denylist means "always refuse" — the matching logic itself
+    doesn't know or care which.
+
+    `strict` (R141, extended by R149) is the one place the two directions
+    must NOT agree. For the allowlist it disables prefix generalization on a
+    compound command (so a stored `ls` can never approve `ls && rm -rf ~`)
+    and on a dangerous one (so a stored `rm -rf` can never approve
+    `rm -rf /`). Applying either restriction to the DENYlist would weaken it
+    — a denied `rm` must still be denied when chained — so `is_denied` leaves
+    it off. Both directions stay fail-closed; they just fail toward different
+    answers."""
     sig = _signature(tool, args)
     if tool in _COMMAND_TOOLS:
+        # These may only ever match a rule EXACTLY. The user explicitly
+        # approved that whole command, which is still a real thing to want,
+        # but nothing about it generalizes to a prefix: for a pipeline the
+        # tail can be swapped (R141), and for a destructive command the
+        # two-token rule holds the harmless half and leaves the TARGET free
+        # to vary (R149).
+        exact_only = strict and (_is_compound(sig)
+                                 or _is_dangerous(_norm_command(sig)))
         # token-boundary prefix match, on NORMALIZED tokens (quotes stripped,
         # ~ expanded) so path-spelling variants of the same command match: an
         # allowlisted "git status" approves "git status --short" but never
         # "gitk". Legacy single-token rules ("rm") only match the bare command
         # EXACTLY — "rm" must not auto-approve "rm -rf /".
         sig_toks = _norm_command(sig)
-        for p in data[tool]:
+        for p in data.get(tool, []):
             if not p:
                 continue
             rule = _norm_command(p)
             if not rule:
                 continue
-            if sig_toks == rule or (len(rule) >= 2
-                                    and sig_toks[:len(rule)] == rule):
+            if sig_toks == rule:
                 return True
-            # single-token rule for a known-safe read-only command: prefix
-            # match regardless of args (see SAFE_COMMANDS above). A
-            # single-token rule for anything else stays exact-match-only —
-            # "rm" must never auto-approve "rm -rf /".
-            if (len(rule) == 1 and rule[0] in SAFE_COMMANDS
-                    and sig_toks[:1] == rule):
+            if exact_only:
+                continue
+            if len(rule) >= 2 and sig_toks[:len(rule)] == rule:
+                return True
+            # A single-token rule prefix-matches regardless of args — but for
+            # the ALLOWlist only when the command is known-safe (see
+            # SAFE_COMMANDS): "rm" must never auto-approve "rm -rf /".
+            #
+            # R149b: on the DENYlist that restriction was backwards. A lone
+            # `dd` there matched only the bare word `dd`, so writing the
+            # obvious rule to hard-block the disk destroyer blocked nothing
+            # real — the exact-match guard exists to stop a vague rule
+            # ALLOWING too much, and denying too much is the safe direction.
+            # A single-token deny rule now covers any args.
+            if (len(rule) == 1 and sig_toks[:1] == rule
+                    and (not strict or rule[0] in SAFE_COMMANDS)):
                 return True
         return False
     # rules are normalized on both sides, so a rule stored before R95g (raw
     # `~/x.py`) still matches a normalized signature
     return any(fnmatch.fnmatch(sig, _norm_path(g))
                for g in data.get(tool, []) if g)
+
+
+def is_allowed(tool: str, args: dict, data: dict | None = None) -> bool:
+    return _matches(tool, args, data if data is not None else load(),
+                    strict=True)
+
+
+def is_denied(tool: str, args: dict, data: dict | None = None) -> bool:
+    """R120: a matching denylist rule skips the approval prompt entirely and
+    auto-refuses — no question asked. Checked before the allowlist by the
+    caller (agent.py); an empty/missing denylist.yaml (the common case)
+    means nothing is ever denied by policy. R170a: a present-but-corrupt
+    denylist.yaml raises `ApproveLoadError` (via `load_deny`) instead of
+    silently behaving like an empty one — the caller must fail closed."""
+    data = data if data is not None else load_deny()
+    if not data:
+        return False
+    return _matches(tool, args, data)
 
 
 def legacy_rules(data: dict | None = None) -> list[str]:
@@ -151,27 +334,69 @@ def legacy_rules(data: dict | None = None) -> list[str]:
             if p and len(p.split()) < 2 and p not in SAFE_COMMANDS]
 
 
-def add_rule(tool: str, args: dict) -> str:
-    """Persist an 'always' answer. For commands, store the first TWO tokens
-    ("rm -rf", "git push") — a bare first token ("rm") auto-approves far more
-    than the human just looked at. For files, the exact path. Returns the
-    stored rule for display."""
-    data = load()
+def _rule_for(tool: str, args: dict) -> str:
+    """The rule string add_rule/add_deny_rule persist. For commands, the
+    first TWO normalized tokens ("rm -rf", "git push") — a bare first token
+    ("rm") auto-approves/denies far more than the human just looked at.
+    For files, the exact path.
+
+    Bug fix: MCP/extension tools rarely carry a `path` argument at all
+    (real args look like `{"title": ..., "body": ...}`), so this used to
+    return `""` for them — falsy, so `add_rule`/`add_deny_rule`'s `if rule`
+    guard silently skipped saving anything. "Always allow"/"Always DENY"
+    picked from the approval prompt then did nothing: the next identical
+    call re-prompted (or, for deny, was never actually blocked next time)
+    with no visible error. `"*"` is a real, storable rule meaning "this
+    tool, any args" — `fnmatch.fnmatch(sig, "*")` matches unconditionally,
+    including an empty signature, so `is_allowed`/`is_denied` treat it
+    exactly like a path-glob rule already would. This is the accepted,
+    documented granularity limit for these tools (tool-level, not
+    per-argument) — the bug was that it didn't even work at that
+    granularity, not that the granularity itself was coarse."""
     if tool in _COMMAND_TOOLS:
-        # store the first two NORMALIZED tokens (quotes stripped, ~ expanded)
-        # with shlex.join so a token containing spaces round-trips losslessly
-        toks = _norm_command(args.get("command", ""))
+        # store with shlex.join so a token containing spaces round-trips
+        # losslessly
+        cmd = args.get("command", "")
+        toks = _norm_command(cmd)
+        # A compound (R141) or dangerous (R149) command is stored WHOLE.
+        # Neither generalization below is sound for them: `ls` would approve
+        # any chain starting `ls`, the two-token `ls &&` is worse still, and
+        # the two-token `rm -rf` leaves the target free to become `/`.
+        # Storing the full command keeps "always allow" honest — it matches
+        # exactly what the user was shown, and nothing else.
+        if _is_compound(cmd) or _is_dangerous(toks):
+            return shlex.join(toks)
         # a known-safe read-only command generalizes across ANY args (the
         # varying part is always just a path/pattern) — store the bare
         # command name so "always allow" on `find /a` also covers `find /b`
         # in a different project/session instead of re-prompting per path
-        rule = toks[0] if toks and toks[0] in SAFE_COMMANDS \
+        return toks[0] if toks and toks[0] in SAFE_COMMANDS \
             else shlex.join(toks[:2])
-    else:
-        rule = _norm_path(args.get("path", ""))
-    if rule and rule not in data[tool]:
+    return _norm_path(args.get("path", "")) or "*"
+
+
+def add_rule(tool: str, args: dict) -> str:
+    """Persist an 'always allow' answer. Returns the stored rule for
+    display. R120 bug fix: used to do `data[tool].append(...)`, which
+    KeyError'd for any tool name outside the fixed `_TOOLS` tuple — an
+    extension's tool (e.g. `mcp_github_create_issue`) crashed the turn
+    instead of persisting the rule. `setdefault` handles any tool name."""
+    data = load()
+    rule = _rule_for(tool, args)
+    if rule and rule not in data.setdefault(tool, []):
         data[tool].append(rule)
         save(data)
+    return rule
+
+
+def add_deny_rule(tool: str, args: dict) -> str:
+    """Persist an 'always DENY' answer (R120) — same rule shape as
+    add_rule, opposite file and meaning."""
+    data = load_deny()
+    rule = _rule_for(tool, args)
+    if rule and rule not in data.setdefault(tool, []):
+        data[tool].append(rule)
+        save_deny(data)
     return rule
 
 
@@ -182,9 +407,38 @@ def diff_preview(tool: str, args: dict) -> str:
     permission error) would kill the turn and leave that tool_use dangling,
     poisoning every later request."""
     try:
-        return _diff_preview(tool, args)
+        body = _diff_preview(tool, args)
     except Exception as e:
-        return f"[diff unavailable: {e.__class__.__name__}: {e}]"
+        body = f"[diff unavailable: {e.__class__.__name__}: {e}]"
+    return _rewind_note(tool, args) + body
+
+
+_PATH_TOOLS = ("write_file", "edit_file", "apply_patch")
+
+
+def _rewind_note(tool: str, args: dict) -> str:
+    """R130: warn, at the approval prompt, when a mutation lands OUTSIDE the
+    tree /rewind can restore.
+
+    R47 checkpoints the working tree before every approved mutation, but its
+    work-tree is the cwd — so a write to `~/Desktop/x.md` or a sibling
+    project is snapshotted by nothing, and `/rewind` silently cannot undo
+    it. R30's system prompt actively pushes the model toward absolute and
+    `~` paths, so this is a normal case, not an exotic one.
+
+    Same principle as R95a: the approval prompt is what buys consent, so it
+    must not imply an undo guarantee that doesn't exist. A note here, not a
+    refusal — writing outside the project is legitimate; being told it is
+    unrecoverable is the point. `run_command` is deliberately excluded: what
+    a shell command touches isn't knowable from its arguments, so a note
+    keyed on them would be guesswork in both directions."""
+    if tool not in _PATH_TOOLS:
+        return ""
+    path = args.get("path", "")
+    if not path or rewind.covers(path):
+        return ""
+    return ("[note: outside the checkpointed tree — /rewind cannot undo "
+            "this write]\n")
 
 
 def _diff_preview(tool: str, args: dict) -> str:

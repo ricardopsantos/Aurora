@@ -2,9 +2,8 @@
 
 Owns ALL terminal I/O: streaming, footer (R13), keybindings (Shift+Enter /
 Cmd+Enter newline, ? help, R18), Ctrl+C interrupt (R17), slash commands,
-`!cmd` passthrough (R10), the /model picker incl. the LlamaDesk library with
-its eviction confirm (R3). The engine is driven only through its public
-methods.
+`!cmd` passthrough (R10), the /model picker. The engine is driven only
+through its public methods.
 """
 
 import getpass
@@ -19,19 +18,43 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from . import (approve, bootstrap, clipboard, gitcommit, keystore, mdrender,
-               memory, rewind, session as sessions, skills, todo, tokens)
-from .colors import (BOLD, CYAN, DIM, GREEN, MAGENTA, RED, RESET, YELLOW,
-                     colour_diff, dim)
+from . import (
+    approve,
+    bootstrap,
+    clipboard,
+    extensions,
+    gitcommit,
+    keystore,
+    mdrender,
+    memory,
+    rewind,
+    skills,
+    tokens,
+    tools,
+)
+from . import session as sessions
+from .colors import (
+    BOLD,
+    CYAN,
+    DIM,
+    GREEN,
+    MAGENTA,
+    RED,
+    RESET,
+    YELLOW,
+    colour_diff,
+    dim,
+)
 from .engine import Engine
-from .llamadesk import LlamaDesk, LlamaDeskError
+from .paths import aurora_home
 
 HELP = f"""\
 {BOLD}plain text{RESET}            talk to the model (paste is safe)
+{CYAN}/<command> help{RESET}       full description of that one command (alias: `man`)
 {BOLD}!{RESET} / {BOLD}!cmd{RESET}              bash: `!` on an empty line enters bash mode ($);
                       each Enter runs a shell command locally, no LLM
                       (Esc or empty backspace exits). Classic REPL: `!cmd`
-{CYAN}/model{RESET}                model picker (OpenRouter $ · local library)
+{CYAN}/model{RESET}                model picker (OpenRouter $ · local free)
 {CYAN}/model add <url>{RESET}      add an OpenRouter model (page URL or org/model id)
                       to config.yaml and switch to it
 {CYAN}/model remove <name>{RESET}  remove a configured model (URL or exact name; `rm`
@@ -53,23 +76,39 @@ HELP = f"""\
 {CYAN}/copy-all{RESET}             copy the whole chat, questions included, to the clipboard (SSH-safe)
 {CYAN}/redact on|off{RESET}         secret-in-prompt/tool-output detection (default ON, persisted)
 {CYAN}/status{RESET}               is the current model's backend up and ready?
-{CYAN}/cost [all]{RESET}            per-model token + $ breakdown for this session (or every
-                      session) — read from the session logs
+{CYAN}/cost{RESET}                 per-model token + $ breakdown across EVERY session on this
+                      machine — for one session's breakdown, {CYAN}/context <id>{RESET}
 {CYAN}/cache on|off{RESET}          prompt caching: mark the system prompt cacheable so the
                       bootstrap preamble isn't re-billed every tool iteration
-{CYAN}/todo{RESET}                 show the model's current task list (it writes one
-                      itself with the todo_write tool on multi-step work)
-{CYAN}/think  /thinking{RESET}     show last turn's reasoning · toggle live dim stream
+{CYAN}/autocompact on|off{RESET}   silently fold older history once context nears the limit
+{CYAN}/fallback on|off{RESET}      retry a failed turn on the next configured model
+                      (off by default); recent turns stay raw, /compact
+                      still folds everything on demand
+{CYAN}/thinking{RESET}            toggle live dim reasoning stream (TUI: click a
+                      "thought for Ns" row to expand/collapse it any time)
 {CYAN}/markdown{RESET}             toggle pretty rendering (bold/code/bullets) vs raw text
 {CYAN}/allowlist{RESET}            show the persistent approval allowlist
+{CYAN}/denylist{RESET}             show tool calls always denied by policy (never asked
+                      again) — set from the approval prompt's "Always DENY"
 {CYAN}/rewind [id]{RESET}          restore the tree to a pre-mutation checkpoint
+{CYAN}/undo{RESET}                 revert just the LAST mutation, not the whole tree
+{CYAN}/diff{RESET}                 show what the last turn actually changed
 {CYAN}/resume  /export{RESET}      pick a past session · dump conversation as markdown
+{CYAN}/search text{RESET}          search every session log for text, resume a hit
 {CYAN}/skills  /name args{RESET}   list skills · run one
+{CYAN}/extensions{RESET}           list loaded extension tools (bundled + your own
+                      ~/.aurora/extensions/) and how to add one
+{CYAN}/extensions new name{RESET}  scaffold a SPEC/RUNNERS template into
+                      ~/.aurora/extensions/name.py
 {CYAN}/bootstrap{RESET}            run the saved bootstrap prompt (set/show/clear to manage;
                       set accepts a local file OR a URL — startup offers
                       cached vs re-download for a URL-sourced prompt)
 {CYAN}/remember [all|last [k]]{RESET}  save what's worth keeping from the session into
                       MEMORY — last exchange (default), last k, or all
+{CYAN}/nano <file>{RESET}           TUI only — open a text file (.txt/.md/.json/.yml/
+                      .yaml/.xml/.sh, up to 1MB) in the built-in editor;
+                      clicking a matching filename in bash-mode output
+                      opens it the same way
 {CYAN}/help  /quit{RESET}          this help · quit immediately (Esc Esc asks first)"""
 
 
@@ -91,7 +130,7 @@ class TerminalFrontend:
         self.cancel_event = threading.Event()
         self.show_thinking = show_thinking   # live dim stream vs marker only
         self.render_md = render_md           # pretty markdown (display only)
-        self.think_buffer = ""               # last turn's reasoning, for /think
+        self.think_buffer = ""               # last turn's reasoning, for /copy-last
         self._think_marker_shown = False
         self._mdbuf = ""
         self._md = mdrender.LineRenderer()
@@ -130,7 +169,8 @@ class TerminalFrontend:
             sys.stdout.write(f"{DIM}{chunk}{RESET}")
             sys.stdout.flush()
         elif not self._think_marker_shown:
-            sys.stdout.write(dim("(thinking… — /think to read it after)"))
+            sys.stdout.write(dim("(thinking… — /copy-last includes it, "
+                                 "or /thinking to stream it live)"))
             sys.stdout.flush()
             self._think_marker_shown = True
 
@@ -153,6 +193,20 @@ class TerminalFrontend:
         print(f"\n{MAGENTA}{BOLD}── approval: {tool} ─────────────────────{RESET}")
         if tool == "run_command":
             print(f"  {BOLD}$ {args.get('command', '')}{RESET}")
+        elif tool == "wait_until":
+            # bug fix: this used to fall through to the generic `path` branch
+            # below, which is empty for wait_until — the command being
+            # polled (and now, its optional `then` follow-up) never showed
+            # at the approval prompt at all.
+            print(f"  {BOLD}$ {args.get('command', '')}{RESET}")
+            if args.get("then"):
+                print(f"  {dim('then:')} {BOLD}{args['then']}{RESET}")
+        elif tool.startswith("mcp_"):
+            # R119: MCP tool args rarely have a "path"/"command" key the
+            # generic branch below expects — show them as key: value instead,
+            # same shape as on_tool_start's own tool-call rendering
+            for k, v in args.items():
+                print(f"  {dim(k)}: {v}")
         else:
             print(f"  {BOLD}{args.get('path', '')}{RESET}")
         if diff:
@@ -161,8 +215,10 @@ class TerminalFrontend:
             ("y", "Yes, run once"),
             ("a", "Always allow this (remember)"),
             ("n", "No, skip"),
+            ("d", "Always DENY this (blocklist — never ask again)"),
             ("s", "Stop the agent"),
             ("c", "Comment — steer the model instead"),
+            ("e", "Explain — describe what this will do, then ask again"),
         ])
         note = ""
         if key == "c":
@@ -189,8 +245,13 @@ class TerminalFrontend:
         return key == "y", ""
 
     def ask_continue(self, iterations: int):
+        # R171/I2: `iterations` is `Turn.iterations` — it counts REQUEST
+        # rounds (agent.py increments it once per `provider.turn` call),
+        # including a round with zero tool calls (rare) and the R5
+        # corrective-retry round, not "rounds that actually called a tool".
+        # "request rounds" says what's really being counted.
         return self._ask_keep_going(
-            f"{iterations} tool iterations — continue?", allow_silent=True)
+            f"{iterations} request rounds — continue?", allow_silent=True)
 
     def ask_secret(self, label: str) -> str:
         return getpass.getpass(label).strip()
@@ -198,23 +259,47 @@ class TerminalFrontend:
     def secret_challenge(self, context: str, matches: list,
                          source_text: str = "") -> str:
         from . import secrets as secretscan
-        where = "your prompt" if context == "prompt" else f"`{context[5:]}` output"
-        print(f"\n{RED}{BOLD}── possible secret detected — {where} ────{RESET}")
-        print(f"  {secretscan.preview(matches)}")
-        if source_text:
-            for line in secretscan.format_matches(source_text, matches):
-                print(f"  {line}")
-        return select("What should Aurora do?", [
-            ("redact", "Replace with <secret> and continue"),
-            ("keep", "Keep as-is and continue"),
-            ("always", "Always allow this value — never flag it again"),
-            ("stop", "Stop"),
-        ])
+        if context == "prompt":
+            where = "your prompt"
+        elif context == "reply":
+            where = "the assistant's reply"
+        elif context.startswith("write:"):
+            where = f"the `{context[len('write:'):]}` call about to run"
+        else:
+            where = f"`{context[5:]}` output"
+        # "v" (feature request, 2026-07-27): toggles masking the token itself
+        # in the lines below — a re-render-and-reask loop, same shape as the
+        # approval gate's "e"xplain option, so the challenge stays open
+        # rather than the toggle silently becoming a terminal answer.
+        masked = False
+        while True:
+            print(f"\n{RED}{BOLD}── possible secret detected — {where} ────{RESET}")
+            print(f"  {secretscan.preview(matches)}")
+            if source_text:
+                for line in secretscan.format_matches(source_text, matches,
+                                                       mask=masked):
+                    print(f"  {line}")
+            choice = select("What should Aurora do?", [
+                ("redact", "Replace with <secret> and continue"),
+                ("keep", "Keep as-is and continue"),
+                ("always", "Always allow this value — never flag it again"),
+                ("v", ("Show" if masked else "Mask")
+                     + " the token (safe for a shared screen)"),
+                ("stop", "Stop"),
+            ])
+            if choice == "v":
+                masked = not masked
+                continue
+            return choice
 
     def on_usage(self, input_tokens: int, output_tokens: int) -> None:
         """Classic REPL ignores per-request usage; token accounting lives
         in the engine/session log."""
-        pass
+
+    def invalidate_status(self) -> None:
+        """No-op: the classic REPL has no persistent status bar to redraw
+        (R154). The engine-side gauge update it accompanies still happens —
+        this is only the "now repaint it" half."""
 
     def cancelled(self) -> bool:
         return self.cancel_event.is_set()
@@ -346,6 +431,10 @@ def _footer(engine: Engine):
         cost = f" (${s.cost_usd:.2f})" if s.cost_known else ""
         warn = "  ⚠ context >80% — /compact?" if s.pct >= 80 else ""
         ml = " │ multiline" if engine.multiline else ""
+        # R159: same rule as the TUI's `⤵N` — shown only once it has
+        # happened. The classic REPL has no click target, so it is a plain
+        # readout; `/compact` is typed here.
+        folds = f" │ ⤵{s.compactions}" if s.compactions else ""
         draft = ""
         try:
             from prompt_toolkit.application import get_app
@@ -355,7 +444,7 @@ def _footer(engine: Engine):
         except Exception:
             pass
         return (f" {s.model}{cost} │ ctx {used}/{limit}{draft} ({s.pct:.0f}%)"
-                f" │ session {s.session_id}{warn}{ml}\n"
+                f" │ session {s.session_id}{folds}{warn}{ml}\n"
                 + _FOOTER_HINT)
     return render
 
@@ -423,15 +512,6 @@ def _run_turn(engine: Engine, fe: TerminalFrontend, text: str,
 
 
 # ── /model picker ─────────────────────────────────────────────────────────
-# /model must feel as instant as /exit — it's not an LLM call, just a local
-# menu. A recently-unreachable LlamaDesk shouldn't make every /model pay the
-# probe's timeout again: remember the failure for a short while and skip
-# straight past it (still retried automatically once the TTL expires, in
-# case the box came back).
-_LLAMADESK_RECHECK_S = 30
-_llamadesk_last_fail: dict[str, float] = {}
-
-
 def _prompt_and_store_key(engine: Engine, env: str) -> None:
     """Offer to enter/store a missing key right after picking a model that
     needs one — instead of leaving the user with '(no key set)' and no way
@@ -464,70 +544,8 @@ def _prompt_and_store_key(engine: Engine, env: str) -> None:
     print(f"{GREEN}stored {env} in {where}{RESET}")
 
 
-def _llamadesk(engine: Engine) -> LlamaDesk | None:
-    cfg = engine.cfg.get("llamadesk") or {}
-    url = cfg.get("url")
-    if not url:
-        return None
-    # cache key MUST match LlamaDesk.__init__'s own normalization (it
-    # rstrips "/"), or a mark_failed(desk.base_url) after construction would
-    # never hit the same key this lookup checks
-    key = url.rstrip("/")
-    import time
-    last_fail = _llamadesk_last_fail.get(key)
-    if last_fail is not None and time.monotonic() - last_fail < _LLAMADESK_RECHECK_S:
-        return None   # skip the probe entirely — no network call, no wait
-    token = ""
-    env = cfg.get("token_env")
-    if env:
-        token = keystore.get_key(env, interactive=False) or ""
-    return LlamaDesk(url, token)
-
-
-def _llamadesk_mark_failed(url: str) -> None:
-    import time
-    _llamadesk_last_fail[url] = time.monotonic()
-
-
-def _llamadesk_mark_ok(url: str) -> None:
-    _llamadesk_last_fail.pop(url, None)
-
-
-# 64k / 128k / 256k — deliberately just these three (not a longer ladder):
-# small enough menu to glance at, big enough range for daily use.
-_CTX_OPTIONS = [65536, 131072, 262144]
-_CTX_LABELS = {65536: "64k", 131072: "128k", 262144: "256k"}
-
-
-def _pick_ctx(default_ctx: int, native: int | None) -> int:
-    """Menu: 64k/128k/256k, capped to the model's native max — options over
-    native are dropped entirely (never rope-extend past what the model was
-    trained for), not just disabled. If native itself is under 64k (a tiny
-    model), it's offered as the sole option instead of an empty menu.
-    Pre-selects the largest offered size that's <= default_ctx."""
-    options_vals = [c for c in _CTX_OPTIONS if native is None or c <= native]
-    if not options_vals:
-        options_vals = [native]
-    default_index = 0
-    for i, v in enumerate(options_vals):
-        if v <= default_ctx:
-            default_index = i
-    options = [(str(v), _CTX_LABELS.get(v, f"{v // 1000}k")) for v in options_vals]
-    chosen = select("Context size for this load?", options, default_index=default_index)
-    return int(chosen)
-
-
 def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
-    desk = _llamadesk(engine)
     loaded = None
-    if desk:
-        try:
-            loaded = desk.loaded_model()
-            _llamadesk_mark_ok(desk.base_url)
-        except LlamaDeskError as e:
-            _llamadesk_mark_failed(desk.base_url)
-            desk = None
-            print(f"{YELLOW}· LlamaDesk unreachable: {e}{RESET}")
 
     from .providers.openai_compat import REMOTE_CONTEXT_LIMITS
 
@@ -550,27 +568,19 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
             parts.append(price)
         return dim(" · ".join(parts)) if parts else ""
 
-    details: list[dict] = []
-    natives: dict[str, int | None] = {}
-    sizes: dict[str, int | None] = {}
-    if desk:
-        try:
-            details = desk.models_detail()
-            for md in details:
-                natives[md.get("name", "")] = md.get("ctx_native")
-                sizes[md.get("name", "")] = md.get("size_bytes")
-        except LlamaDeskError as e:
-            desk = None
-            print(f"{YELLOW}· LlamaDesk unreachable: {e}{RESET}")
-
-    entries = []       # (label, kind, payload)
+    entries = []       # (label, payload)
     current_index = 0  # which entry is the active model — pre-highlighted
     # identity (`is`) isn't reliable here: switch_model() stores whatever dict
     # it was handed, which is rarely the SAME object as the matching entry in
     # engine.list_models() (a fresh copy parsed from config.yaml) — compare by
     # the (provider, model) pair instead.
     cur_key = (engine.current.get("provider"), engine.current.get("model"))
-    # alphabetical picker: config models A→Z, then the LlamaDesk library A→Z
+    # feature request, 2026-07-27: last-known request latency per model,
+    # cached from the session log — a live per-entry probe would add real
+    # latency/complexity to opening the picker itself, so this is read-only
+    # and can be stale or simply absent for a model not used recently.
+    latencies = sessions.last_latency_by_model()
+    # alphabetical picker: config models A→Z
     for m in sorted(engine.list_models(),
                     key=lambda m: str(m.get("model", "")).lower()):
         name = m.get("model", "")
@@ -589,92 +599,53 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
                         price_out=remote.get("price_out_per_mtok"))
         else:
             info = ""
+        latency = latencies.get(name)
+        if latency is not None:
+            shown = f"{latency * 1000:.0f}ms" if latency < 1 else f"{latency:.1f}s"
+            info = f"{info} · {shown}" if info else shown
         if name == "local":  # show what "local" actually is
             live = loaded
             if not live:
+                # R170j: nonblocking — a direct provider.live_model_name()
+                # call here is a live /props probe that can wait out its own
+                # 4s timeout against a dead local server, freezing picker
+                # construction before the menu even renders. Serves cache
+                # (or None the first time) and refreshes in the background.
                 provider = engine._provider_for(m)
-                live = provider.live_model_name() \
-                    if hasattr(provider, "live_model_name") else None
+                live = engine._live_model_name_nonblocking(provider)
             if live:
                 name = f"local {DIM}→ {live}{RESET}"
-                info = _info(natives.get(live), sizes.get(live))
         is_current = (m.get("provider"), m.get("model")) == cur_key
         mark = f"  {GREEN}{BOLD}✔{RESET}" if is_current else ""
         no_key = f"  {RED}(no key set){RESET}" if not engine.has_key(m.get("provider")) else ""
         if is_current:
             current_index = len(entries)
-        entries.append((f"{name}{mark}  {tag} {info}{no_key}", "config", m))
+        entries.append((f"{name}{mark}  {tag} {info}{no_key}", m))
 
-    for md in sorted(details, key=lambda d: str(d.get("name", "")).lower()):
-        name = md.get("name", "")
-        note = (f"{GREEN}loaded, ready{RESET}" if name == loaded
-                else dim("library — needs a ~1-2 min load"))
-        entries.append((f"local:{name}  {GREEN}[free]{RESET} "
-                        f"{_info(natives.get(name), sizes.get(name))} {note}",
-                        "library", name))
-
-    options = [(str(i), label) for i, (label, _, _) in enumerate(entries, 1)]
+    options = [(str(i), label) for i, (label, _) in enumerate(entries, 1)]
     chosen = select("Select model", options, default_index=current_index)
     if chosen is None:   # TUI: menu dismissed (e.g. a second click on the
         return            # status bar's model name) — no change
     idx = int(chosen) - 1
-    _, kind, payload = entries[idx]
+    _, payload = entries[idx]
 
-    if kind == "config":
-        pkey = payload.get("provider")
-        if not engine.has_key(pkey):
-            env = engine.cfg["providers"].get(pkey, {}).get("api_key_env")
-            if env:
-                _prompt_and_store_key(engine, env)
-                engine.forget_key_check(pkey)   # pick up the freshly-stored key
-                if not engine.has_key(pkey):
-                    # no key entered — stay on whatever model was active
-                    print(f"{YELLOW}· no key stored — keeping "
-                          f"'{engine.current.get('model')}'{RESET}")
-                    return
-        engine.switch_model(payload)
-        print(f"{GREEN}→ {payload.get('model')}{RESET}")
-        return
-
-    # LlamaDesk library model (R3): eviction confirm, then load + wait
-    name = payload
-    if name != loaded:
-        print(f"{YELLOW}⚠ switching the local model is GLOBAL — it evicts the "
-              f"current model for every other consumer of that server.{RESET}")
-        try:
-            if desk.busy():
-                print("✗ LlamaDesk reports a switch in progress — not switching.")
+    pkey = payload.get("provider")
+    if not engine.has_key(pkey):
+        env = engine.cfg["providers"].get(pkey, {}).get("api_key_env")
+        if env:
+            _prompt_and_store_key(engine, env)
+            engine.forget_key_check(pkey)   # pick up the freshly-stored key
+            if not engine.has_key(pkey):
+                # no key entered — stay on whatever model was active
+                print(f"{YELLOW}· no key stored — keeping "
+                      f"'{engine.current.get('model')}'{RESET}")
                 return
-        except LlamaDeskError:
-            pass
-        if not confirm(f"Load '{name}' and evict '{loaded}'?", default_yes=False):
-            return
-        try:
-            default_ctx = int((engine.cfg.get("llamadesk") or {}).get("ctx", 65536))
-            native = natives.get(name)
-            ctx = _pick_ctx(default_ctx, native)
-            print(dim(f"  loading with ctx {ctx}"))
-            desk.switch(name, ctx=ctx)
-            print("loading", end="", flush=True)
-            ok = desk.wait_ready(name, on_tick=lambda: print(".", end="", flush=True))
-            print()
-            if not ok:
-                print("✗ model did not come up in time")
-                return
-        except LlamaDeskError as e:
-            print(f"✗ {e}")
-            return
-    # point the local provider entry at it
-    local = next((m for m in engine.list_models()
-                  if "openrouter" not in str(m.get("provider", ""))), None)
-    if local:
-        local = dict(local, model=name)
-        engine.switch_model(local)
-        print(f"{GREEN}→ local:{name}{RESET}")
+    engine.switch_model(payload)
+    print(f"{GREEN}→ {payload.get('model')}{RESET}")
 
 
 # ── /model add (R80) ───────────────────────────────────────────────────────
-_OPENROUTER_URL_RE = re.compile(r"^https?://openrouter\.ai/(?:models/)?", re.I)
+_OPENROUTER_URL_RE = re.compile(r"^https?://openrouter\.ai/(?:models/)?", re.IGNORECASE)
 
 
 def _parse_openrouter_model(arg: str) -> str | None:
@@ -704,8 +675,10 @@ def _add_model_cmd(engine: Engine, arg: str) -> None:
     # validate against OpenRouter's catalog FIRST — a typo'd model id must
     # fail here, not on the first send. The same lookup supplies the
     # ctx/pricing/description for the footer gauge + $ badge (R71/R73).
-    from .providers.openai_compat import (fetch_openrouter_model_info,
-                                          save_remote_model_info)
+    from .providers.openai_compat import (
+        fetch_openrouter_model_info,
+        save_remote_model_info,
+    )
     info, catalog_ok = fetch_openrouter_model_info(model_id)
     if catalog_ok and info is None:
         print(f"{RED}✗ {model_id} not found on OpenRouter — check the "
@@ -767,9 +740,8 @@ def _remove_model_cmd(engine: Engine, arg: str) -> None:
 
 
 COMMAND_INFO = {
-    "model":     "model picker — OpenRouter $ · local library · add/remove <url>",
+    "model":     "model picker — OpenRouter $ · local free · add/remove <url>",
     "status":    "is the current model's backend up and ready?",
-    "think":     "show last turn's reasoning",
     "thinking":  "toggle the live dim reasoning stream",
     "markdown":  "toggle pretty rendering vs raw text",
     "compact":   "summarize-and-continue (frees context)",
@@ -779,19 +751,28 @@ COMMAND_INFO = {
     "copy-last": "copy last turn's RAW response (thinking included) to the clipboard",
     "copy-all":  "copy the whole chat (questions + answers) to the clipboard",
     "redact":    "secret detection on|off · allowlist [clear] (persisted)",
-    "cost":      "per-model token + $ breakdown (add `all` for every session)",
+    "cost":      "per-model token + $ breakdown across every session on this machine",
+    "context":   "cost tree — this session as turns, tokens, tools and $",
     "cache":     "prompt caching on|off — stops re-billing the system prompt",
-    "todo":      "show the model's current task list",
+    "autocompact": "silently fold older history near the context limit on|off",
+    "fallback":  "retry a failed turn on the next configured model on|off (persisted)",
     "allowlist": "show the persistent approval allowlist",
+    "denylist":  "show tool calls always denied by policy",
     "rewind":    "restore the working tree to a pre-mutation checkpoint",
+    "undo":      "revert just the last mutation, not the whole tree (see /rewind)",
+    "diff":      "show what the last turn actually changed (vs its pre-mutation checkpoint)",
     "commit":    "stage + draft a commit message from the diff + commit (optional message)",
     "resume":    "pick a past session to continue",
+    "search":    "search every session log for text (add a number to resume that hit)",
     "export":    "dump this conversation as markdown",
     "skills":    "list installed skills",
+    "extensions": "list loaded extension tools + how to add one",
     "bootstrap": "run the saved bootstrap prompt (set/show/clear)",
     "multiline": "toggle multiline mode: Enter newline, Alt+Enter submit (persisted)",
     "remember":  "save what's worth keeping from the session into MEMORY (last [k]|all)",
     "agentic_report": "context folder health: Stats (stats.sh) or a pretty-printed Index",
+    "nano":      "open a text file (.txt/.md/.json/.yml/.yaml/.xml/.sh, up to 1MB) "
+                 "in the built-in editor (TUI only)",
     "help":      "all commands and keys",
     "quit":      "quit aurora immediately (no confirmation; /exit works too)",
     "exit":      "quit aurora immediately (alias of /quit)",
@@ -884,13 +865,28 @@ def _run_bootstrap(engine: Engine, fe: TerminalFrontend, redownload: bool = Fals
     overhead. `sync=False` (classic REPL, the default) is unchanged."""
     if redownload:
         print(dim("· re-downloading bootstrap prompt..."))
+
+        def _confirm_refresh(old_text: str, new_text: str) -> bool:
+            # R171/S3: this prompt is about to be sent as a tool-enabled
+            # turn — show what actually changed before it's persisted (and
+            # before any of it can run), rather than silently trusting
+            # whatever came back over the wire.
+            print(dim(f"· fetched content differs from the cached copy "
+                      f"({len(old_text)} → {len(new_text)} chars):"))
+            print(new_text[:2000] + ("\n…[truncated]" if len(new_text) > 2000
+                                     else ""))
+            return confirm("Use this fetched version?")
+
         try:
-            refreshed = bootstrap.refresh_from_source(".")
+            refreshed = bootstrap.refresh_from_source(
+                ".", confirm=_confirm_refresh)
         except Exception as e:
             print(f"· download failed: {e} — using cached version")
         else:
             if refreshed:
                 print(dim(f"· updated → {refreshed[1]}"))
+            else:
+                print(dim("· keeping cached version"))
     text, source = bootstrap.load(".")
     if not text:
         print("· no bootstrap prompt saved — /bootstrap set")
@@ -954,6 +950,16 @@ def _bootstrap_cmd(engine: Engine, fe: TerminalFrontend, arg: str) -> None:
             except Exception as e:
                 print(f"· download failed: {e}")
                 return
+            # R171/S3: the FIRST download of a URL has no integrity check at
+            # all (no pinning/hash, follow_redirects=True) and this content
+            # later gets offered as a tool-enabled turn at every startup —
+            # show it before it's saved so a compromised URL or a redirect
+            # attack doesn't get a free pass on the one tap that matters.
+            print(dim(f"· fetched {len(text)} chars:"))
+            print(text[:2000] + ("\n…[truncated]" if len(text) > 2000 else ""))
+            if not confirm("Save and use this bootstrap prompt?"):
+                print("· discarded — nothing saved")
+                return
             src, url = path_arg, path_arg
         elif path_arg:
             text, src = bootstrap.from_input(path_arg)
@@ -979,6 +985,12 @@ def _bootstrap_cmd(engine: Engine, fe: TerminalFrontend, arg: str) -> None:
                     text = bootstrap.fetch_url(pasted)
                 except Exception as e:
                     print(f"· download failed: {e}")
+                    return
+                print(dim(f"· fetched {len(text)} chars:"))
+                print(text[:2000] +
+                     ("\n…[truncated]" if len(text) > 2000 else ""))
+                if not confirm("Save and use this bootstrap prompt?"):
+                    print("· discarded — nothing saved")
                     return
                 src, url = pasted, pasted
             else:
@@ -1061,6 +1073,47 @@ def _commit_cmd(engine: Engine, fe: TerminalFrontend, arg: str) -> None:
         return
 
 
+def _extension_tool_specs() -> list[dict]:
+    """R119/R121: the tool specs that came from extensions specifically —
+    `tools.specs()` also folds in the built-ins plus the `.agentic_context`
+    doc tool when active, neither of which is an extension, so those are
+    named out explicitly rather than assuming "everything past the built-ins"
+    is extension-provided. Shared by `/extensions` and the startup banner so
+    the two can never disagree about what's loaded.
+
+    R157: `web_search`/`web_fetch` are deliberately NOT excluded any more.
+    They now come from `extensions_bundled/web_extension.py`, so `/extensions`
+    listing them is correct — it reports what is actually loaded, and a
+    bundled extension is still an extension (the MCP tools have always shown
+    up here the same way)."""
+    from . import context as ctxmod
+    non_ext_names = ({s["name"] for s in tools.SPEC}
+                     | {s["name"] for s in ctxmod.SPEC})
+    return [s for s in tools.specs() if s["name"] not in non_ext_names]
+
+
+def _diff_cmd(engine: Engine) -> None:
+    """/diff: what did the LAST turn actually change? Diffs the working tree
+    against the checkpoint HEAD captured right before that turn ran
+    (`engine.last_turn_diff_base`) — the shadow repo already has both
+    endpoints (R47's per-mutation checkpoints), so this is the read-only
+    other half of the approval gate: you approved N writes, here's what they
+    did. Operates on rewind.py's shadow repo, never the project's real .git
+    (that's /commit's job)."""
+    if engine.last_turn_diff_base is None and not rewind.entries():
+        print("· no checkpoints yet — one is taken before every approved "
+              "write/edit/command; run a turn that mutates something first")
+        return
+    diff = rewind.diff_since(engine.last_turn_diff_base)
+    if diff.startswith("[diff error:"):
+        print(f"· {diff}")
+        return
+    if not diff.strip():
+        print("· no changes since the last turn started")
+        return
+    print(colour_diff(diff))
+
+
 def _rewind_cmd(arg: str) -> None:
     """List checkpoints (snapshots taken before every approved mutation) and
     restore one — `/rewind <id>` skips the picker. Restoring resets tracked
@@ -1088,14 +1141,82 @@ def _rewind_cmd(arg: str) -> None:
         print("· no such checkpoint")
 
 
-# ── slash commands ────────────────────────────────────────────────────────
+def _undo_cmd() -> None:
+    """/undo: revert just the LAST mutation. ALWAYS previews the affected
+    paths before asking, and always NAMES them (never a generic "undo the
+    last mutation?") — a real incident (twice, in one session) showed why:
+    a mutation whose target was outside the checkpointed tree
+    (`rewind.covers()`'s documented gap — an absolute path elsewhere on
+    disk) left nothing in the whole-tree checkpoint to undo for it, and
+    `undo()` used to fall back to reverting an OLDER, unrelated,
+    already-sealed mutation instead — silently, with a confirm that named
+    no files. R181's per-file snapshot (`rewind.snapshot_before_write`)
+    closed the actual gap — write_file/edit_file/apply_patch are tracked
+    regardless of location now — and `undo_preview()` dropped the
+    unrelated-history fallback entirely (see its docstring for why it
+    could never be correct). The filename is still always shown up front:
+    naming it is what lets a user catch "that's not the file I meant"
+    before confirming, not after. Feedback: naming the file wasn't quite
+    enough either — showing the actual DIFF alongside it (via
+    `rewind.undo_diff`) is what lets it be judged at a glance instead of
+    just trusted."""
+    kind, paths = rewind.undo_preview()
+    if kind in ("none", "error"):
+        print(f"· {rewind.undo()}")   # reuses undo()'s own wording for both
+        return
+    diff = rewind.undo_diff()
+    if diff.strip():
+        print(colour_diff(diff))
+    if kind == "file":
+        prompt = f"Undo will revert {paths[0]}. Proceed?"
+    else:
+        shown = ", ".join(paths[:8]) + (f" (+{len(paths) - 8} more)" if len(paths) > 8 else "")
+        prompt = f"Undo will revert: {shown}. Proceed?"
+    if confirm(prompt, default_yes=False):
+        print(f"· {rewind.undo()}")
+
+
+# a fixed banner + a rule between each section (R124a) — plain
+# "[prompt]\n...\n\n[response]\n..." concatenation read as one run-on block
+# with no visual seam between "the question" and "the answer"
+_SEP = "-" * 10
+
+
 def _raw_last_response_text(engine: Engine, fe: TerminalFrontend) -> str:
-    """Last turn's RAW response: reasoning (if any) followed by the final
-    answer. Unlike `/copy`/`engine.last_response()`, this deliberately
-    includes thinking — the one place it's allowed to leave the buffer."""
+    """Last turn's RAW record (R124): the prompt that started it, the
+    reasoning (if any), then the final answer. Unlike `/copy`/`engine.
+    last_response()`, this deliberately includes the prompt and thinking —
+    the one place either is allowed to leave the buffer/history."""
+    prompt = engine.last_prompt()
     think = fe.think_buffer
     answer = engine.last_response()
-    return f"[thinking]\n{think}\n\n[response]\n{answer}" if think else answer
+    parts = []
+    if prompt:
+        parts.append(f"[prompt]\n{prompt}")
+    if think:
+        parts.append(f"[thinking]\n{think}")
+    parts.append(f"[response]\n{answer}" if (prompt or think) else answer)
+    if len(parts) == 1:
+        return parts[0]
+    return f"{_SEP}\n{_SEP}\n\n" + f"\n\n{_SEP}\n\n".join(parts)
+
+
+def _last_copyable_text(engine: Engine, fe: TerminalFrontend) -> tuple[str, str]:
+    """Whichever happened more recently: the last LLM turn's raw response
+    (thinking included, via `_raw_last_response_text`) or — in the TUI's
+    bash mode, which has no `engine`/session concept of its own — the last
+    shell command's captured output, same text `!<cmd>` printed. Returns
+    (text, label); label feeds the caller's copy-confirmation message.
+    Falls back to LLM-only behavior for frontends without TUI bash state
+    (e.g. the classic REPL, where `!<cmd>` isn't captured at all)."""
+    tui = getattr(fe, "_tui", None)
+    bash_text = getattr(tui, "_last_bash_output", "") if tui else ""
+    bash_at = getattr(tui, "_last_bash_at", 0.0) if tui else 0.0
+    llm_at = getattr(tui, "_last_llm_at", 0.0) if tui else 0.0
+    llm_text = _raw_last_response_text(engine, fe)
+    if bash_text and (not llm_text or bash_at >= llm_at):
+        return bash_text, "command output"
+    return llm_text, "raw response"
 
 
 def _all_chat_text(engine: Engine) -> str:
@@ -1106,48 +1227,38 @@ def _all_chat_text(engine: Engine) -> str:
     return sessions.export_markdown(engine.session.id)
 
 
-def _cost_report(engine: Engine, arg: str) -> str:
-    """`/cost [all]` (R92): per-model token + $ breakdown, read from the
-    session log(s). Pure read over data Aurora already writes on every turn —
-    no new accounting, and it works on sessions that ended long ago."""
-    from .providers.openai_compat import price_for
-    everything = arg.strip().lower() == "all"
-    rows = (sessions.usage_all_sessions() if everything
-            else sessions.usage_by_model(engine.session.id))
+def _cost_report(engine: Engine) -> str:
+    """`/cost` (R92, narrowed by R166): per-model token + $ breakdown
+    ACROSS EVERY SESSION on this machine — a single session's breakdown
+    lives in `/context <id>` now (its own tree, not a duplicate command),
+    which frees `/cost` from the `[all]` argument that meant two different
+    things depending on which command you were reading it in. Pure read
+    over data Aurora already writes on every turn — no new accounting.
+
+    Bug fix (2026-07-27): R168 made the status bar's `$` price CLICKABLE →
+    runs this exact command — but the bar shows `engine.context_stats().
+    cost_usd`, THIS SESSION's own accrued cost, while this report has always
+    been the cross-session total (R166). Clicking "$3.31" and landing on a
+    report whose bottom line says "$8.6359" reads as a miscalculation; both
+    numbers were always correct for what they measure, there was just no
+    line connecting them. The trailing note below states the current
+    session's figure explicitly so the two numbers reconcile instead of
+    just disagreeing."""
+    from . import ctxtree
+    rows = sessions.usage_all_sessions()
     if not rows:
-        return "· nothing logged yet" if not everything else "· no sessions yet"
-    scope = "all sessions" if everything else f"session {engine.session.id}"
-    out = [f"{BOLD}token usage — {scope}{RESET}"]
-    total, unpriced = 0.0, False
-    for model in sorted(rows):
-        r = rows[model]
-        price = price_for(model)
-        if price:
-            usd = (r["billed"] * price[0] + r["output"] * price[1]) / 1_000_000
-            total += usd
-            money = f"${usd:,.4f}".rstrip("0").rstrip(".")
-        else:
-            unpriced = True
-            money = dim("no price")
-        cached = f"  {GREEN}{fmt_token_count(r['cached'])} cached{RESET}" \
-            if r["cached"] else ""
-        out.append(f"  {BOLD}{model}{RESET}")
-        out.append(f"    {r['turns']} turn{'s' if r['turns'] != 1 else ''}"
-                   f" · in {fmt_token_count(r['billed'])}"
-                   f" · out {fmt_token_count(r['output'])}"
-                   f" · {money}{cached}")
+        return "· no sessions yet"
+    lines, total = ctxtree.model_breakdown_lines(rows)
+    out = [f"{BOLD}token usage — all sessions{RESET}", *lines]
     # trim the trailing zeros BEFORE wrapping in colour codes — rstrip on the
     # wrapped string is a no-op with colours on and eats digits with them off
     total_str = f"${total:,.4f}".rstrip("0").rstrip(".")
     out.append(f"  {BOLD}total  {total_str}{RESET}")
-    out.append(dim("  in = billed prompt tokens (every tool iteration of a "
-                   "turn is billed, R37)"))
-    out.append(dim("  estimate only — an UPPER bound: prices come from "
-                   "providers/remote_context_limits.json, and cached tokens "
-                   "bill cheaper than shown"))
-    if unpriced:
-        out.append(dim("  \"no price\" = local, or a model with no entry in "
-                       "that table"))
+    stats = engine.context_stats()
+    if stats.cost_known:
+        this_str = f"${stats.cost_usd:,.4f}".rstrip("0").rstrip(".")
+        out.append(dim(f"  (this session so far: {this_str} — the number on "
+                       f"the status bar; already included in the total above)"))
     return "\n".join(out)
 
 
@@ -1155,6 +1266,24 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
     """Returns False to exit the REPL."""
     cmd, _, arg = line[1:].partition(" ")
     cmd, arg = cmd.strip().lower(), arg.strip()
+
+    # `/<cmd> help` (alias `man`) — feature request, 2026-07-27: works for
+    # EVERY command uniformly, checked once here rather than wired into
+    # each branch below, so a new command gets it for free. Prints the
+    # SAME text `--man`'s COMMANDS section shows for this command (one
+    # source, `man.command_man` — see man.py's docstring), not the terse
+    # one-line `COMMAND_INFO` blurb autocomplete already shows. Checked
+    # before the exit/quit short-circuit so `/exit help` explains rather
+    # than exiting. Trade-off, accepted: a command whose own argument
+    # could legitimately BE the literal word "help"/"man" (e.g. searching
+    # session logs for that word via `/search help`) can't reach that
+    # argument this way — narrow enough not to block on.
+    if arg.lower() in ("help", "man") and cmd in COMMAND_INFO:
+        from . import man
+        text = man.command_man(cmd)
+        print(f"{CYAN}{BOLD}/{cmd}{RESET}\n{text}" if text
+              else f"· {COMMAND_INFO[cmd]}")
+        return True
 
     if cmd in ("exit", "quit"):
         return False
@@ -1174,11 +1303,10 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
     elif cmd == "reset":
         engine.reset()
         print("· full reset — history and system prompt cleared")
-        if bootstrap.load(".")[0]:
-            if confirm("Re-run bootstrap?"):
-                _run_bootstrap(engine, fe)
+        if bootstrap.load(".")[0] and confirm("Re-run bootstrap?"):
+            _run_bootstrap(engine, fe)
     elif cmd == "compact":
-        n = engine.compact_history()
+        n = engine.compact_history(notify=fe.notify)
         print(f"· compacted {n} messages into one" if n else "· nothing to compact")
     elif cmd == "copy":
         n = int(arg) if arg.isdigit() else 1
@@ -1188,11 +1316,12 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
         else:
             print(f"· copied via {clipboard.copy(text)}")
     elif cmd == "copy-last":
-        text = _raw_last_response_text(engine, fe)
+        text, label = _last_copyable_text(engine, fe)
         if not text:
             print("· no such response")
         else:
-            print(f"· raw response (thinking included) copied via {clipboard.copy(text)}")
+            suffix = " (thinking included)" if label == "raw response" else ""
+            print(f"· {label}{suffix} copied via {clipboard.copy(text)}")
     elif cmd == "copy-all":
         text = _all_chat_text(engine)
         if not text.strip():
@@ -1213,10 +1342,18 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
             print(f"· secret redaction {'ON' if engine.redact_secrets else 'OFF'} "
                  f"(persisted; usage: /redact on|off | /redact allowlist [clear])")
     elif cmd == "cost":
-        print(_cost_report(engine, arg))
-    elif cmd == "todo":
-        print(todo.render() or "· no task list — the model writes one with "
-                               "the todo_write tool on multi-step work")
+        if arg.strip():
+            # R171/I1: /cost (all sessions) and /context <id> (one session's
+            # tree) are two commands both named around "cost" with different
+            # scopes — `/cost <id>` doing what `/context <id>` does removes
+            # the need to remember which command takes an id.
+            from . import ctxtree
+            print(ctxtree.report(engine, arg))
+        else:
+            print(_cost_report(engine))
+    elif cmd == "context":
+        from . import ctxtree
+        print(ctxtree.report(engine, arg))
     elif cmd == "cache":
         if arg.lower() in ("on", "off"):
             engine.set_prompt_cache(arg.lower() == "on")
@@ -1227,15 +1364,27 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
               + dim("  marks the system prompt as cacheable so the bootstrap "
                     "preamble isn't re-billed every tool iteration; /cost "
                     "shows the hits"))
+    elif cmd == "autocompact":
+        if arg.lower() in ("on", "off"):
+            engine.set_auto_compact(arg.lower() == "on")
+        state = "ON" if engine.auto_compact else "OFF"
+        print(f"· auto-compact {state} (persisted) — folds older history "
+              f"once context hits {engine.auto_compact_threshold_pct:.0f}%, "
+              f"keeping the last ~{engine.compact_keep_recent_tokens} tokens "
+              "raw")
+    elif cmd == "fallback":
+        if arg.lower() in ("on", "off"):
+            engine.set_model_fallback(arg.lower() == "on")
+        state = "ON" if engine.model_fallback else "OFF"
+        chain = ", ".join(m.get("model", "?") for m in engine._fallback_models())
+        print(f"· model fallback {state} (persisted) — on a hard provider "
+              f"failure, retries the turn against the next model with a "
+              f"usable key\n" + dim(f"  chain from {engine.current.get('model')}: "
+                                   f"{chain or '(no other model with a usable key)'}"))
     elif cmd == "multiline":
         engine.set_multiline(not engine.multiline)
         print(f"· multiline {'ON' if engine.multiline else 'OFF'} "
               f"(Enter inserts newline, Alt+Enter submits; persisted)")
-    elif cmd == "think":
-        if fe.think_buffer:
-            print(dim(fe.think_buffer))
-        else:
-            print("· no thinking captured on the last turn")
     elif cmd == "thinking":
         fe.show_thinking = not fe.show_thinking
         print(f"· live thinking view {'ON (dim stream)' if fe.show_thinking else 'OFF (marker only)'}")
@@ -1258,8 +1407,21 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
             if not v:
                 print("    (empty)")
         print(f"· edit: {approve._path()}")
+    elif cmd == "denylist":
+        data = approve.load_deny()
+        if not data:
+            print("  (empty — nothing is denied by policy)")
+        for k, v in data.items():
+            print(f"  {k}:")
+            for rule in v:
+                print(f"    - {rule}")
+        print(f"· edit: {approve._deny_path()}")
     elif cmd == "rewind":
         _rewind_cmd(arg)
+    elif cmd == "undo":
+        _undo_cmd()
+    elif cmd == "diff":
+        _diff_cmd(engine)
     elif cmd == "commit":
         _commit_cmd(engine, fe, arg)
     elif cmd == "resume":
@@ -1276,6 +1438,23 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
             print(f"· resumed {sid} ({n} turns)")
         elif raw:
             print("· no such session — enter a number from the list, or empty to cancel")
+    elif cmd == "search":
+        if not arg:
+            print("· usage: /search <text>")
+            return True
+        rows = sessions.search_sessions(arg)
+        if not rows:
+            print("· no matches")
+            return True
+        for i, (sid, mtime, event, snippet) in enumerate(rows, 1):
+            print(f"  {i}. {sid}  {mtime}  ({event}) …{snippet}…")
+        raw = input("resume session #, or empty to cancel: ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(rows):
+            sid = rows[int(raw) - 1][0]
+            n = engine.resume_from(sid)
+            print(f"· resumed {sid} ({n} turns)")
+        elif raw:
+            print("· no such session — enter a number from the list, or empty to cancel")
     elif cmd == "export":
         out = f"aurora-session-{engine.session.id}.md"
         with open(out, "w") as f:
@@ -1283,12 +1462,58 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
         print(f"· wrote {out}")
     elif cmd == "skills":
         print(skills.listing(engine.cfg.get("_base_dir")))
+    elif cmd == "extensions" and arg.split(" ", 1)[0] == "new":
+        ext_name = arg.split(" ", 1)[1].strip() if " " in arg else ""
+        if not ext_name:
+            print("· usage: /extensions new <name>")
+        else:
+            try:
+                path = extensions.scaffold(ext_name)
+                print(f"· wrote {path}\n"
+                     f"  edit SPEC + the tool function, then restart Aurora to load it")
+            except FileExistsError as e:
+                print(f"· already exists: {e}")
+            except ValueError as e:
+                print(f"· {e}")
+    elif cmd == "extensions":
+        ext_specs = _extension_tool_specs()
+        if not ext_specs:
+            print("· no extensions loaded")
+        else:
+            print(f"· {len(ext_specs)} extension tool"
+                 f"{'s' if len(ext_specs) != 1 else ''} loaded:")
+        for s in ext_specs:
+            print(f"  {s['name']}  {dim(s['description'])}")
+        if engine.extension_warnings:
+            print("· warnings:")
+            for w in engine.extension_warnings:
+                print(f"    - {w}")
+        print(dim(
+            "  bundled with Aurora: mcp_* (config.yaml's mcp_servers:), "
+            "lint_check\n"
+            "  add your own: drop a .py file (SPEC + RUNNERS) into "
+            f"{aurora_home() / 'extensions'}\n"
+            "  full docs: documents/EXTENSIONS.md in the Aurora repo"))
     elif cmd == "bootstrap":
         _bootstrap_cmd(engine, fe, arg)
     elif cmd == "remember":
         memory.remember(engine, fe, arg)
     elif cmd == "agentic_report":
         _agentic_report_cmd(engine, fe)
+    elif cmd == "nano":
+        tui = getattr(fe, "_tui", None)
+        if tui is None:
+            print("· /nano only works in the full-screen TUI")
+        elif not arg:
+            print("· usage: /nano <file>")
+        else:
+            from pathlib import Path
+            # check_busy=False: this call IS the worker's own dispatch of
+            # `/nano` (the worker set self._busy True for this very line
+            # right before reaching here), so the busy guard — meant for
+            # the OTHER entry point, a mouse click racing an unrelated
+            # command — would always find "itself" busy and self-block.
+            tui.open_nano(Path(arg).expanduser(), check_busy=False)
     else:  # /name args → a skill (R11)
         print(skills.run(cmd, arg, engine.cfg.get("_base_dir")))
     return True
@@ -1297,6 +1522,7 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
 def _banner(engine: Engine) -> None:
     """Clear the screen and show a compact session card at startup."""
     import os
+
     from . import __version__ as version
 
     if sys.stdout.isatty():
@@ -1312,6 +1538,11 @@ def _banner(engine: Engine) -> None:
                   f"  session  {engine.session.id}"
                   + (dim(f"  ({len(engine.messages)} messages resumed)")
                      if engine.messages else "")]
+    n_ext = len(_extension_tool_specs())
+    if n_ext:
+        info_lines.append(f"  extensions  {n_ext} tool"
+                          f"{'s' if n_ext != 1 else ''} loaded"
+                          + dim("  (/extensions for details)"))
     print("\n".join(info_lines))
     print()
 

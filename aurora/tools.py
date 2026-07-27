@@ -14,14 +14,25 @@ MAX_READ_BYTES = 200_000
 NEEDS_APPROVAL = {"write_file", "edit_file", "run_command", "apply_patch",
                  "wait_until"}
 
+
+def needs_approval(name: str) -> bool:
+    """R119: every `mcp_*` tool call needs approval, unconditionally — MCP
+    has no universal "this tool is safe" flag, and Aurora's whole safety
+    model is approval-gated writes. A prefix check rather than adding each
+    discovered tool to NEEDS_APPROVAL individually, since the tool list is
+    only known once a server's `tools/list` handshake completes, at
+    Engine-construction time — this way the rule holds regardless of what
+    any given server exposes."""
+    return name in NEEDS_APPROVAL or name.startswith("mcp_")
+
 # R94: tools the agent loop may run CONCURRENTLY within one round. An
 # explicit allowlist, deliberately NOT "everything outside NEEDS_APPROVAL":
-# the test is "read-only AND has no shared state", which `todo_write`
-# (rewrites the task list) fails even though it's ungated. Everything here
-# only reads the filesystem or the network, so ordering between them is
-# unobservable — the model asked for all of them at once anyway.
-PARALLEL_SAFE = {"read_file", "list_dir", "grep", "open_context_doc",
-                 "web_search", "web_fetch"}
+# the test is "read-only AND has no shared state" — a tool that rewrites
+# shared state fails that even when ungated. Everything here only reads the
+# filesystem or the network, so ordering between them is unobservable — the
+# model asked for all of them at once anyway.
+PARALLEL_SAFE = {"read_file", "list_dir", "grep", "find_files",
+                 "open_context_doc", "web_search", "web_fetch"}
 
 # R94: run a round's PARALLEL_SAFE calls concurrently. runtime.parallel_tools
 # turns it off.
@@ -107,6 +118,51 @@ def list_dir(path: str = ".", **_) -> str:
 GREP_PRUNE = [".git", "node_modules", ".venv", "venv", "__pycache__",
               ".build", "build", "dist", ".mypy_cache", ".pytest_cache"]
 
+# Cap on how many paths find_files returns — a broad pattern over a big tree
+# (`*` from the repo root) could otherwise walk on forever; the model can
+# always narrow the pattern/path and re-run.
+MAX_FIND_RESULTS = 500
+
+
+def find_files(pattern: str, path: str = ".", **_) -> str:
+    """Search for files by glob pattern (e.g. '*.py', 'test_*.py'),
+    recursively — the filename-search counterpart to `grep`'s content
+    search (feature request, 2026-07-27). Uses `os.walk` with the same
+    prune list as `grep` (GREP_PRUNE), pruning DURING the walk so an
+    excluded directory (node_modules, .venv, …) is never even descended
+    into — unlike `Path.rglob`, which has no way to skip a subtree mid-walk
+    and would still pay the cost of listing everything inside one.
+
+    Matches against both the bare filename (so a simple `*.py` matches at
+    any depth) and the path relative to `path` (so a pattern with a `/` in
+    it, e.g. `tests/test_*.py`, also works)."""
+    import fnmatch as _fnmatch
+    import os
+    root = _resolve(path)
+    if not root.is_dir():
+        return (f"[error: not a directory: {path} — cwd is {Path.cwd()}; "
+                f"use an absolute path or ~/…]")
+    out: list[str] = []
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in GREP_PRUNE]
+        for name in filenames:
+            rel = (Path(dirpath) / name).relative_to(root).as_posix()
+            if _fnmatch.fnmatch(name, pattern) or _fnmatch.fnmatch(rel, pattern):
+                out.append(rel)
+                if len(out) >= MAX_FIND_RESULTS:
+                    truncated = True
+                    break
+        if truncated:
+            break
+    if not out:
+        return "[no matches]"
+    text = "\n".join(sorted(out))
+    if truncated:
+        text += (f"\n[truncated at {MAX_FIND_RESULTS} results — "
+                 f"narrow the pattern/path]")
+    return text
+
 
 GREP_TIMEOUT = 30
 
@@ -118,9 +174,12 @@ def grep(pattern: str, path: str = ".", **_) -> str:
         # habit — `(foo|bar)`, `a+`, `x?`. Under BRE those metacharacters are
         # literals, so the search SILENTLY returns "[no matches]" instead of
         # erroring, and the model concludes the code doesn't exist (R90b).
+        # R127: BINARY pipes, decoded once at the end. Text mode wraps the
+        # pipe in a TextIOWrapper whose `.read(n)` blocks until n chars have
+        # arrived — see the read loop below for why that broke the timeout.
         proc = subprocess.Popen(
             ["grep", "-rnIE", *excludes, "--", pattern, str(_resolve(path))],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         # R96m: read stdout INCREMENTALLY and stop once we have enough,
         # instead of subprocess.run(capture_output=True) — that buffers
         # grep's COMPLETE stdout before the old `out[:MAX_READ_BYTES]`
@@ -133,12 +192,29 @@ def grep(pattern: str, path: str = ".", **_) -> str:
         # is still caught, and the process is killed the moment enough
         # output has arrived, instead of after it finishes producing more
         # that would only be thrown away.
+        import os as _os
         import select
         import time
-        chunks: list[str] = []
+        chunks: list[bytes] = []
         total = 0
         truncated = False
         timed_out = False
+        # Review pass: stderr is ALSO piped, and was never drained here —
+        # only `select`ed for on stdout. `-rnI` over a tree with unreadable
+        # dirs/files produces a "Permission denied" line per miss, and grep
+        # can print enough of them to fill stderr's pipe buffer (64KB):
+        # once full, grep blocks trying to WRITE to it, produces no more
+        # stdout either, `select` (watching only stdout) never fires, and a
+        # search that would have finished in milliseconds burns the entire
+        # GREP_TIMEOUT and reports a false timeout. Drained the same way as
+        # stdout — `os.read` whatever's ready — but capped (STDERR_CAP)
+        # since only the first line ever gets shown (below); reads past the
+        # cap are still performed (draining, not accumulated) so the pipe
+        # never fills.
+        STDERR_CAP = 4096
+        stderr_chunks: list[bytes] = []
+        stderr_len = 0
+        watch = [proc.stdout, proc.stderr]
         try:
             deadline = time.monotonic() + GREP_TIMEOUT
             while True:
@@ -146,10 +222,30 @@ def grep(pattern: str, path: str = ".", **_) -> str:
                 if remaining <= 0:
                     timed_out = True
                     break
-                ready, _, _ = select.select([proc.stdout], [], [], remaining)
+                ready, _, _ = select.select(watch, [], [], remaining)
                 if not ready:
                     continue
-                chunk = proc.stdout.read(65536)
+                if proc.stderr in ready:
+                    chunk = _os.read(proc.stderr.fileno(), 65536)
+                    if not chunk:
+                        watch.remove(proc.stderr)   # EOF — stop selecting on it
+                    elif stderr_len < STDERR_CAP:
+                        stderr_chunks.append(chunk)
+                        stderr_len += len(chunk)
+                if proc.stdout not in ready:
+                    continue
+                # R127: a raw `os.read` on the fd, NOT `proc.stdout.read(n)`.
+                # The latter is a buffered read that blocks until n bytes
+                # arrive or the process exits, so it could block FAR past the
+                # deadline `select` had just been given: the loop only bounded
+                # the wait BETWEEN reads, never a stall inside one. That is
+                # the normal shape for this tool — grep prints a few early
+                # matches, then scans a large tree for minutes — so the 30s
+                # timeout simply did not hold, on the worker thread.
+                # `os.read` returns whatever is available right now (>=1 byte,
+                # since select just said readable), so the loop always gets
+                # back to re-check the deadline.
+                chunk = _os.read(proc.stdout.fileno(), 65536)
                 if not chunk:
                     break   # EOF — grep finished on its own
                 chunks.append(chunk)
@@ -165,11 +261,12 @@ def grep(pattern: str, path: str = ".", **_) -> str:
             # process-group kill exists to prevent for run_command.
             if timed_out or truncated:
                 proc.kill()
-            stderr = ""
-            try:
-                stderr = proc.stderr.read(4096) or ""
-            except Exception:
-                pass
+            # Review pass: no blocking read here anymore — a bounded
+            # `proc.stderr.read(4096)` in this `finally` could itself hang
+            # with no deadline if grep were still alive holding stderr open
+            # (e.g. killed above but not yet reaped). Everything worth
+            # showing was already drained incrementally in the loop.
+            stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
             proc.stdout.close()
             proc.stderr.close()
             try:
@@ -179,7 +276,7 @@ def grep(pattern: str, path: str = ".", **_) -> str:
                 proc.wait(timeout=5)
         if timed_out:
             return f"[grep error: timeout after {GREP_TIMEOUT}s]"
-        out = "".join(chunks).strip()
+        out = b"".join(chunks).decode("utf-8", errors="replace").strip()
         if out:
             if truncated:
                 out = (out[:MAX_READ_BYTES]
@@ -260,17 +357,22 @@ def set_command_timeout(seconds: float) -> None:
     COMMAND_TIMEOUT = max(1, int(seconds))
 
 
-def _run_command_once(command: str, workdir: str | None) -> tuple[str, int | None]:
-    """Run one shell command to completion (or COMMAND_TIMEOUT), process-
-    group-safe (R95c). Returns (raw combined stdout+stderr, returncode) —
-    returncode is None on a timeout.
+def _run_command_once(command: str, workdir: str | None,
+                      timeout: float | None = None) -> tuple[str, int | None]:
+    """Run one shell command to completion (or `timeout`, default
+    COMMAND_TIMEOUT), process-group-safe (R95c). Returns (raw combined
+    stdout+stderr, returncode) — returncode is None on a timeout.
 
     Shared by `run_command` (the tool, which formats this into its
-    "[exit N]"/"[timeout ...]" display text) and `wait_until` (R100, which
-    needs the REAL exit code to decide whether to keep polling — parsing
-    that back out of run_command's own display text would be fragile and
-    is exactly the kind of thing that silently breaks the moment the text
-    format changes)."""
+    "[exit N]"/"[timeout ...]" display text), `wait_until` (R100, which
+    passes a shrinking per-attempt `timeout` so one hung attempt can't
+    outrun the caller's own deadline — see R125b), and the TUI's bash mode
+    (which needs the REAL exit code to decide whether to keep polling —
+    parsing that back out of run_command's own display text would be
+    fragile and is exactly the kind of thing that silently breaks the
+    moment the text format changes)."""
+    if timeout is None:
+        timeout = COMMAND_TIMEOUT
     # R95c: own the whole process GROUP. `subprocess.run(shell=True,
     # timeout=…)` kills only the shell — every child it spawned survives,
     # reparented to init, and keeps running for the rest of the session (a
@@ -278,7 +380,14 @@ def _run_command_once(command: str, workdir: str | None) -> tuple[str, int | Non
     # session makes the shell a group leader so the timeout can kill the
     # whole tree.
     import os
+    # R144a: `errors="replace"`, same as read_file/grep already use. `text=True`
+    # decodes as strict UTF-8, so a command emitting ANY non-UTF-8 byte — a
+    # latin-1 log, a binary blob, a tool printing raw bytes — raised
+    # UnicodeDecodeError and lost the whole output, including the part that
+    # decoded fine. Worse in bash mode, which calls this directly, outside
+    # run_tool's exception guard.
     proc = subprocess.Popen(command, shell=True, cwd=workdir, text=True,
+                            errors="replace",
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
     # Read the group id NOW, while the shell is certainly alive. Looking it
@@ -292,7 +401,7 @@ def _run_command_once(command: str, workdir: str | None) -> tuple[str, int | Non
     except OSError:
         pgid = None
     try:
-        stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT)
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as e:
         _kill_group(proc, pgid)
         # TimeoutExpired carries what was read before the deadline — a
@@ -301,9 +410,27 @@ def _run_command_once(command: str, workdir: str | None) -> tuple[str, int | Non
         # killed, so take it from the exception.)
         partial = (_text(e.stdout) + _text(e.stderr)).strip()
         try:
-            proc.wait(timeout=5)   # reap; never leave a zombie behind
+            # R171: the direct child already got SIGKILL above, so reaping
+            # it is normally instant — this wait only exists to avoid a
+            # zombie, not to give an escaped grandchild time to die. A 5s
+            # bound blocked the WORKER THREAD (no Esc polling happens here)
+            # up to 5s past the command's own timeout on exactly the R170e
+            # escaped-grandchild case, which the warning below already
+            # reports either way; shortening the bound caps that extra
+            # stall without changing what gets reported.
+            proc.wait(timeout=1)
         except subprocess.TimeoutExpired:
-            pass
+            # R170e: `_kill_group` only reaches processes still in `pgid` —
+            # a grandchild that double-forked into its own session (`setsid`,
+            # a daemonizing tool) escapes it, can keep holding the stdout
+            # pipe open, and this final wait() can itself time out. That used
+            # to be swallowed silently: the tool call "succeeded" with no
+            # sign anything was left running. Surface it instead — the
+            # process itself still can't be reached from here (that's the
+            # whole problem), but the model/user should know to go looking.
+            partial = (partial + "\n" if partial else "") + (
+                "[warning: a grandchild process may have escaped cleanup "
+                "and could still be running]")
         return partial, None
     return (stdout or "") + (stderr or ""), proc.returncode
 
@@ -323,20 +450,35 @@ def run_command(command: str, cwd: str = "", **_) -> str:
 
 
 def wait_until(command: str, cwd: str = "", interval: float = 2.0,
-              timeout: float = 60.0, **_) -> str:
+              timeout: float = 60.0, then: str = "", **_) -> str:
     """Repeatedly run `command` until it exits 0 or `timeout` seconds pass
-    (R100) — the same "poll until true or give up" shape
-    `llamadesk.LlamaDesk.wait_ready` already uses for a model load, exposed
-    as a general tool. Useful for "wait for the dev server to be listening",
-    "wait until this file appears", etc. — instead of the model guessing a
-    single sleep duration and hoping it was long enough.
+    (R100) — a general "poll until true or give up" tool. Useful for "wait
+    for the dev server to be listening", "wait until this file appears",
+    etc. — instead of the model guessing a single sleep duration and hoping
+    it was long enough.
+
+    `then` (feature request, 2026-07-27): a second command run ONCE,
+    immediately after `command` first succeeds, in the SAME gated call —
+    "when the server is up, curl it" as one atomic step. Without this the
+    model has to guess the boundary itself: a separate run_command call
+    right after wait_until succeeds still races the exact thing wait_until
+    was polling for (a listener that accepts the TCP connection a moment
+    before it's actually ready to answer, a file that exists but isn't
+    fully flushed yet) — this closes that race by running `then` in the
+    same breath as the successful poll, with no round-trip back through the
+    model in between.
 
     Approval is asked ONCE for the whole call — `agent.py`'s gate wraps the
     tool call itself, not each internal attempt, since re-approving every
     poll would make this unusable. Each attempt reuses `_run_command_once`
     directly (bypassing the approval gate, which already ran for this
-    call), same execution as `run_command` — process-group-safe, bounded by
-    the shared `COMMAND_TIMEOUT` per attempt."""
+    call), same execution as `run_command` — process-group-safe. Each
+    attempt is capped to whatever's left of `timeout`, not the global
+    `COMMAND_TIMEOUT` (R125b) — otherwise a single hung attempt could run
+    up to COMMAND_TIMEOUT (300s default) even when the caller asked for a
+    much smaller overall timeout. `then` gets its own COMMAND_TIMEOUT-bounded
+    run, not carved out of the polling budget — it only ever runs once
+    `command` has already succeeded, so it isn't racing the same clock."""
     import time as _time
     workdir = str(_resolve(cwd)) if cwd else None
     if workdir and not Path(workdir).is_dir():
@@ -350,12 +492,21 @@ def wait_until(command: str, cwd: str = "", interval: float = 2.0,
     out, code = "", None
     while True:
         attempt += 1
-        out, code = _run_command_once(command, workdir)
+        remaining = timeout - (_time.monotonic() - start)
+        out, code = _run_command_once(command, workdir,
+                                      timeout=max(0.1, remaining))
         shown = out.strip() or "[no output]"
         if code == 0:
             elapsed = _time.monotonic() - start
-            return (f"[wait_until: succeeded after {attempt} attempt(s), "
+            head = (f"[wait_until: succeeded after {attempt} attempt(s), "
                     f"{elapsed:.1f}s]\n{shown}")
+            if not then:
+                return head
+            then_out, then_code = _run_command_once(then, workdir)
+            then_shown = then_out.strip() or "[no output]"
+            then_head = ("[then: timed out]" if then_code is None
+                        else f"[then: exit {then_code}]")
+            return f"{head}\n{then_head}\n{then_shown}"
         if _time.monotonic() - start + interval > timeout:
             status = "timed out mid-command" if code is None else f"exit {code}"
             return (f"[wait_until: gave up after {attempt} attempt(s), "
@@ -390,6 +541,7 @@ def _kill_group(proc, pgid=None) -> None:
 
 RUNNERS = {
     "read_file": read_file, "list_dir": list_dir, "grep": grep,
+    "find_files": find_files,
     "write_file": write_file, "edit_file": edit_file, "run_command": run_command,
     "apply_patch": apply_patch, "wait_until": wait_until,
 }
@@ -412,6 +564,14 @@ SPEC = [
      "regex (ERE) or plain string; returns file:line matches.",
      "parameters": {"type": "object", "properties": {
          "pattern": {"type": "string"}, "path": {"type": "string"}},
+         "required": ["pattern"]}},
+    {"name": "find_files",
+     "description": "Recursively search for files by GLOB pattern (e.g. "
+                    "'*.py', 'test_*.md') — matches by filename, not "
+                    "content; use `grep` to search inside files.",
+     "parameters": {"type": "object", "properties": {
+         "pattern": {"type": "string"},
+         "path": {"type": "string", "description": "default '.'"}},
          "required": ["pattern"]}},
     {"name": "write_file", "description": "Create or overwrite a file with content (asks approval).",
      "parameters": {"type": "object", "properties": {
@@ -451,7 +611,11 @@ SPEC = [
                     "timeout passes (asks approval once, not per attempt). "
                     "Use for 'wait until the server is listening', 'wait "
                     "for the build to finish producing this file', etc. "
-                    "instead of guessing a single sleep duration.",
+                    "instead of guessing a single sleep duration. Pass "
+                    "`then` to run a second command once, immediately after "
+                    "success, in this same call — e.g. wait for the server "
+                    "to be listening, then curl it — instead of a separate "
+                    "follow-up call that would re-race the same condition.",
      "parameters": {"type": "object", "properties": {
          "command": {"type": "string"},
          "cwd": {"type": "string", "description": "directory to run it in (optional)"},
@@ -459,31 +623,69 @@ SPEC = [
                      "description": "seconds between attempts (default 2)"},
          "timeout": {"type": "number",
                     "description": "give up after this many seconds "
-                                   "(default 60, max 300)"}},
+                                   "(default 60, max 300)"},
+         "then": {"type": "string",
+                  "description": "a second command to run once, "
+                                 "immediately after `command` first "
+                                 "succeeds (optional)"}},
          "required": ["command"]}},
 ]
 
 
-# R93: offer the task-list tool. On by default; runtime.todo_tool can turn it
-# off, for a small local model that gets confused by one more tool more than
-# it gains from a plan.
-TODO_ENABLED = True
+# R119: extension tools (user-authored ~/.aurora/extensions/ + Aurora's own
+# bundled ones, e.g. MCP support) — populated once at Engine construction via
+# set_extensions(), same pattern as TODO_ENABLED/PARALLEL_ENABLED above.
+_EXTENSION_SPECS: list[dict] = []
+_EXTENSION_RUNNERS: dict = {}
 
 
-def set_todo_enabled(on: bool) -> None:
-    global TODO_ENABLED
-    TODO_ENABLED = bool(on)
+def set_extensions(specs: list[dict], runners: dict) -> list[str]:
+    """Install extension tools, dropping any whose name collides with a
+    builtin or an already-kept extension tool (R125c). Without this, a
+    colliding name shipped silently broken two different ways: the spec
+    still went to the model (duplicated in the tool list, or ambiguous
+    between two extensions), but `run_tool`'s lookup order (RUNNERS before
+    _EXTENSION_RUNNERS) meant a builtin-shadowing extension's runner was
+    dead code the model could never actually reach, and `/extensions`
+    hid the collision entirely since it only lists what made it into
+    _EXTENSION_SPECS. Returns human-readable warnings for the same
+    `engine.extension_warnings` surface load/register failures already use."""
+    global _EXTENSION_SPECS, _EXTENSION_RUNNERS
+    from . import context
+    builtin_names = set(RUNNERS) | set(context.RUNNERS)
+    warnings: list[str] = []
+    seen: set[str] = set()
+    kept_specs: list[dict] = []
+    kept_runners: dict = {}
+    for spec in specs:
+        name = spec.get("name")
+        if name in builtin_names:
+            warnings.append(f"extension tool '{name}' shadows a builtin "
+                            f"tool — skipped")
+            continue
+        if name in seen:
+            warnings.append(f"extension tool '{name}' defined by more than "
+                            f"one extension — skipped duplicate")
+            continue
+        seen.add(name)
+        kept_specs.append(spec)
+        if name in runners:
+            kept_runners[name] = runners[name]
+    _EXTENSION_SPECS = kept_specs
+    _EXTENSION_RUNNERS = kept_runners
+    return warnings
 
 
-def specs(include_web: bool) -> list[dict]:
-    from . import context, todo, websearch
+def specs() -> list[dict]:
+    """R157: no `include_web` argument any more. web_search/web_fetch moved to
+    `extensions_bundled/web_extension.py`, whose `register()` reads
+    `runtime.web_search` itself — so the flag is honoured once, at load, and
+    this layer no longer knows the web tools exist by name."""
+    from . import context
     s = list(SPEC)
-    if include_web:
-        s += websearch.SPEC
     if context.active():
         s += context.SPEC
-    if TODO_ENABLED:
-        s += todo.SPEC
+    s += _EXTENSION_SPECS
     return s
 
 
@@ -492,13 +694,53 @@ def specs(include_web: bool) -> list[dict]:
 # 65k local context. ~15k tokens is plenty; the model can re-read narrower.
 TOOL_OUTPUT_LIMIT = 60_000
 
+# R133b: every failure path in this module answers with a bracketed marker at
+# the START of the output ("[error: …]", "[grep error: …]", "[tool error: …]")
+# and every not-run path with "[skipped: …]", "[denied …]" or "[not run — …]".
+# That convention was already load-bearing (the model reads it); this just
+# names it so the session log can record an outcome instead of readers
+# re-deriving it by sniffing strings.
+_ERROR_MARKERS = ("[error:", "[tool error:", "[grep error:")
+_SKIPPED_MARKERS = ("[skipped:", "[denied", "[not run")
+
+
+def result_status(out: str) -> str:
+    """'ok' | 'error' | 'skipped' for one tool result.
+
+    R134g: the marker has to BRACKET the whole result, not merely start it.
+    Every string this module (and the agent) produces for a failure or a
+    refusal is a single bracketed form and nothing else, so the closing `]`
+    is always the last character — including after `run_tool`'s truncation
+    notice, which ends in one too. Reading a file whose FIRST line happens
+    to be `[error: …]` — an application log, say — was otherwise reported as
+    a failed tool call.
+
+    Residual ambiguity is irreducible from the outside: a file that both
+    starts with a marker and ends with `]` still reads as an error. Only the
+    producer can be certain, and it does not say."""
+    if not out.rstrip().endswith("]"):
+        return "ok"
+    head = out[:32]
+    if head.startswith(_SKIPPED_MARKERS):
+        return "skipped"
+    if head.startswith(_ERROR_MARKERS):
+        return "error"
+    return "ok"
+
 
 def run_tool(name: str, args: dict) -> str:
-    from . import context, todo, websearch
-    for table in (RUNNERS, websearch.RUNNERS, context.RUNNERS, todo.RUNNERS):
+    from . import context
+    for table in (RUNNERS, context.RUNNERS, _EXTENSION_RUNNERS):
         if name in table:
             try:
                 out = table[name](**args)
+                # R144b: inside the guard. An extension's runner (user-authored,
+                # and `extensions.py` never states str as a hard contract) that
+                # returns None/dict/int made `len(out)` below raise TypeError
+                # OUTSIDE the try — killing the turn in exactly the way the
+                # comment below says must never happen.
+                if not isinstance(out, str):
+                    out = "" if out is None else str(out)
             except Exception as e:
                 # a raising tool must NOT kill the turn: the assistant message
                 # already carries the tool_use, and a missing tool result makes

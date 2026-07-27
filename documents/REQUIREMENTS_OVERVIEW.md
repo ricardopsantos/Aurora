@@ -2,18 +2,18 @@
 
 Aurora is a micro terminal coding agent (macOS + Linux, synced via git).
 
-> **Canonical spec is [`AURORA.md`](AURORA.md).** It holds the full numbered
-> requirements (R1–R90), build plan, and test plan, written before the code
-> and kept in sync with behaviour. This file is a stable high-level index; when
-> the two disagree, AURORA.md wins. Any behaviour change updates AURORA.md (and
-> README.md) in the same commit.
+> **Canonical spec is [`CHANGELOG_TECHNICAL.md`](CHANGELOG_TECHNICAL.md)**
+> (formerly `AURORA.md`). It holds the full numbered requirements (R1–R172+),
+> build plan, and test plan, written before the code and kept in sync with
+> behaviour. This file is a stable high-level index; when the two disagree,
+> `CHANGELOG_TECHNICAL.md` wins. Any behaviour change updates
+> `CHANGELOG_TECHNICAL.md` (and README.md) in the same commit.
 
-## Requirement groups (see AURORA.md for the numbered detail)
+## Requirement groups (see CHANGELOG_TECHNICAL.md for the numbered detail)
 
 - **Providers & models (R1–R5).** OpenAI-compatible providers only (local
   llama.cpp / any OpenAI-compatible server, and OpenRouter). Aurora consumes
-  whatever model is loaded; it never launches or manages the server. Optional
-  local library switching via LlamaDesk with an explicit eviction confirm.
+  whatever model is loaded; it never launches or manages the server.
   `/model` picker; per-model `tools:` flag with graceful degrade to chat.
 - **Coding agent (R6–R11).** Tool loop (read/write/edit/run/list/grep/context/
   web). Approval gate on writes & commands (`y`/`n`/`a`, persistent allowlist),
@@ -38,8 +38,8 @@ Aurora is a micro terminal coding agent (macOS + Linux, synced via git).
 - Repo = source of truth; runs on macOS + Linux, synced by git.
 - After every shipped feature: `git add + commit + push` to Forgejo
   (`ricardo/Aurora`) without asking — multi-machine flow.
-- README.md (quick start) and AURORA.md (spec) must never drift from actual
-  behaviour; ship doc updates in the same commit.
+- README.md (quick start) and CHANGELOG_TECHNICAL.md (spec) must never drift
+  from actual behaviour; ship doc updates in the same commit.
 
 ## Architecture
 

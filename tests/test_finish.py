@@ -1,9 +1,6 @@
 """Tests for the finishing pieces: context bootstrap, skills, engine
-compact/resume, LlamaDesk parsing. No network — everything local/mocked."""
+compact/resume. No network — everything local/mocked."""
 
-import json
-import os
-import stat
 import textwrap
 
 import pytest
@@ -119,22 +116,10 @@ def test_resume_rebuilds_history(engine):
     past.log("assistant", text="first answer", model="m")
     past.log("tool", name="grep", output="x")  # ignored on resume
     n = engine.resume_from("resumetest01")
-    assert n == 2
+    assert n == 1   # R171/B2: turns (1 exchange), not raw message count
     assert engine.session.id == "resumetest01"
     assert engine.messages[0]["content"] == "first question"
     assert engine.messages[1]["role"] == "assistant"
-
-
-# ── llamadesk response-shape tolerance ─────────────────────────────────────
-def test_llamadesk_parses_model_shapes(monkeypatch):
-    from aurora.llamadesk import LlamaDesk
-
-    desk = LlamaDesk("http://x")
-    monkeypatch.setattr(desk, "_get",
-                        lambda p: {"models": [{"name": "qwen"}, "gemma"]})
-    assert desk.models() == ["qwen", "gemma"]
-    monkeypatch.setattr(desk, "_get", lambda p: {"loaded": "qwen"})
-    assert desk.loaded_model() == "qwen"
 
 
 # ── markdown renderer ──────────────────────────────────────────────────────
@@ -156,7 +141,7 @@ def test_mdrender_lines(monkeypatch):
 
 
 def test_agent_flushes_parallel_calls_via_bulk_api(tmp_path):
-    from aurora import agent, approve
+    from aurora import agent
     from aurora.providers.base import ToolCall, TurnResult
 
     class BulkProvider:
@@ -181,7 +166,7 @@ def test_agent_flushes_parallel_calls_via_bulk_api(tmp_path):
     cb = agent.AgentCallbacks(lambda t: None, lambda n, a: None, lambda n, o: None,
                               lambda t, a, d: "y", lambda i: True,
                               lambda m: None, lambda: False)
-    t = agent.run_turn(p, "m", msgs, "", cb, 5, True, False)
+    t = agent.run_turn(p, "m", msgs, "", cb, 5, True)
     assert p.bulk_called == 1                  # both results in one flush
     assert t.billed_input >= 0
 
@@ -197,13 +182,19 @@ def test_tool_output_truncated(tmp_path):
 
 # ── regression: bugfix pass ────────────────────────────────────────────────
 def test_skill_run_survives_exec_format_error(tmp_path):
-    # an executable .py without a shebang must return text, not raise OSError
+    """An executable .py without a shebang must return TEXT, never raise or
+    hang. R171/I4 routes this through `_run_command_once` (shell=True, for
+    process-group-safe timeouts) instead of a bare argv exec — the shell
+    itself now reports the bad interpreter as a normal non-zero exit rather
+    than Aurora catching an OSError, but the outcome is the same: an error
+    message back to the model, not a crash."""
     sk = tmp_path / "skills"
     sk.mkdir()
     bad = sk / "bad.py"
     bad.write_text("print(1)\n")
     bad.chmod(0o755)
-    assert "skill error" in skills.run("bad", "", str(tmp_path))
+    out = skills.run("bad", "", str(tmp_path))
+    assert "[exit" in out and out.strip()
 
 
 def test_skill_run_passes_quoted_args_as_one(tmp_path):
@@ -223,6 +214,92 @@ def test_records_skips_corrupt_lines(engine):
     s.log("assistant", text="also good", model="m")
     rows = s.records()
     assert [r["event"] for r in rows] == ["user", "assistant"]
+
+
+# ── session log rotation by size (feature request, 2026-07-27) ─────────────
+def test_log_rotates_to_a_new_part_once_the_cap_is_exceeded(engine, monkeypatch):
+    from aurora import session as sessionmod
+    monkeypatch.setattr(sessionmod, "SESSION_LOG_MAX_BYTES", 200)
+    s = Session("rotatingsession1")
+    for i in range(20):
+        s.log("tool", name="x", output="y" * 50, chars=50)
+    part1 = s.log_path
+    part2 = s.log_path.with_name("rotatingsession1.2.jsonl")
+    assert part1.exists()
+    assert part2.exists()   # rotation actually happened past the tiny cap
+
+
+def test_rotated_parts_are_never_deleted_and_all_records_readable(engine, monkeypatch):
+    from aurora import session as sessionmod
+    monkeypatch.setattr(sessionmod, "SESSION_LOG_MAX_BYTES", 200)
+    s = Session("rotatingsession2")
+    for i in range(20):
+        s.log("tool", name="x", output=f"record-{i}", chars=10)
+    rows = s.records()
+    assert [r["output"] for r in rows] == [f"record-{i}" for i in range(20)]
+    assert s.log_path.exists()   # part 1 still on disk — nothing deleted
+
+
+def test_write_target_recomputes_from_disk_not_cached_state(engine, monkeypatch):
+    """Two Session objects for the SAME id (e.g. a resumed process) must
+    agree on the current part by re-checking disk each call, not by
+    trusting their own construction-time state."""
+    from aurora import session as sessionmod
+    monkeypatch.setattr(sessionmod, "SESSION_LOG_MAX_BYTES", 50)
+    s1 = Session("sharedsession1")
+    s1.log("user", text="x" * 60, model="m")   # pushes part 1 over the cap
+    s2 = Session("sharedsession1")
+    s2.log("user", text="y", model="m")        # must land in part 2, not part 1
+    part2 = s1.log_path.with_name("sharedsession1.2.jsonl")
+    assert part2.exists()
+    assert '"text": "y"' in part2.read_text()
+
+
+def test_list_sessions_counts_a_rotated_session_once_and_shows_fresh_mtime(
+        engine, monkeypatch):
+    from aurora import session as sessionmod
+    monkeypatch.setattr(sessionmod, "SESSION_LOG_MAX_BYTES", 50)
+    s = Session("rotatedlisting1")
+    s.log("user", text="first task " + "x" * 60, model="m")
+    s.log("user", text="second, in part 2", model="m", bootstrap=True)
+    rows = sessionmod.list_sessions()
+    matches = [r for r in rows if r[0] == "rotatedlisting1"]
+    assert len(matches) == 1   # one row per SESSION, not per part file
+    assert "first task" in matches[0][2]   # preview still reads from part 1
+
+
+def test_usage_all_sessions_does_not_double_count_a_rotated_session(
+        engine, monkeypatch):
+    from aurora import session as sessionmod
+    monkeypatch.setattr(sessionmod, "SESSION_LOG_MAX_BYTES", 50)
+    s = Session("rotatedusage1")
+    s.log("assistant", model="m", input_tokens=100, output_tokens=10,
+          text="x" * 60)
+    s.log("assistant", model="m", input_tokens=100, output_tokens=10,
+          text="lands in part 2")
+    total = sessionmod.usage_all_sessions()
+    assert total["m"]["turns"] == 2   # not 4 — each part counted once
+
+
+def test_search_sessions_finds_a_hit_in_a_rotated_part(engine, monkeypatch):
+    from aurora import session as sessionmod
+    monkeypatch.setattr(sessionmod, "SESSION_LOG_MAX_BYTES", 50)
+    s = Session("rotatedsearch1")
+    s.log("user", text="padding " + "x" * 60, model="m")
+    s.log("user", text="needle in part two", model="m")
+    hits = sessionmod.search_sessions("needle")
+    assert any(h[0] == "rotatedsearch1" for h in hits)
+
+
+def test_latest_session_id_follows_rotated_activity(engine, monkeypatch):
+    from aurora import session as sessionmod
+    monkeypatch.setattr(sessionmod, "SESSION_LOG_MAX_BYTES", 50)
+    old = Session("oldersession1")
+    old.log("user", text="old", model="m")
+    rotated = Session("rotatedlatest1")
+    rotated.log("user", text="x" * 60, model="m")
+    rotated.log("user", text="most recent, in part 2", model="m")
+    assert sessionmod.latest_session_id() == "rotatedlatest1"
 
 
 def test_failed_turn_keeps_previous_context_gauge(engine, monkeypatch):

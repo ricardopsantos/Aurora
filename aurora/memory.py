@@ -91,7 +91,7 @@ def parse_findings(reply: str) -> list[dict]:
     if reply.strip().upper() == "NONE":
         return []
     out = []
-    for block in re.split(r"^\s*===\s*$", reply, flags=re.M):
+    for block in re.split(r"^\s*===\s*$", reply, flags=re.MULTILINE):
         m = {}
         body = None
         for line in block.splitlines():
@@ -252,6 +252,11 @@ def remember(engine, fe, arg: str = "") -> None:
                 f = redone[0]
                 continue
             break                     # 'n' (or c without note) → skip it
+        else:
+            # R171/I3: the loop ran out of attempts with the user still
+            # picking "c" on the 3rd try — it fell out silently before, with
+            # no notice at all, reading as if the finding just vanished.
+            fe.notify("redraft limit reached — skipped")
         if ans == "stop-all":
             break
 

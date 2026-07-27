@@ -87,11 +87,24 @@ def fetch_url(url: str) -> str:
         return r.text
 
 
-def refresh_from_source(cwd: str | Path = ".") -> tuple[str, Path] | None:
+def refresh_from_source(cwd: str | Path = ".", confirm=None
+                        ) -> tuple[str, Path] | None:
     """Re-download the active bootstrap prompt from its saved URL and persist
     the fresh content at the same path (project vs global) it was loaded
     from. Returns (new_text, path), or None if no URL-sourced prompt is
-    active — callers fall back to the cached `load()` in that case."""
+    active, the fetch was rejected by `confirm`, or the content is unchanged
+    (nothing to persist) — callers fall back to the cached `load()` in that
+    case.
+
+    `confirm(old_text, new_text) -> bool`, if given, is asked BEFORE the
+    fetched content is written and BEFORE it is later sent as a tool-enabled
+    turn (R171/S3): a compromised URL, a hijacked redirect, or a
+    man-in-the-middle on the first-ever download all reach the same "run
+    with tools" turn with no integrity check between fetch and execution.
+    `confirm` gives the caller a chance to show the diff and require an
+    explicit yes rather than treating a fetch as automatically trustworthy.
+    `confirm=None` (the default) keeps the old unconditional-overwrite
+    behavior for callers that don't have a UI to ask through."""
     active = _active_source(cwd)
     if active is None:
         return None
@@ -99,7 +112,12 @@ def refresh_from_source(cwd: str | Path = ".") -> tuple[str, Path] | None:
     url = source_url(cwd)
     if not url:
         return None
+    old_text = p.read_text(encoding="utf-8") if p.is_file() else ""
     text = fetch_url(url)
+    if text.rstrip() == old_text.rstrip():
+        return None   # nothing changed — no re-confirmation, no rewrite
+    if confirm is not None and not confirm(old_text, text):
+        return None
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text.rstrip() + "\n", encoding="utf-8")
     _source_url_path(p).write_text(url.strip() + "\n", encoding="utf-8")

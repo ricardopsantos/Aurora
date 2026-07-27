@@ -37,12 +37,21 @@ class Frontend(Protocol):
     def notify(self, message: str) -> None:
         """An out-of-band notice (degrade, interrupt, allowlist add, error)."""
 
+    def invalidate_status(self) -> None:
+        """R154: engine state the status display derives from has changed —
+        redraw it. Called mid-turn (after each tool result, whose size the
+        context gauge now counts immediately), so it must be cheap and safe
+        from the worker thread. A front end with nothing to redraw
+        implements it as a no-op."""
+
     # ── prompts (block until the human answers) ─────────────────────────
     def approve(self, tool: str, args: dict, diff: str):
         """Gate a write/command. Return 'y' (once), 'n' (deny), 'a' (always),
-        's' (stop the whole turn), 'c' (don't run; steer the model) — or a
-        (key, note) tuple where the note is a denial reason / 'c' guidance
-        fed back to the model in the tool result."""
+        's' (stop the whole turn), 'c' (don't run; steer the model), or 'e'
+        (R103: get a model-written explanation of the call, then re-ask this
+        SAME challenge — 'e' is never a terminal answer, the caller loops on
+        it) — or a (key, note) tuple where the note is a denial reason / 'c'
+        guidance fed back to the model in the tool result."""
 
     def ask_continue(self, iterations: int):
         """Tool loop hit the cap after `iterations` — keep going? Return a

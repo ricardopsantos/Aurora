@@ -4,7 +4,6 @@ import pytest
 
 from aurora import secrets
 
-
 _AWS1 = "AKIA" + "A1B2C3D4E5F6G7H8"     # 16 chars after the AKIA/ASIA prefix
 _AWS2 = "AKIA" + "Z9Y8X7W6V5U4T3S2"
 
@@ -198,6 +197,20 @@ def test_format_matches_shows_context_with_bold_token():
     assert "export AWS_ACCESS_KEY_ID=" in lines[0]
 
 
+def test_format_matches_mask_hides_the_token_but_keeps_context_and_kind():
+    """The challenge is the one place a detected secret prints in full,
+    unconditionally — mask=True must still say WHAT kind matched and show
+    the surrounding context (the useful part for deciding keep/redact/stop),
+    but never the raw token itself."""
+    text = f"export AWS_ACCESS_KEY_ID={_AWS1} # staging"
+    m = secrets.scan(text)
+    lines = secrets.format_matches(text, m, mask=True)
+    assert len(lines) == 1
+    assert _AWS1 not in lines[0]
+    assert "AWS access key" in lines[0]
+    assert "export AWS_ACCESS_KEY_ID=" in lines[0]
+
+
 def test_scan_ignores_dated_file_paths():
     # Paths with ISO-style timestamps / dated filenames were false positives:
     # '/' made the entropy fallback see the whole path as one mixed token and
@@ -336,3 +349,21 @@ def test_scan_is_faster_with_literal_guards_on_ordinary_text():
 
     assert guarded_ms < unguarded_ms * 0.8, \
         f"unguarded={unguarded_ms:.2f}ms guarded={guarded_ms:.2f}ms — guard isn't helping"
+
+
+def test_a_secret_glued_onto_a_pattern_match_is_still_reported():
+    """R170b: `_CANDIDATE_RE`'s charset includes `-`/`+`, which aren't `\\w`
+    for regex `\\b` purposes — so a PATTERNS match that ends on a fixed-length
+    boundary (like the AWS key's exact 20 chars) can still sit inside a LONGER
+    candidate span if a hyphen glues more secret-looking text on immediately
+    after it, with no whitespace separator. The old code skipped the whole
+    candidate the moment it overlapped the AWS match at all, silently
+    dropping the glued-on tail instead of reporting it separately."""
+    tail = "p9ZqXtR3mVnJ8kL2wYsF"
+    text = f"key is {_AWS1}-{tail} secret"
+    matches = secrets.scan(text)
+    kinds = {m.kind: m.text for m in matches}
+    assert kinds.get("AWS access key") == _AWS1
+    assert any(m.kind == "High-entropy token" and tail in m.text
+              for m in matches), \
+        f"the glued-on tail {tail!r} was never reported: {matches}"

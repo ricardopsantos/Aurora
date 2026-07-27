@@ -71,7 +71,7 @@ def happy_eyeballs_connect(host: str, port: int, timeout: float | None,
             if source_address is not None:
                 s.bind(source_address)
             s.connect(sa)
-        except Exception as e:                # noqa: BLE001 — report, keep racing
+        except Exception as e:
             s.close()
             results.put(("err", e))
             return
@@ -105,7 +105,7 @@ class _HappyEyeballsBackend(SyncBackend):
         source = None if local_address is None else (local_address, 0)
         try:
             sock = happy_eyeballs_connect(host, port, timeout, source)
-        except socket.timeout as e:
+        except TimeoutError as e:
             raise ConnectTimeout(str(e)) from e
         except OSError as e:
             raise ConnectError(str(e)) from e

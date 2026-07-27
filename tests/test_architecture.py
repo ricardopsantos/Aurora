@@ -63,7 +63,7 @@ def test_engine_does_no_terminal_io():
     for path in _engine_files():
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                if node.func.id in {"input", "print"}:
-                    offenders.append(f"{path.name}:{node.lineno} calls {node.func.id}()")
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in {"input", "print"}):
+                offenders.append(f"{path.name}:{node.lineno} calls {node.func.id}()")
     assert not offenders, "engine doing terminal I/O:\n" + "\n".join(offenders)

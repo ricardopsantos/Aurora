@@ -31,6 +31,25 @@ case ":$PATH:" in
 esac
 
 echo
+KEY_LINES="$(./.venv/bin/aurora key status 2>/dev/null || true)"
+if echo "$KEY_LINES" | grep -q ': not set$' \
+        && ! echo "$KEY_LINES" | grep -qv ': not set$'; then
+    echo "No API key is configured yet:"
+    echo "$KEY_LINES" | sed 's/^/  /'
+    read -rp "Set one up now? [y/N] " SETUP_KEY
+    if [[ "$SETUP_KEY" =~ ^[Yy]$ ]]; then
+        KEY_NAMES="$(echo "$KEY_LINES" | cut -d: -f1)"
+        if [ "$(echo "$KEY_NAMES" | wc -l)" -eq 1 ]; then
+            ENV_NAME="$KEY_NAMES"
+        else
+            echo "Which key?"
+            select ENV_NAME in $KEY_NAMES; do [ -n "$ENV_NAME" ] && break; done
+        fi
+        ./.venv/bin/aurora key set "$ENV_NAME"
+    fi
+fi
+
+echo
 echo "Done. Next:"
 echo "  aurora key set            # store your OpenRouter/local key (keyring/encrypted)"
 echo "  aurora                    # run (auto-detects .agentic_context/)"

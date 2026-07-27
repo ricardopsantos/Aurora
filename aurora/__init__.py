@@ -10,7 +10,7 @@ from pathlib import Path as _Path
 # github-deploy.sh overwrites this exact line on every deploy to GitHub, so
 # it always reflects GitTea's version at deploy time. Left empty here in
 # GitTea itself — empty means "compute live from git" below.
-_PINNED_VERSION = "1.0.185"
+_PINNED_VERSION = "1.1.307"
 
 
 def _commit_count() -> str:
@@ -27,4 +27,4 @@ def _commit_count() -> str:
     return "0"
 
 
-__version__ = _PINNED_VERSION or f"1.0.{_commit_count()}"
+__version__ = _PINNED_VERSION or f"1.1.{_commit_count()}"

@@ -49,22 +49,33 @@ def _fetch_command(env: str) -> str | None:
 
 
 def _known_key_names() -> list[str]:
-    """Every ENV_VAR name config.yaml actually uses for a key — each
-    provider's api_key_env plus llamadesk's token_env, if configured. This is
-    what `key clear --all` / `wipe` iterate; it reflects THIS config, not a
-    hardcoded list, so it stays correct for whatever providers are set up."""
+    """Every ENV_VAR name config.yaml actually uses for a key. This is what
+    `key clear --all` / `wipe` iterate; it reflects THIS config, not a
+    hardcoded list, so it stays correct for whatever is set up.
+
+    Two sources, not one (R150a):
+    - each provider's `api_key_env`
+    - each `mcp_servers[].env` VALUE — `mcp._resolve_env` resolves those
+      through `keystore.get_key()`, so a `GITHUB_TOKEN` for an MCP server
+      lives in the same `"aurora-agent"` keyring service as any provider
+      key. Missing them meant `wipe` deleted AURORA_HOME while those
+      credentials survived in the keyring — exactly the "silently
+      un-logging-out the user" hole ARCHITECTURE.md §5 says this function
+      exists to close. The `env` MAPPING is {CHILD_VAR: AURORA_KEYSTORE_VAR},
+      so it is the values that name keystore entries, never the keys."""
     cfg = _load_raw_config()
     names = {p.get("api_key_env") for p in (cfg.get("providers") or {}).values()
              if p.get("api_key_env")}
-    token_env = (cfg.get("llamadesk") or {}).get("token_env")
-    if token_env:
-        names.add(token_env)
-    return sorted(names)
+    for server in (cfg.get("mcp_servers") or []):
+        if isinstance(server, dict):
+            names.update(v for v in (server.get("env") or {}).values() if v)
+    return sorted(n for n in names if n)
 
 
 def _key_set(argv: list[str]) -> None:
     import getpass
     import subprocess
+
     from . import keystore
 
     env = argv[0] if argv else "LLAMA_API_KEY"
@@ -91,6 +102,7 @@ def _key_set(argv: list[str]) -> None:
 
 def _report_clear(name: str) -> None:
     import os
+
     from . import keystore
     removed = keystore.clear_key(name)
     where = f"cleared from {', '.join(removed)}" if removed else "not stored (keyring/encrypted file)"
@@ -185,6 +197,8 @@ def main() -> None:
     from .engine import Engine
 
     engine = Engine(config)
+    for warning in engine.extension_warnings:
+        print(f"· {warning}")
     if resume_id:
         n = engine.resume_from(resume_id)
         print(f"· resuming session {resume_id} ({n} turns)")

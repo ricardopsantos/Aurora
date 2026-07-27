@@ -26,7 +26,17 @@ def _local_tool(text: str) -> str | None:
 
 
 def copy(text: str) -> str:
-    """Copy `text`; returns a human description of the method used."""
+    """Copy `text`; returns a human description of the method used.
+
+    R171/S4: this is reachable from the model's own output (the copy
+    picker's "last reply", `/copy-all`, and any tool result the user
+    selects) with no size/rate gate beyond `_osc52`'s 100KB truncation — the
+    symmetric direction of the policy `_strip_dangerous_escapes` (tui.py)
+    enforces for OSC sequences arriving FROM a subprocess: a single
+    confirm/click is the only gate on writing arbitrary model-controlled
+    content to the real OS clipboard. Accepted risk, same trust boundary as
+    the rest of the model's output; documented rather than rate-limited,
+    since a legitimate large copy (a full session export) is a normal use."""
     over_ssh = bool(os.environ.get("SSH_TTY") or os.environ.get("SSH_CONNECTION"))
     if not over_ssh:
         tool = _local_tool(text)

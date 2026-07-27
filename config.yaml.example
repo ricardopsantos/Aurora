@@ -39,23 +39,37 @@ runtime:
   # /`false` overrides. /cache on|off toggles + persists here, /cost shows
   # the hits.
   prompt_cache: true
-  # R93: offer the todo_write task-list tool. Turn off for a small local
-  # model that gains less from a plan than it loses to one more tool.
-  todo_tool: true
   # R94: run a round's read-only tool calls (reads/greps/fetches) at once
   # instead of one after another. Approvals and output order are unaffected.
   parallel_tools: true
+  # R118: silently fold OLDER history into a summary once context usage
+  # crosses auto_compact_threshold_pct — recent turns (the last
+  # ~compact_keep_recent_tokens tokens) stay raw, unlike manual /compact
+  # (which always folds everything). /autocompact on|off toggles + persists
+  # here.
+  # R154: ON by default, at 80%, and checked BETWEEN ROUNDS of a running
+  # turn as well as at the end of one. End-of-turn-only could not save the
+  # long tool-heavy turn that overflows the window, because that turn never
+  # reaches the end-of-turn check. Set false to go back to doing it by hand
+  # with /compact.
+  auto_compact: true
+  auto_compact_threshold_pct: 80
+  compact_keep_recent_tokens: 20000
 
-# Optional: LlamaDesk (github.com/<you>/llamadesk or your own instance) is a
-# companion model-library switcher for a local llama.cpp server — lets
-# /model list and load from a library of ggufs, not just whatever's already
-# running. Remove this whole block if you don't use it; Aurora works fine
-# without it (the `local` provider above is all you need for a single
-# always-loaded local model).
-# llamadesk:
-#   url: http://localhost:8097
-#   token_env: LLAMADESK_TOKEN
-#   ctx: 65536              # context size requested on library loads
+# R119: MCP (Model Context Protocol) servers, stdio transport only. Each
+# server's tools are exposed to the model as mcp_<name>_<tool>, gated by the
+# SAME approval prompt as write_file/run_command — every MCP call needs
+# approval, no "trusted server" bypass. `env` maps a CHILD process env var
+# name to an AURORA keystore env var name (`aurora key set <name>`) — never
+# put a raw token here.
+# mcp_servers:
+#   - name: filesystem
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allow"]
+#   - name: github
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-github"]
+#     env: {GITHUB_PERSONAL_ACCESS_TOKEN: GITHUB_TOKEN}
 
 # `aurora key set <VAR>` offers to run these (shown first, needs a "y") and
 # stores the printed value in the keystore. No secret lives in this file.

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import yaml
 
+from .paths import write_text_atomic
+
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -54,7 +56,7 @@ def load_state() -> dict:
 def save_state_values(**values) -> None:
     st = load_state()
     st.update(values)
-    _state_path().write_text(yaml.safe_dump(st, sort_keys=False))
+    write_text_atomic(_state_path(), yaml.safe_dump(st, sort_keys=False))
 
 
 def persist_runtime_value(cfg: dict, key: str, value) -> None:
@@ -65,7 +67,8 @@ def persist_runtime_value(cfg: dict, key: str, value) -> None:
     path = Path(cfg["_path"])
     raw = yaml.safe_load(path.read_text()) or {}
     raw.setdefault("runtime", {})[key] = value
-    path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    write_text_atomic(path, yaml.safe_dump(raw, sort_keys=False,
+                                          allow_unicode=True))
     cfg["runtime"][key] = value
 
 
@@ -77,7 +80,8 @@ def persist_model_entry(cfg: dict, entry: dict) -> None:
     path = Path(cfg["_path"])
     raw = yaml.safe_load(path.read_text()) or {}
     raw.setdefault("models", []).append(dict(entry))
-    path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    write_text_atomic(path, yaml.safe_dump(raw, sort_keys=False,
+                                          allow_unicode=True))
     cfg.setdefault("models", []).append(entry)
 
 
@@ -92,7 +96,8 @@ def remove_model_entries(cfg: dict, model_id: str) -> int:
     removed = len(models) - len(kept)
     if removed:
         raw["models"] = kept
-        path.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+        write_text_atomic(path, yaml.safe_dump(raw, sort_keys=False,
+                                          allow_unicode=True))
         live = cfg.get("models")
         if live is not None:
             live[:] = [m for m in live if m.get("model") != model_id]

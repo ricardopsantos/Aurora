@@ -1,10 +1,364 @@
-"""`aurora --man` — a man-page-style manual, coloured like llama-pick's."""
+"""`aurora --man` — a man-page-style manual, coloured like llama-pick's.
+
+`COMMAND_MAN` is the single source for BOTH the full manual's "COMMANDS"
+section and the in-REPL `/<cmd> help` (alias `/<cmd> man`) lookup — one
+command's entry can't drift out of sync with the other because there is
+only one copy of the text. Keep entries THOROUGH: this is the reference a
+user reaches for when the one-line `COMMAND_INFO` blurb (autocomplete,
+the `/help` summary) wasn't enough, not a repeat of that same blurb.
+"""
 
 from .colors import BOLD, CYAN, DIM, GREEN, RESET, YELLOW
+
+# Display order for the manual's COMMANDS section. `/cmd help` doesn't need
+# this (it looks up one key directly) — this only controls the full page.
+COMMAND_ORDER = [
+    "model", "compact", "clear", "reset", "copy", "copy-last", "copy-all",
+    "redact", "status", "cost", "context", "cache", "autocompact",
+    "fallback", "thinking", "markdown", "multiline", "allowlist",
+    "denylist", "rewind", "undo", "diff", "commit", "resume", "search",
+    "export", "skills", "extensions", "bootstrap", "remember",
+    "agentic_report", "nano", "help", "quit", "exit",
+]
+
+
+def _entries(B, C, D, G, Y, R):
+    """Built as a function of the colour constants so every entry can use
+    them — `man_page()` and `command_man()` both call this fresh (colours
+    are resolved once at import time in `colors.py`, so this is cheap, not
+    re-evaluated per call in any costly sense)."""
+    return {
+"model": f"""Switch models, or manage the configured list.
+
+    {C}/model{R}              Arrow-key menu: OpenRouter ($) · local loaded
+                       (free) · local library (free, ~1-2 min load, confirms
+                       global eviction). The current model is marked {G}✔{R}
+                       and pre-selected. An entry needing a key you don't
+                       have shows {D}(no key set){R} — picking it offers to
+                       enter/store it right there instead of failing later.
+                       Leaving the prompt blank (empty or whitespace only)
+                       skips the switch entirely — you stay on whichever
+                       model was active before. TUI only: Esc also cancels
+                       with no change (every other menu requires an
+                       explicit pick).
+    {C}/model add{R} {G}url{R}    Add an OpenRouter model by its page URL
+                       ({D}https://openrouter.ai/<org>/<model>{R}) or a bare
+                       {G}org/model{R} id. Validates it against the
+                       OpenRouter catalog, appends it to {Y}config.yaml{R},
+                       fetches ctx/pricing/description, asks for the key if
+                       missing, and switches to it. OpenRouter-only.
+    {C}/model remove{R} {G}name{R} Remove a configured model (URL or exact
+                       name; {C}rm{R} works too). Removing the current one
+                       falls back to the first remaining model with a
+                       usable key.""",
+
+"compact": f"""Summarize the conversation so far and continue with only the
+    summary — frees context without starting over. Uses the CURRENT model
+    to write the summary; if that model is unreachable, falls back to a
+    plain flatten (a mechanical trim, not a real summary) so the turn
+    doesn't just fail. Distinct from {C}/autocompact{R}, which does this
+    silently in the background near the context limit — {C}/compact{R} is
+    the manual, on-demand version, and always folds EVERYTHING, not just
+    the oldest part.""",
+
+"clear": f"""Start fresh: history is cleared, but the system prompt (and any
+    bootstrap that set it) is kept. For a full reset including the system
+    prompt, use {C}/reset{R} instead.""",
+
+"reset": f"""Full reset: clears history AND the system prompt, then offers to
+    re-run the saved {C}/bootstrap{R} prompt (declining leaves you with no
+    project context at all, same as a brand-new install). Use {C}/clear{R}
+    instead if you just want the conversation gone but the current system
+    prompt kept.""",
+
+"copy": f"""{C}/copy{R} [{G}N{R}]  Copy the Nth-last assistant response to the
+    clipboard (default: the last one). Uses OSC52, so it works over SSH
+    with no local clipboard access needed on the remote end. Copies the
+    final answer only — no thinking, no tool output; see {C}/copy-last{R}
+    for the raw record including reasoning.""",
+
+"copy-last": f"""Copy the LAST turn's raw record — the prompt that started
+    it, any reasoning/thinking, and the final answer — to the clipboard
+    (OSC52, SSH-safe). This is the one place either the prompt or the
+    thinking is ever copyable; {C}/copy{R} and {C}/copy-all{R} both leave
+    thinking out. Also reachable as "copy last" in the status bar's
+    {C}copy{R} picker.""",
+
+"copy-all": f"""Copy the WHOLE chat — every question and answer, in order —
+    to the clipboard (OSC52, SSH-safe). Thinking is never included. Also
+    reachable as "copy whole session transcript" in the status bar's
+    {C}copy{R} picker.""",
+
+"redact": f"""Secret detection in prompts and tool output — API keys, bearer
+    tokens, GUIDs, {D}.env{R}-style assignments, plus a high-entropy
+    fallback for tokens with no recognizable shape. Default {G}ON{R},
+    persisted.
+
+    {C}/redact{R} {G}on|off{R}         Toggle the feature.
+    {C}/redact allowlist{R}     Show how many confirmed false positives are
+                         allowlisted (matched by hash, never the raw
+                         value) — never flagged again once allowlisted.
+    {C}/redact allowlist clear{R}  Clear the allowlist; every match gets
+                         challenged again from here on.
+
+    A match challenges you: {G}keep{R} it as-is, {G}redact{R} it to
+    {D}<secret>{R} in history/the log, {G}always{R} allow it (adds it to the
+    allowlist), or {G}stop{R} the turn. {C}run_command{R}/{C}wait_until{R}'s
+    own command STRING only ever gets a notice, never redacted or blocked —
+    the command needs its real argument to actually work, and blocking
+    would duplicate the approval gate it already passed.""",
+
+"status": f"""Backend health check for the CURRENT model. A local (llama.cpp)
+    backend reports the real loaded model and its live context size (via
+    {D}/props{R}); a remote (OpenRouter) backend reports whether a key is
+    present, since there's no equivalent live probe for it.""",
+
+"cost": f"""Per-model token + $ breakdown across EVERY session ever logged on
+    this machine — not just this one. Reads straight from the session
+    JSONL logs, so it works on old sessions too, including ones from a
+    previous Aurora process. Prices come from
+    {Y}providers/remote_context_limits.json{R}; the total is a deliberate
+    UPPER bound (cached tokens bill cheaper, but the discount isn't
+    reported uniformly across providers, so nothing is subtracted). Also
+    prints this session's own accrued cost alongside the grand total, so
+    the two reconcile instead of just disagreeing. For ONE session's own
+    breakdown — turn by turn, not just a per-model summary — use
+    {C}/context{R} instead.""",
+
+"context": f"""{C}/context{R} [{G}all{R}{Y}|{R}{G}N{R}] [{G}id{R}]  The "cost tree": this
+    session (or a past one, by id) drawn as turns, each with its
+    thinking/prompt/completion token counts, tool calls, and $ — with
+    approvals, {C}/compact{R} folds, and model switches shown in place at
+    the point they happened. Shows the last 20 turns by default; {G}all{R}
+    for every one, or a bare number {G}N{R} for the last N. A session that
+    used more than one model (a {C}/model{R} switch mid-session, or a
+    {C}/fallback{R} retry) also gets a {C}/cost{R}-style per-model
+    breakdown up top. When rendering the LIVE session, also prints a
+    linear "at this rate: ~N more turn(s) until context fills (~$X total
+    by then)" projection, once there's an actual multi-turn growth trend
+    to extrapolate from. Also reachable by tapping the status bar's
+    {B}ctx{R} gauge.""",
+
+"cache": f"""{G}on|off{R}, persisted. Marks the system prompt as cacheable so
+    the bootstrap preamble isn't re-billed on every tool iteration of every
+    turn — it's the one part of a request that's byte-identical for the
+    whole session. On by default for remote (OpenRouter) models; off for
+    the local one, since llama.cpp keeps its own prefix cache already.
+    {C}/cost{R} shows the cache-hit savings when this is paying off.""",
+
+"autocompact": f"""{G}on|off{R}, persisted, ON by default. Silently folds
+    OLDER history (never the recent part) once context usage crosses 80% —
+    checked between rounds of a running turn as well as at the end of one,
+    so a long tool-heavy task folds and keeps going instead of dying on a
+    full context mid-turn. Unlike {C}/compact{R} (which always folds
+    EVERYTHING on demand, keeps nothing raw, and only runs when you ask),
+    this is the quiet background version that only trims what it needs to.""",
+
+"fallback": f"""{G}on|off{R}, persisted, OFF by default. When ON, a HARD
+    provider failure — a network/API error, NOT a tool failure or a denied
+    approval — retries the SAME turn against the next configured model
+    with a usable key, walking {Y}config.yaml{R}'s {G}models:{R} list in
+    the same order {C}/model{R}'s own picker does. A successful fallback
+    silently switches the current model, exactly as if you'd picked it
+    from {C}/model{R} yourself.""",
+
+"thinking": f"""Toggle the live reasoning stream: a dim, real-time stream of
+    the model's thinking vs. just a static "(thinking…)" marker while it
+    works. Default comes from {Y}runtime.show_thinking{R} in config. TUI
+    only, independent of this toggle: click any "thought for Ns" row in the
+    transcript to expand or collapse it in place, any time, no command
+    needed.""",
+
+"markdown": f"""Toggle pretty rendering (bold, inline code, bullet lists) vs.
+    raw text. A fenced code block tagged with a recognized language
+    ({G}python js ts bash go rust ruby{R} + common aliases) also gets basic
+    keyword/string/number syntax highlighting; an untagged or unrecognized
+    fence just renders dim, same as with this off.""",
+
+"multiline": f"""Toggle multiline input mode (same as {B}Alt+M{R}; persisted).
+    ON: {B}Enter{R} inserts a newline and {B}Alt+Enter{R} submits. OFF (the
+    default): {B}Enter{R} submits immediately. Either way, typing {B}\\n{R}
+    or {B}\\br{R} inside a prompt inserts a literal newline, and a pasted
+    newline never submits.""",
+
+"allowlist": f"""Show the persistent "always allow" approval rules — added
+    via the {G}a{R} option at any approval prompt. How far a rule
+    generalizes depends on the command: read-only ones ({C}find ls grep{R}
+    …) match across any arguments; destructive ones ({C}dd rm mkfs shred
+    sudo sh python curl{R} … and anything using a shell operator) match the
+    EXACT command only, so allowing {C}rm -rf ./build{R} never allows
+    {C}rm -rf /{R}. Everything else stores a two-token prefix (e.g.
+    {C}git push{R}). Persisted in {Y}AURORA_HOME/allowlist.yaml{R}.""",
+
+"denylist": f"""Show tool calls always denied by policy — added via the
+    {G}d{R} ("always DENY") option at any approval prompt. A denylist match
+    skips the approval prompt entirely: no question is asked, the call is
+    refused outright, every time. Persisted in
+    {Y}AURORA_HOME/denylist.yaml{R}.""",
+
+"rewind": f"""{C}/rewind{R} [{G}id{R}]  Restore the WHOLE working tree to an
+    earlier checkpoint — the coarse option; see {C}/undo{R} for reverting
+    just the last single mutation instead. A checkpoint (a snapshot in a
+    private shadow git repo under {Y}AURORA_HOME{R}, separate from the
+    project's own {D}.git{R}) is taken before every approved write/edit/
+    command, labelled with the prompt that caused it. With no {G}id{R},
+    lists the recent checkpoints newest-first and asks which to restore.
+    Restoring resets tracked files to that snapshot and deletes anything
+    created since — but it is itself undoable: the pre-restore state gets
+    its own checkpoint first, and the restore message shows the id to go
+    back with. Gitignored/excluded files (venvs, build output, caches) are
+    never touched either way.""",
+
+"undo": f"""Revert just the LAST mutation — not the whole tree (that's
+    {C}/rewind{R}). ALWAYS shows what it's about to revert — the affected
+    file(s) AND the actual diff — before asking to confirm (default: No).
+    Tracks the target file directly (whatever {C}write_file{R}/
+    {C}edit_file{R}/{C}apply_patch{R} last touched), so it works no matter
+    where that file lives — inside the project or anywhere else on disk.
+    A {C}run_command{R}/{C}wait_until{R} mutation (no single unambiguous
+    target file) falls back to whatever changed in the project tree
+    itself. If nothing qualifies — the last action left no trace anywhere
+    Aurora can see, or it was a genuine no-op — says "nothing to undo"
+    rather than guessing; it will never revert something OLDER than the
+    last mutation. For that, use {C}/rewind{R} and pick a checkpoint
+    explicitly. Also reachable as the status bar's {C}undo{R} button, shown
+    once the first mutation this session has happened.""",
+
+"diff": f"""Show what the LAST TURN actually changed — diffs the working
+    tree against the checkpoint taken right before that turn started, so
+    you see exactly what the approved writes/edits/commands did, without
+    re-reading the whole conversation. Covers brand-new files as real
+    additions too (not silently blank). Operates on {C}/rewind{R}'s shadow
+    checkpoint history, never the project's real {D}.git{R} — for that,
+    see {C}/commit{R}.""",
+
+"commit": f"""{C}/commit{R} [{G}message{R}]  Stage and commit to the REAL
+    project repository — never {C}/rewind{R}'s private shadow one. Nothing
+    staged yet? Shows what {C}git add -A{R} would include and asks first.
+    With no message, drafts one from the diff (style-matched to the
+    repo's own recent commit messages) and shows it before committing,
+    with a chance to edit or cancel; pass a message yourself to skip the
+    draft step entirely.""",
+
+"resume": f"""Pick a past session from a list and continue it exactly where
+    it left off — full history restored, not just a summary. On quit,
+    Aurora always prints the exact command to re-enter whatever session
+    you were just in, whether you used {C}/resume{R} to get there or not.""",
+
+"search": f"""{C}/search{R} {G}text{R}  Case-insensitive substring search over
+    EVERY session log on this machine, not just the current one — matches
+    both prompts and tool output. Shows one hit per session (the newest
+    session first). Pick a number afterward to jump straight into
+    {C}/resume{R}-ing that session.""",
+
+"export": f"""Dump the current conversation as a markdown file in the
+    working directory — questions, answers, and tool activity, formatted
+    for reading outside Aurora (a PR description, a note to a teammate,
+    etc).""",
+
+"skills": f"""List every installed skill (bundled + your own, from
+    {Y}<repo>/skills/{R} or {Y}AURORA_HOME/skills/{R}). Run one directly as
+    {C}/{R}{G}skill-name{R} {G}args{R} — skills show up in {C}/{R}
+    autocomplete alongside the built-in commands.""",
+
+"extensions": f"""{C}/extensions{R}  List loaded extension tools — bundled
+    ones (an MCP client, configured via {Y}mcp_servers:{R} in
+    {Y}config.yaml{R}, plus {G}lint_check{R}) and any of your own from
+    {Y}AURORA_HOME/extensions/{R} — and how to add one.
+    {C}/extensions new{R} {G}name{R}  Scaffold a SPEC/RUNNERS template file
+    into {Y}AURORA_HOME/extensions/{R}{G}name{R}{Y}.py{R} — fill in the
+    tool function yourself, then restart Aurora to load it.""",
+
+"bootstrap": f"""Manage the saved bootstrap prompt — the ONLY way any
+    project context (e.g. an {D}.agentic_context{R} protocol) enters a
+    session; nothing is auto-detected or auto-injected.
+    {C}/bootstrap{R}              Run the saved prompt right now, as a
+                           normal user turn.
+    {C}/bootstrap set{R} [{G}file{R}{Y}|{R}{G}url{R}] [{G}project{R}]  Save a
+                           new one — from a local file, a pasted prompt, or
+                           a URL (downloaded and cached, remembering the
+                           source URL for later re-download). Add
+                           {G}project{R} to save it into THIS project's own
+                           {Y}.aurora/bootstrap.md{R} (overrides the global
+                           one) instead of the global
+                           {Y}AURORA_HOME/bootstrap.md{R}.
+    {C}/bootstrap show{R}         Print the currently saved prompt.
+    {C}/bootstrap clear{R} [{G}project{R}]  Remove it (global, or just this
+                           project's override).
+    When a bootstrap prompt exists, Aurora offers to run it at startup —
+    a plain yes/no for a local file or pasted prompt, or a choice of
+    run-cached / re-download / skip for a URL-sourced one.""",
+
+"remember": f"""{C}/remember{R} [{G}all{R}{Y}|{R}{G}last{R} [{G}k{R}]]  Save
+    what's worth keeping from this session into MEMORY (a
+    {D}.agentic_context{R} project's own memory store, or
+    {G}~/AURORA_PFCS/MEMORY/{R} — machine-wide, not project-specific — when
+    no such folder is detected). The model drafts candidate findings from
+    the transcript; each one gets its own approval challenge before being
+    written, same gate as a file write. With no argument (or {C}last{R}),
+    covers just the last question/answer pair; {C}last{R} {G}k{R} covers
+    the last {G}k{R} pairs; {C}all{R} covers the whole session.""",
+
+"agentic_report": f"""Only shown/available once a context-protocol folder
+    (a {D}KNOWLEDGE/SKILL.md{R} + {D}MEMORY/SKILL.md{R} pair) is detected in
+    the project. Choose {C}Stats{R} (runs the folder's own
+    {G}scripts/stats.sh{R}) or {C}Index{R} (pretty-prints
+    {D}KNOWLEDGE/INDEX.md{R} and {D}MEMORY/INDEX.md{R}). Also reachable via
+    the TUI status bar's "agentic report" link, shown under the same
+    condition.""",
+
+"nano": f"""{C}/nano{R} {G}file{R}  Open a text file
+    ({G}.txt .md .json .yml .yaml .xml .sh{R}, up to 1MB) in Aurora's own
+    built-in editor — TUI only, not available in the classic REPL. The
+    editor takes over the chat area while open; the status bar swaps to
+    save/close/save-and-close buttons in place of the usual model/context
+    links for the duration. Clicking a matching filename anywhere in
+    bash-mode output opens it the same way, with no need to type
+    {C}/nano{R} yourself.""",
+
+"help": f"""Print the full command + key summary (same content as the TUI's
+    {B}?{R}-triggered scrollable help overlay on an empty prompt). For a
+    single command's own full description instead of the one-line
+    summary, use {C}/{R}{G}command{R} {C}help{R} (or {C}man{R} — they're
+    synonyms).""",
+
+"quit": f"""Quit Aurora immediately — no confirmation prompt. {C}/exit{R} is
+    a full alias; either spelling works. In the TUI, pressing {B}Esc{R}
+    twice on an empty, idle prompt asks the same "quit?" question through
+    an explicit Yes/No menu instead — this command skips that and just
+    quits.""",
+
+"exit": f"""Alias of {C}/quit{R} — quits Aurora immediately, no confirmation.
+    Both spellings do exactly the same thing; use whichever you reach for.""",
+    }
+
+
+def command_man(cmd: str) -> str | None:
+    """The full `/<cmd> help`/`/<cmd> man` text for one command, or None if
+    `cmd` isn't a recognized command at all. Same source `man_page()`'s
+    COMMANDS section renders from — see this module's docstring."""
+    B, C, D, G, Y, R = BOLD, CYAN, DIM, GREEN, YELLOW, RESET
+    return _entries(B, C, D, G, Y, R).get(cmd)
 
 
 def man_page() -> str:
     B, C, D, G, Y, R = BOLD, CYAN, DIM, GREEN, YELLOW, RESET
+    entries = _entries(B, C, D, G, Y, R)
+
+    def _block(cmd: str) -> str:
+        # normalize rather than preserve each entry's own hand-typed
+        # indentation — entries are authored assuming they're printed
+        # standalone (`/cmd help`, at the left margin); nesting them under
+        # a header here doubles whatever indent they already carry, which
+        # reads as ragged, inconsistent wrapping. A flat 4-space indent for
+        # every line (dropping each line's OWN leading whitespace first)
+        # keeps sub-bullets like "/model add" readable without that.
+        body = "\n".join(f"    {line.strip()}" if line.strip() else ""
+                         for line in entries[cmd].splitlines())
+        return f"    {C}/{cmd}{R}\n{body}\n"
+
+    commands_section = "\n".join(_block(cmd) for cmd in COMMAND_ORDER
+                                 if cmd in entries)
     return f"""
 {B}NAME{R}
     aurora — micro terminal coding agent (OpenRouter / local llama.cpp)
@@ -23,8 +377,12 @@ def man_page() -> str:
     Writes and commands show a diff and ask:
         {G}y{R} run once   {G}n{R} [reason] deny (reason shown to the model)
         {G}a{R} always-allow (persists to the allowlist)
+        {G}d{R} always-DENY (persists to the denylist — never asked again)
         {G}s{R} stop the whole turn
         {G}c{R} [text] don't run — steer the model with your text instead
+        {G}e{R} explain — the model describes what the call will do (a plain
+              side question, no tools, not added to history), then the SAME
+              approval prompt comes back so you can decide
     The iteration-cap prompt accepts {G}y{R} / {G}N{R} / {G}c{R} <guidance> the same way.
 
     The agent starts with NO project knowledge. Your saved {C}/bootstrap{R}
@@ -45,103 +403,9 @@ def man_page() -> str:
                  untinted.
     {Y}--man{R}         This manual.
 
-{B}COMMANDS (inside the REPL){R}
-    {C}/model{R}        Arrow-key menu: OpenRouter ($) · local
-                  loaded (free) · local library (free, ~1-2 min load,
-                  confirms global eviction). Current model marked {G}✔{R} and
-                  pre-selected. An entry needing a key you don't have shows
-                  {D}(no key set){R} — picking it offers to enter/store it
-                  right there instead of failing later. Leaving the prompt
-                  blank (empty or whitespace only) skips the switch entirely
-                  — you stay on whichever model was active before. TUI only:
-                  Esc also cancels it with no change (every other menu
-                  requires an explicit pick).
-    {C}/model add{R} {G}url{R} Add an OpenRouter model by its page URL
-                  (https://openrouter.ai/<org>/<model>) or bare org/model id:
-                  validates it against the OpenRouter catalog, appends it to
-                  config.yaml, fetches ctx/pricing/description, asks for the
-                  key if missing, and switches to it. OpenRouter-only.
-    {C}/model remove{R} {G}name{R} Remove a configured model (URL or exact name;
-                  {C}rm{R} works too). Removing the current one falls back to
-                  the first remaining model with a usable key.
-    {C}/compact{R}      Summarize history with the current model and carry only
-                  the summary (plain flatten is the fallback when the model
-                  is unreachable).
-    {C}/clear{R}        Start fresh (history only; system prompt kept).
-    {C}/reset{R}        Full reset: clear history + system prompt, then
-                  offer to re-run the bootstrap prompt.
-    {C}/copy{R} [{G}N{R}]     Copy the Nth-last response (OSC52 — works over SSH).
-    {C}/copy-last{R}    Copy last turn's RAW response, thinking included
-                  (OSC52 — works over SSH). Also the "copy last" status-bar button.
-    {C}/copy-all{R}     Copy the whole chat — questions + answers, no thinking —
-                  (OSC52 — works over SSH). Also the "copy all" status-bar button.
-    {C}/redact{R} {G}on|off{R} Secret detection in prompts + tool output (API keys,
-                  tokens, GUIDs, .env credentials) — default ON, persisted.
-                  A match challenges you: keep it, redact to {D}<secret>{R},
-                  always allow it (allowlists it — never flagged again), or
-                  stop. {C}run_command{R} arguments only ever get a notice, never
-                  redacted (the command needs the real value to work).
-    {C}/redact allowlist{R} [{G}clear{R}] Show how many false positives are
-                  allowlisted, or clear them all (persisted).
-    {C}/status{R}       Backend health: local shows the real loaded model +
-                  context size from /props; a remote model shows key presence.
-    {C}/cost{R} [{G}all{R}]     Per-model token + $ breakdown for this session, or
-                  every session on this machine. Read straight from the
-                  session logs, so it works on past sessions too. Prices
-                  come from {Y}providers/remote_context_limits.json{R}; the
-                  total is an UPPER bound (cached tokens bill cheaper).
-    {C}/cache{R} {G}on|off{R}   Prompt caching (persisted). Marks the system prompt
-                  as cacheable so the bootstrap preamble isn't re-billed on
-                  every tool iteration of every turn. On by default for
-                  remote models, off for the local one (llama.cpp keeps its
-                  own prefix cache). {C}/cost{R} shows the cache hits.
-    {C}/todo{R}         Show the model's current task list. The model writes it
-                  itself with the {Y}todo_write{R} tool on multi-step work;
-                  {C}/clear{R} resets it with the conversation.
-    {C}/think{R}        Print the last turn's reasoning (thinking models).
-    {C}/thinking{R}     Toggle live reasoning: dim stream vs "(thinking…)"
-                  marker. Default from {Y}runtime.show_thinking{R} in config.
-    {C}/markdown{R}     Toggle pretty rendering (bold/code/bullets) vs raw text.
-    {C}/multiline{R}    Toggle multiline mode (same as {B}Alt+M{R}; persisted).
-    {C}/allowlist{R}    Show the persistent approval allowlist.
-    {C}/rewind{R} [{G}id{R}]   Restore the working tree to a checkpoint. One is
-                  snapshotted (shadow git under AURORA_HOME) before every
-                  approved write/edit/command, labelled with the causing
-                  prompt. Restoring is undoable — the pre-rewind state is
-                  checkpointed too. Gitignored files are never touched.
-    {C}/commit{R} [{G}msg{R}]  Stage + commit the REAL project repo (not
-                  {C}/rewind{R}'s shadow one). Nothing staged? shows what
-                  {C}git add -A{R} would include and asks first. Drafts a
-                  message from the diff (style-matched to recent commits)
-                  unless you pass one; shows it before committing, with a
-                  chance to edit or cancel.
-    {C}/resume{R}       Pick a past session and continue it. On quit Aurora
-                  prints the exact command to re-enter the same session.
-    {C}/export{R}       Dump the conversation as markdown in the cwd.
-    {C}/skills{R}       List skills; run one with {C}/name{R} {G}args{R}.
-    {C}/bootstrap{R}    Run the saved bootstrap prompt as a user turn.
-                  {C}set{R} [{G}file{R}{Y}|{R}{G}url{R}] [{G}project{R}] · {C}show{R} · {C}clear{R} [{G}project{R}].
-                  Global {G}AURORA_HOME/bootstrap.md{R}; a project's
-                  {G}.aurora/bootstrap.md{R} overrides. {C}set{R} with a URL
-                  downloads and caches it, remembering the URL; when one
-                  exists, startup offers to run it — a plain yes/no for a
-                  local file/paste, or run-cached / re-download / skip for
-                  a URL-sourced prompt.
-    {C}/remember{R} [{G}all{R}{Y}|{R}{G}last{R} [{G}k{R}]] Save what's worth keeping from the
-                  session into MEMORY, with a per-finding approval
-                  challenge. Default (no argument, or {C}last{R}) is just
-                  the last question/reply pair; {C}last{R} {G}k{R} the last {G}k{R}
-                  pairs; {C}all{R} the whole session. No context protocol
-                  folder detected? Saves flat into
-                  {G}~/AURORA_PFCS/MEMORY/{R} instead (machine-wide, not
-                  project-specific).
-    {C}/agentic_report{R} {D}(only shown once a context protocol folder — a
-                  KNOWLEDGE/SKILL.md + MEMORY/SKILL.md pair — is
-                  detected){R} Choose {C}Stats{R} (runs the folder's
-                  {G}scripts/stats.sh{R}) or {C}Index{R} (pretty-prints
-                  KNOWLEDGE/INDEX.md and MEMORY/INDEX.md). Also the target
-                  of the TUI status bar's "agentic report" link.
-    {C}/help{R} {C}/quit{R}   Command summary · quit immediately.
+{B}COMMANDS (inside the REPL){R}  {D}— run `/<command> help` (or `man`) any
+    time for the full entry below, without leaving the REPL{R}
+{commands_section}
     {B}!{R}{G}cmd{R}          Classic REPL: run one bash command locally, no LLM.
                   TUI: {B}!{R} on an EMPTY prompt enters persistent bash mode
                   ({G}${R} prompt) — every Enter runs a command until you leave.
@@ -171,14 +435,25 @@ def man_page() -> str:
                   it to copy (local: pbcopy/wl-copy/xclip; over SSH: OSC52).
                   The terminal's own selection is captured by the TUI; use
                   this instead. {C}/copy{R} grabs the whole last response in
-                  one go.
+                  one go. Dragging in the prompt line works the same way —
+                  same button — and a {B}double-click{R} there selects the
+                  whole draft.
 
 {B}FILES{R}
     {C}AURORA_HOME{R} {D}(default ~/.aurora; set at install, marker ~/.aurora-path){R}
         {G}sessions/*.jsonl{R}   full event logs (turns, tools, approvals)
-        {G}allowlist.yaml{R}     persisted "always" approvals
+        {G}allowlist.yaml{R}     persisted "always allow" approvals. How far a
+                          rule generalizes depends on the command: read-only
+                          ({C}find ls grep{R} …) across any args; destructive
+                          ({C}dd rm mkfs shred sudo sh python curl{R} …) across
+                          NONE — exact command only, so allowing
+                          {C}rm -rf ./build{R} never allows {C}rm -rf /{R}. Same for
+                          anything with a shell operator. Others store a
+                          two-token prefix ({C}git push{R}).
+        {G}denylist.yaml{R}      persisted "always DENY" approvals
         {G}keys.enc{R}           Fernet-encrypted key store (opt-in fallback)
         {G}skills/{R}            user skills (also {G}<repo>/skills/{R})
+        {G}extensions/{R}        user extensions ({C}/extensions{R} to list; SPEC + RUNNERS)
         {G}bootstrap.md{R}       default bootstrap prompt ({G}.aurora/bootstrap.md{R}
                            in a project overrides it)
         {G}state.yaml{R}         last-used model, restored on the next start
@@ -201,7 +476,6 @@ def man_page() -> str:
     {Y}OPENROUTER_API_KEY{R}  OpenRouter key {D}(else keyring → encrypted file → prompt){R}
     {Y}LLAMA_API_KEY{R}       Bearer key for your local llama-server endpoint
                      {D}(leave unset if your server needs no key){R}
-    {Y}LLAMADESK_TOKEN{R}     Token for LlamaDesk model-library switches
     {Y}AURORA_HOME{R}         Override the data dir
     {Y}NO_COLOR{R}            Disable colours
 

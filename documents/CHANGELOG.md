@@ -1,9 +1,201 @@
 # Changelog
 
-Aurora's version is `1.0.<commit-count>`, pinned at the point each release
+Aurora's version is `1.1.<commit-count>` (the `1.0.` prefix was used through
+release 1.0.185; R114 bumped it to `1.1.`), pinned at the point each release
 was published — check `aurora --man` or `python3 -c "import aurora;
 print(aurora.__version__)"` for what you're actually running. For the full
-numbered requirements record, see `AURORA.md`.
+numbered requirements record, see `CHANGELOG_TECHNICAL.md` (formerly
+`AURORA.md`).
+
+## 1.1.303 (2026-07-27)
+
+### Added
+- `/nano <file>`, a built-in text editor: open, edit, save, close, with line
+  numbers, a cursor position/"modified" indicator, and click-to-open for any
+  filename mentioned in bash-mode output. Restricted to plain text-ish files
+  (`.txt/.md/.json/.yml/.yaml/.xml/.sh`, ≤1MB) and never auto-creates a
+  missing file. Closing a dirty file now asks once before discarding your
+  edits.
+- Extensions: drop a small Python file into your extensions folder and its
+  tools become callable by the model — see `/extensions` for what's loaded,
+  and `/extensions new <name>` to scaffold a starting template. Bundled with
+  Aurora out of the box: an MCP client (connect to any Model Context
+  Protocol server listed in `config.yaml`), `lint_check` (runs `ruff` on a
+  Python file, or a syntax-only check if `ruff` isn't installed),
+  `refresh_model_prices` (re-pulls context size/pricing for every configured
+  OpenRouter model in one batch), `find_files` (find files by name pattern,
+  the filename counterpart to `grep`), and `web_search`/`web_fetch`. Every
+  extension-provided tool call still goes through the approval gate — an
+  extension is never silently trusted.
+- A denylist alongside the existing allowlist: at any approval prompt,
+  "Always DENY this" blocks a command or path permanently without asking
+  again, and `/denylist` shows what's blocked.
+- `apply_patch`: apply a multi-hunk unified diff to a file in one atomic,
+  one-approval call instead of several separate edits, each needing its own
+  approval. All hunks apply, or none do — the file is never left
+  half-patched.
+- `wait_until`: repeatedly runs a shell command until it succeeds or times
+  out, approved once for the whole call — for "wait until the server is
+  listening" instead of guessing a `sleep` duration. It can also run a
+  follow-up command (`then`) once the wait succeeds, in the same approval.
+- `/commit [message]`: stages, drafts a commit message in your repo's own
+  style (or uses the one you give it), shows you the diff and message for
+  review, and commits — without leaving Aurora. Never stages anything
+  without asking first.
+- `/diff` shows exactly what your last turn changed on disk, including a
+  brand-new file.
+- `/undo`, a precision revert: undoes just the last file change (in the
+  project or anywhere else on disk), rather than resetting the whole
+  project the way `/rewind` does. Always shows the actual diff of what
+  would be reverted before asking to confirm. A status-bar button offers it
+  once something has changed.
+- `/search <text>` finds a past session by what was actually said or done in
+  it, not just by date — useful once you have more sessions than `/resume`'s
+  recent list shows.
+- `/fallback on|off`: if a model/provider is down or rate-limited mid-turn,
+  automatically retry the same request on the next configured model instead
+  of just failing. Off by default.
+- Auto-compact: once a session's context usage gets high, older history is
+  automatically folded into a summary — including, now, mid-turn, so a
+  single tool-heavy turn that would otherwise blow the context window can
+  shrink itself and keep going instead of dying with a context-limit error.
+  On by default at 80% usage; `/autocompact off` disables it, and
+  `/compact` still folds everything manually at any time.
+- Syntax highlighting inside rendered code fences for Python, JavaScript/
+  TypeScript, bash, Go, Rust, and Ruby (keywords, strings, numbers).
+- `/<command> help` (or `/<command> man`) prints a full explanation of any
+  command — not just its one-line autocomplete blurb.
+- The status bar's `$` price is now clickable (→ `/cost`), and a single
+  `copy` button replaces the previous four separate copy buttons, opening a
+  menu (copy last reply, copy the whole session, copy the session id, copy
+  a selection). A small `⤵N` counter shows how many times the session has
+  auto-compacted, clickable to compact again.
+- A secret detected in a shell command or tool output can now be viewed with
+  the token itself masked (`v` at the challenge prompt), instead of only
+  full-reveal-or-nothing.
+- Session logs now rotate once they pass 5MB instead of growing as one
+  ever-larger file — nothing is deleted, `/cost`, `/search`, and `/resume`
+  all still see every record.
+- `/context`'s per-turn view now also shows: a live "at this rate, ~N more
+  turns until context fills" projection with an estimated cost, a per-model
+  cost breakdown for sessions that used more than one model, and a visible
+  drop to zero right after `/clear`/`/reset`.
+- The status-bar mode label (`prompt mode`/`bash mode`) is now clickable to
+  toggle modes; double-clicking the prompt selects the whole draft; bash
+  mode now Tab-completes file paths (including for `cd`) and `cd` persists
+  across bash-mode commands; `clear`/`cls` in bash mode now clears the
+  actual on-screen scrollback rather than dumping raw escape codes into the
+  transcript.
+- `/model`'s picker now shows each model's last-seen response latency when
+  known, and no longer blocks the picker on a live probe of a possibly-dead
+  local server.
+
+### Changed
+- "Copy last" now includes the prompt that started the turn, not just the
+  thinking and the reply, with a clearer visual separator between them.
+- `/cost` no longer repeats its explainer footer on every call, and now
+  states your current session's own cost alongside the all-sessions total
+  so the two numbers visibly reconcile instead of just looking like they
+  disagree. `/cost <id>` is now an alias for `/context <id>`.
+- `/context`'s per-turn line uses plain, coloured, uppercase labels
+  (`IN:`/`OUT:`/`TOOLS:`/`CACHE:`) instead of emoji, states units, and no
+  longer implies growth where a figure is actually a multi-round sum.
+- `/think` is removed — the TUI's existing click-to-expand on any "thought
+  for Ns" row already does the same thing, for any past turn, not just the
+  latest. Classic (non-TUI) sessions lose the ability to review past
+  reasoning after the fact as a result.
+- The LlamaDesk integration is removed — it required a `llamadesk:` config
+  block nobody had configured. Aurora's local-model support is unaffected.
+- `/model` add/remove, prompt caching, per-session `/cost`, concurrent
+  read-only tool calls, and a 429 rate limit getting its own automatic
+  retry (previously covered) are joined by: connection retries now notify
+  you and jitter their delay, and a 429 retry now honours the server's own
+  requested wait time (capped) and can be cancelled instead of blocking for
+  up to 30 seconds.
+- Shadow checkpoints (what `/rewind` and `/undo` restore from) and the chat
+  scrollback are both bounded now, so a long-running project or a long
+  session no longer grows either one without limit.
+
+### Fixed
+- **A serious approval bypass**: an "always allow" rule for a safe,
+  read-only command (like `ls` or `cat`) could be silently reused to
+  auto-run a chained destructive command (`ls && rm -rf ~`, and several
+  other shell-operator forms) with no approval prompt at all. Fixed — a
+  compound command now always requires an exact, whole-command match.
+  Relatedly, "always allow" on a destructive command like `rm -rf` or `dd`
+  no longer generalizes to a different, more dangerous target than the one
+  you actually approved.
+- A backspace on a selected (double-clicked) draft in the prompt deleted
+  only one character instead of the whole selection.
+- MCP servers no longer inherit Aurora's own environment variables (so a
+  misconfigured or compromised server can't read your provider API keys),
+  can no longer have loader/interpreter environment variables injected into
+  them via a typo'd config, and a failing MCP server now reports why
+  (its own error output), instead of just "connection closed" or "timed
+  out". A hung or wedged MCP server no longer leaks its process, and a
+  large request to one is no longer silently truncated.
+- A crafted URL or terminal escape sequence in fetched content, bash
+  output, or a model's own reply could no longer smuggle a hidden terminal
+  command (e.g. a clipboard hijack) into what gets displayed or copied —
+  these sequences are now stripped.
+- The first-ever fetch of a `/bootstrap set <url>` now shows a preview and
+  asks for confirmation before it's saved, rather than trusting it sight
+  unseen.
+- Several turn-ending edge cases (a cancelled turn, an approval denial, an
+  interrupted round, hitting the iteration cap, a secret-detection stop) no
+  longer leave incorrect or missing session-log records — previously some
+  of these could log a "skipped" placeholder as if it were the model's real
+  answer, undercount tool calls in `/context`, or (rarer) leave the session
+  history in a shape that made the *next* message to certain models fail.
+  `--continue` also no longer restores two consecutive user messages from a
+  turn that crashed mid-flight.
+- Secret detection now also scans a model's own reply text and the new
+  content written by `write_file`/`edit_file`/`apply_patch`, not just your
+  prompt and tool output — closing two paths where a credential could reach
+  the model/provider with no notice or chance to redact.
+- Several TUI/menu edge cases fixed: a menu opened while an Esc-Esc confirm
+  was already open could permanently freeze the session; a stray Esc could
+  silently swallow the next message you typed; an out-of-range digit press
+  during a menu could leak into the hidden input; opening the help overlay
+  and `/nano` at the same time could leave help stuck open; Esc in bash
+  mode with a path-completion popup open now closes the popup instead of
+  arming "leave bash mode".
+- `/undo` itself went through several corrections in quick succession after
+  a real incident: an early version could, in one specific case, silently
+  revert an unrelated, already-sealed piece of work instead of the file you
+  meant. It's since been rebuilt to only ever act on the change your last
+  action actually made, to show you a real diff before confirming, and to
+  work correctly on files outside the project directory too.
+- A crash killed between two file saves (config, allowlist/denylist rules,
+  etc.) could previously leave that file empty or half-written on the next
+  start; writes to these files are now atomic.
+- A hung/silent subprocess (bash-mode command, `grep`, an MCP server) is now
+  reliably caught by its timeout instead of occasionally blocking far past
+  it; a heavily-chattered stderr no longer causes `grep` to falsely report
+  a timeout.
+- `run_command` no longer crashes on non-UTF-8 command output, and a
+  misbehaving extension returning something other than text no longer kills
+  the whole turn.
+- Assorted smaller fixes: `cd` with spaces in bash mode; a chat crash right
+  after a bash command; the approval gate now tells you when `/rewind`
+  can't undo a write that landed outside the checkpointed project (or in a
+  git-ignored path inside it); a corrupt denylist file now blocks tool use
+  instead of silently letting everything through; a bare `models:` line in
+  `config.yaml` no longer crashes startup; `aurora wipe` now also clears
+  MCP-server credentials from the keyring.
+
+### Performance
+- Fixed a case where the context/cost status-bar numbers could sit stale
+  for the entire duration of a long, tool-heavy turn instead of updating as
+  it ran.
+- The "copy all"/"copy whole session" action now runs off the UI thread, so
+  clicking it on a large session no longer freezes the app.
+- A text-merging routine used while streaming output was quadratic in the
+  size of the text; it's now linear, saving real time on every frame of
+  every turn.
+- Old checkpoints are now pruned periodically instead of growing forever —
+  verified to shrink a real project's checkpoint storage by roughly a
+  third with no loss of `/rewind`'s recent history.
 
 ## 1.0.182 (2026-07-23)
 

@@ -9,8 +9,7 @@ Never plaintext on disk."""
 import base64
 import json
 import os
-from pathlib import Path
-from typing import Callable
+from collections.abc import Callable
 
 from .paths import aurora_home
 
@@ -53,9 +52,9 @@ def _keyring_set(name: str, value: str) -> bool:
 
 
 def _fernet(passphrase: str):
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    from cryptography.hazmat.primitives import hashes
     from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     salt_path = aurora_home() / "keys.salt"
     if not salt_path.exists():
         salt_path.write_bytes(os.urandom(16))
@@ -100,6 +99,23 @@ def _encfile_get(name: str, interactive: bool = True) -> str | None:
     except Exception:
         _passphrase_cache.pop("pw", None)
         return None
+
+
+def forget_passphrase() -> bool:
+    """R170i: drop the cached encrypted-file passphrase, if any. Until this
+    existed, `_passphrase_cache["pw"]` had NO clearing path at all once
+    entered — it lived for the rest of the process, however long the
+    session ran, with no timeout. `clear_key()` (below) clears a STORED
+    KEY, not the cache — a different operation, despite the similar name;
+    it in fact populates the cache on success (line ~192) to avoid asking
+    twice in a row. This is the actual "forget the passphrase" primitive,
+    for a caller (a `/key forget` command, an inactivity timeout) that
+    wants to shrink the exposure window instead of "eventually, when the
+    process exits." Best effort: `bytes` are immutable in Python, so this
+    drops the dict's only reference rather than overwriting the memory in
+    place — it removes the easy `_passphrase_cache` access path, not a
+    guarantee against every form of memory inspection."""
+    return _passphrase_cache.pop("pw", None) is not None
 
 
 def get_key(env_var: str, interactive: bool = True) -> str | None:

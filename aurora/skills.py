@@ -7,11 +7,13 @@ venv's python. The first line's trailing comment (after `#`) is its blurb."""
 
 import os
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 
+from . import tools
 from .paths import aurora_home
+
+_SKILL_TIMEOUT = 300   # module-level so tests can shrink it
 
 
 def _dirs(config_base: str | None) -> list[Path]:
@@ -86,14 +88,21 @@ def run(name: str, args: str, config_base: str | None = None) -> str:
         cmd += shlex.split(args) if args else []
     except ValueError as e:   # unbalanced quotes etc.
         return f"[skill args error: {e}]"
+    # R171/I4: was a bare `subprocess.run(..., timeout=300)` — the exact
+    # shape R125c fixed for TUI bash mode (`_run_command_once`): on timeout,
+    # `subprocess.run`'s own TimeoutExpired handling kills only the direct
+    # child, so a skill that forks/backgrounds something (a dev server, a
+    # build) leaves it running forever, reparented to init, with no
+    # `[timeout]` + process-group-kill semantics the rest of the codebase
+    # standardized on. Route through the same helper `run_command` uses.
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        return "[skill timeout after 300s]"
+        out, code = tools._run_command_once(shlex.join(cmd), None,
+                                            timeout=_SKILL_TIMEOUT)
     except OSError as e:
         # an executable skill with a bad/missing interpreter (Exec format
         # error, ENOENT shebang) must come back as text, not kill the turn
         return f"[skill error: {e}]"
-    out = (r.stdout or "") + (r.stderr or "")
-    return (out.strip() or "[no output]") + (
-        f"\n[exit {r.returncode}]" if r.returncode else "")
+    if code is None:
+        msg = f"[skill timeout after {_SKILL_TIMEOUT}s]"
+        return f"{out}\n{msg}" if out else msg
+    return (out.strip() or "[no output]") + (f"\n[exit {code}]" if code else "")

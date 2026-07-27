@@ -1,7 +1,8 @@
 # Aurora — Architecture
 
-Reference doc for how the pieces fit together. `AURORA.md` is the numbered
-requirements/spec (the *what* and *why*, R1–R101+); this is the *how* — module
+Reference doc for how the pieces fit together. `CHANGELOG_TECHNICAL.md`
+(formerly `AURORA.md`) is the numbered requirements/spec (the *what* and
+*why*, R1–R186+); this is the *how* — module
 map, data flow, boundaries, and the mechanisms worth understanding before
 touching them. Update this file whenever a change alters one of these shapes,
 not just when adding a requirement.
@@ -78,6 +79,22 @@ UI-agnostic and directly unit-testable with a fake provider + fake callbacks
 `self.messages` list, so history persists across turns without the agent loop
 knowing anything about session/engine state.
 
+**In place is a contract, not an implementation detail (R154).** `run_turn`
+holds that one list object for the whole turn, so anything that rewrites
+history *during* a turn must mutate the same object — `Engine.compact_history`
+does `self.messages[:] = ...` rather than rebinding for exactly this reason. A
+rebind splits the two: the engine holds the new list while the loop keeps
+appending to and sending the old one, silently, with nothing looking wrong.
+
+**Step 0 (R154): `cb.maybe_compact()`, between rounds only.** Before building
+each request after the first, the loop asks the engine whether history needs
+folding (auto-compact at 80%, see `_maybe_auto_compact_mid_turn`). A round
+boundary is the only safe point: it is where every assistant `tool_calls`
+entry already has its matching `tool` results, so the list can be rewritten
+without producing an invalid sequence. The split of responsibility is
+deliberate — the loop knows *when it is safe to ask*, the engine owns *the
+policy* (threshold, whether it's enabled at all, what a fold does).
+
 **Step 2 runs read-only calls concurrently (R94), and that changes nothing
 observable.** Before the sequential per-call loop, every call whose name is
 in `tools.PARALLEL_SAFE` is dispatched at once through
@@ -88,14 +105,15 @@ transcript and the history messages all stay strictly ordered — a user must
 never be asked two questions at once, and `messages` must never depend on
 which read finished first. `PARALLEL_SAFE` is an explicit allowlist, not
 `set(all) - NEEDS_APPROVAL`: the test is "read-only AND no shared state", so
-an ungated but stateful tool (`todo_write`, R93) is correctly excluded.
+an ungated but stateful tool would be correctly excluded even though it
+needs no approval (`todo_write`, R93, was that case before its removal).
 
 **Degrade paths are deliberate, not incidental**: a malformed tool call gets
 one corrective retry, then the model degrades to chat-only for the rest of
 the session (`turn.degraded`); a `ProviderError` is inspected for known
 substrings ("timed out", "context" + "exceed", …) to give targeted advice
 instead of a raw exception. Every one of these is a place a future change
-should ADD a case, not replace the pattern — see AURORA.md's per-R entries
+should ADD a case, not replace the pattern — see CHANGELOG_TECHNICAL.md's per-R entries
 for the history of what each one is guarding against.
 
 ## 3. Providers (`providers/`)
@@ -161,7 +179,7 @@ robustness — each one is load-bearing:
   waiting for the real request to time out. Any OpenAI-compatible endpoint
   put in front of a local server — e.g. m7's `aurora-gateway.py`, which
   unifies local llama.cpp + real OpenRouter behind one provider entry (see
-  AURORA.md's "As-built additions" for the deployment note) — MUST
+  CHANGELOG_TECHNICAL.md's "As-built additions" for the deployment note) — MUST
   implement a passthrough `/props` route or every request looks
   unreachable and Aurora never gets past the probe.
 - **`happy_eyeballs.py`** — a custom httpcore network backend that races
@@ -194,10 +212,10 @@ robustness — each one is load-bearing:
 ### Backend API surface a self-hosted server must implement
 
 Everything below is what Aurora actually calls against `providers.local
-.base_url` (llama.cpp's own OpenAI-compat server) and, separately, an
-optional LlamaDesk instance. Nothing here is Aurora-specific protocol —
-it's the exact subset of llama.cpp's/LlamaDesk's real HTTP APIs Aurora
-depends on; a from-scratch reimplementation only needs to match these.
+.base_url` (llama.cpp's own OpenAI-compat server). Nothing here is
+Aurora-specific protocol — it's the exact subset of llama.cpp's real HTTP
+API Aurora depends on; a from-scratch reimplementation only needs to match
+these.
 
 **Required — llama.cpp server (`providers.local.base_url`, `type: openai`):**
 - `POST {base_url}/chat/completions` — OpenAI-compatible chat completions,
@@ -238,40 +256,6 @@ generic OpenAI-compat backend like OpenRouter) — llama.cpp's own `/props`:**
   how a non-llama.cpp OpenAI-compat backend (OpenRouter, LM Studio) is
   already handled, so it's a supported configuration, not just tolerated.
 
-**Optional — LlamaDesk (`llamadesk.url` in `config.yaml`), a SEPARATE
-service from the llama.cpp server itself, for switching which gguf is
-loaded.** Entirely optional — omit the `llamadesk:` config block and
-Aurora only ever talks to whatever's already loaded on `providers.local
-.base_url`. (`aurora/llamadesk.py`)
-- `GET {url}/api/models` → `{"models": [...]}` or a bare list — plain gguf
-  filenames. Read-only, no auth.
-- `GET {url}/api/models/detail` → `{"models": [{"name", "ctx_native",
-  "size_bytes"}, ...]}`. Optional refinement of `/api/models` — its
-  absence (a 404, older LlamaDesk) is caught and Aurora falls back to the
-  plain name list with `ctx_native: None` for every entry, which in turn
-  makes R68's context picker show the unbounded ladder instead of one
-  capped at the model's real max.
-- `GET {url}/api/status` → `{"model": <name>|None, "ctx": <int>|None,
-  "ram_used_bytes": <int>|None, "status": "online"|"offline"}` (shape-
-  tolerant: `loaded_model()` also accepts a `"loaded"`/`"current"` key).
-  Read-only, no auth.
-- `GET {url}/api/switch/progress` → `{"running": bool}` — polled by
-  `busy()` before starting a new switch, so Aurora never launches a second
-  load on top of one already in flight. Read-only, no auth.
-- `POST {url}/api/switch` with JSON `{"model": <name>, "ctx": <int>, "ngl":
-  "auto"|<int>}` — the ONE mutating endpoint, and the only one gated
-  behind a bearer token: `Authorization: Bearer <LLAMADESK_TOKEN>`
-  (`token_env` in the `llamadesk:` config block) if the server requires
-  one. This is a GLOBAL action — it evicts whatever's currently loaded for
-  every consumer of that llama-server, which is why the UI always shows an
-  explicit eviction confirm before calling it (R3). A missing/wrong token
-  surfaces as `401`, matched literally in the UI's error text.
-- After `switch()`, Aurora polls `GET {url}/api/status` (via `wait_ready()`,
-  default 3s interval, 240s timeout) until `status.model == <requested
-  name>` and `busy()` is false — there's no push/webhook mechanism, so a
-  from-scratch LlamaDesk-alike just needs `/api/status` to reflect the new
-  model truthfully once the load actually completes.
-
 ## 4. The TUI's three areas (`tui.py`) — R53
 
 Full-screen layout is an `HSplit` of exactly three regions, and this is a
@@ -281,7 +265,13 @@ area matching a new feature's role:
 1. **Chat/scrollback** (`_ChatControl` in a `Window`) — the only area that
    scrolls; wheel/PgUp/drag-select live here. Fragment-cached per entry
    (`_cache`) since a long session appends thousands of chunks and re-parsing
-   the whole ANSI stream on every keystroke would be O(n²).
+   the whole ANSI stream on every keystroke would be O(n²). **Capped at
+   `_SCROLLBACK_MAX_LINES` (R152)**: Aurora's own flatten is flat in session
+   length (R96b), but the fragment list goes whole to prompt_toolkit's
+   `create_content`, which is linear and runs before its own cache — so the
+   only lever is fewer fragments. Trimming invalidates any selection rather
+   than remapping it, because `_sel`/`_sel_frozen` are absolute line
+   coordinates.
 2. **Input area** — `self.input` (a `TextArea`) plus, ABOVE it, a dedicated
    menu window for `select()` challenges. Two separate mechanisms live here,
    easy to conflate:
@@ -331,7 +321,25 @@ Any future float/control built on a library class needs the same scrutiny.
 | `AURORA_HOME/state.yaml` | per-machine | `last_model`/`last_provider` (R51) | `config.save_state_values()` |
 | `AURORA_HOME/allowlist.yaml` | per-machine | tool-approval "always" rules (unrelated to the secret allowlist above — same word, two different features) | `approve.add_rule()` |
 | `AURORA_HOME/sessions/<id>.jsonl` | per-machine | every turn/tool/approval, append-only | `Session.log()` |
-| `AURORA_HOME/checkpoints/<hash>/` | per-machine | shadow git repo, pre-mutation snapshots (R47) | `rewind.checkpoint()` |
+| `AURORA_HOME/checkpoints/<hash>/` | per-machine | shadow git repo, pre-mutation snapshots (R47), capped at `rewind.RETENTION` (R151) | `rewind.checkpoint()` |
+
+**Every one of these YAML files is written atomically** (R146a —
+`paths.write_text_atomic`: sibling temp file, `fsync`, `os.replace`). A plain
+`write_text()` over the live file truncates it first, so a crash mid-write
+left `config.yaml` empty and `load_config` failing at the next start. Any new
+persisted file gets the same treatment.
+
+**Only the checkpoints directory has a retention policy** (R151 — `RETENTION`
+snapshots per project, `UNDO_TAG_RETENTION` undo tags, pruned on a background
+thread every `_PRUNE_EVERY` checkpoints). It is the one store that grows
+per-mutation rather than per-setting. Note *why* it needed a real mechanism
+rather than a delete loop: old commits can't be removed while they're
+ancestors of HEAD, so `prune()` marks the Nth commit as a **shallow root**
+(the `git fetch --depth` mechanism) instead of rewriting history — rewriting
+would change every hash, including ones `/rewind` has already shown the user.
+The `undo-<hash>` tags matter more than the chain: each one made an orphaned
+commit reachable, so growth was previously *irreducible*, not just unbounded.
+Session JSONLs still grow forever by design (R20).
 
 **Why config.yaml vs. state.yaml is a real distinction, not a whim**:
 config.yaml is meant to be committed and synced between machines (providers,
@@ -446,7 +454,7 @@ touches all the layers above:
   and explicitly excludes hex-only strings (git SHAs, MD5/SHA digests) — a
   real false-positive source worth guarding deliberately rather than tuning
   away by accident. (UUIDs used to be excluded here too, until it became
-  clear some systems DO use them as secrets — see AURORA.md R58.)
+  clear some systems DO use them as secrets — see CHANGELOG_TECHNICAL.md R58.)
 - **Three hook points**, chosen so the on-disk session log is automatically
   consistent with what was sent (no separate log-side check needed):
   `Engine.send()` scans `user_text` before it enters `messages`/the log;
@@ -504,7 +512,7 @@ from 2026-07-12 to 2026-07-13: it fired on wall-clock elapsed time regardless
 of whether the model was looping, which meant a single long-but-normal
 generation (big local model, slow network) got a "still working, continue?"
 challenge unrelated to any actual runaway behavior. Removed at the user's
-request — see AURORA.md R61 for the full torn-out call-site list. The
+request — see CHANGELOG_TECHNICAL.md R61 for the full torn-out call-site list. The
 iteration cap above is the only loop-safety mechanism now.
 
 ## 9. Esc as a generic double-tap control key (R62) — and why it needed a NEW non-blocking menu
@@ -557,8 +565,8 @@ not Esc) and a stale arm must never silently fire on an unrelated later Esc.
 
 ## Where to look next
 
-- **Requirements** (R1–R101+, the numbered spec with dates and rationale):
-  `AURORA.md`.
+- **Requirements** (R1–R186+, the numbered spec with dates and rationale):
+  `CHANGELOG_TECHNICAL.md`.
 - **User-facing feature list**: `README.md` → "Daily use" and "Esc, the
   double-tap control key".
 - **`.agentic_context/`**: this project's own cross-session memory system
