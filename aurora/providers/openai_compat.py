@@ -4,6 +4,11 @@ MalformedToolCall so agent.py can retry-then-degrade (R5)."""
 
 import ipaddress
 import json
+import os
+import socket
+import tempfile
+import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -92,13 +97,21 @@ def _load_remote_context_limits() -> dict[str, dict]:
     context_limit()); anything not listed here falls back to config.yaml's
     provider-level `context_limit` (or 128k)."""
     try:
-        entries = json.loads(_REMOTE_CONTEXT_LIMITS_PATH.read_text())
+        entries = json.loads(_REMOTE_CONTEXT_LIMITS_PATH.read_text(encoding="utf-8"))
         return {e["model"]: e for e in entries}
     except (OSError, json.JSONDecodeError, KeyError, TypeError):
         return {}
 
 
 REMOTE_CONTEXT_LIMITS = _load_remote_context_limits()
+
+
+# R192: what a cache read costs when the catalog didn't say — a fraction OF
+# the input rate, not an absolute $. 0.1 is the rate every provider Aurora
+# talks to actually charges (Moonshot, OpenAI, Anthropic all bill cache reads
+# at 10% of input), and it is the RIGHT direction to be wrong in: assuming no
+# discount is what produced the 4x overstatement this constant exists to fix.
+_CACHE_READ_FALLBACK = 0.1
 
 
 def _mtok(v):
@@ -113,6 +126,13 @@ def _model_info_from_catalog_entry(m: dict) -> dict:
     return {"context_size": m.get("context_length"),
             "price_in_per_mtok": _mtok(pricing.get("prompt")),
             "price_out_per_mtok": _mtok(pricing.get("completion")),
+            # R192: a cache HIT is billed at a fraction of the input rate
+            # (OpenRouter's `input_cache_read`), and on an agentic loop the
+            # resent prefix is nearly all of the prompt — so leaving this out
+            # of the table is what made the $ badge read several times the
+            # real bill. None when the catalog lists no cache rate; `cost()`
+            # falls back rather than treating that as "no discount".
+            "price_cache_read_per_mtok": _mtok(pricing.get("input_cache_read")),
             "description": (m.get("description") or "").strip()}
 
 
@@ -163,6 +183,90 @@ def refresh_prices_for(model_ids: list[str]) -> tuple[dict[str, dict], bool]:
              for mid in model_ids if mid in by_id}, True)
 
 
+# feature request, 2026-08-03: opening `/model` refreshes the picker's prices
+# in the background, so a listed price that changed on OpenRouter's side stops
+# needing a manual `refresh_model_prices` call. Rate-limited by a per-entry
+# `refreshed_at` stamp: the catalog is only re-fetched when some configured
+# model's price is older than this (or was never stamped — a hand-edited entry
+# or one from before this existed).
+PRICE_TTL_SECONDS = 24 * 60 * 60
+_refresh_lock = threading.Lock()
+_refresh_in_flight = False
+
+
+def prices_are_stale(model_ids: list[str], now: float | None = None) -> bool:
+    """True when at least one of `model_ids` has no fresh cached price — the
+    TTL gate for the background refresh. A model with no entry at all counts
+    as stale (that's exactly the case worth fetching)."""
+    now = time.time() if now is None else now
+    for mid in model_ids:
+        stamp = (REMOTE_CONTEXT_LIMITS.get(mid) or {}).get("refreshed_at")
+        try:
+            if now - float(stamp) < PRICE_TTL_SECONDS:
+                continue
+        except (TypeError, ValueError):
+            pass       # never stamped, or a malformed hand-edit → refresh
+        return True
+    return False
+
+
+def _looks_online(host: str = "openrouter.ai") -> bool:
+    """Cheap "is there any point trying" probe: can we resolve the catalog's
+    host? Not a guarantee (DNS can answer from cache on a dead link) — the
+    fetch still has to handle its own failure. It's here so the common offline
+    case costs a failed resolve instead of the full 10s HTTP timeout, which
+    matters because this runs while the user is looking at the `/model` menu."""
+    try:
+        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        return True
+    except OSError:
+        return False
+
+
+def refresh_prices_in_background(model_ids: list[str], on_done=None) -> bool:
+    """Fire-and-forget `refresh_prices_for` + `save_remote_model_infos` on a
+    daemon thread, calling `on_done()` once the in-memory table has been
+    updated (never on failure — a stale price is not worth a repaint). Returns
+    whether a thread was actually started: no-op when there's nothing to fetch,
+    when the TTL says the cache is fresh, or when a refresh is already running
+    (re-opening the picker three times must not mean three catalog fetches).
+
+    Deliberately silent about errors: this runs behind the user's back while
+    they're picking a model, so being offline has to look like nothing
+    happening, not like a failure."""
+    global _refresh_in_flight
+    model_ids = list(dict.fromkeys(mid for mid in model_ids if mid))
+    if not model_ids or not prices_are_stale(model_ids):
+        return False
+    with _refresh_lock:
+        if _refresh_in_flight:
+            return False
+        _refresh_in_flight = True
+
+    def work():
+        global _refresh_in_flight
+        try:
+            # the resolve, not just the fetch, happens off the caller's thread:
+            # getaddrinfo blocks, and nothing about opening the picker should
+            # wait on the network.
+            if not _looks_online():
+                return
+            info_by_id, catalog_ok = refresh_prices_for(model_ids)
+            if not catalog_ok or not info_by_id:
+                return
+            save_remote_model_infos(info_by_id)
+            if on_done is not None:
+                on_done()
+        except Exception:
+            pass       # background chore — must never take the session down
+        finally:
+            with _refresh_lock:
+                _refresh_in_flight = False
+
+    threading.Thread(target=work, name="price-refresh", daemon=True).start()
+    return True
+
+
 def _merge_model_entry(model_id: str, info: dict) -> dict:
     """Fold `info` (from a catalog lookup) onto the existing
     `remote_context_limits.json` entry for `model_id`, or a fresh skeleton if
@@ -186,12 +290,48 @@ def _merge_model_entry(model_id: str, info: dict) -> dict:
             entry["context_size"] = int(info["context_size"])
         except (TypeError, ValueError):
             pass   # malformed catalog data — don't let it crash the caller
-    for k in ("price_in_per_mtok", "price_out_per_mtok"):
+    for k in ("price_in_per_mtok", "price_out_per_mtok",
+              "price_cache_read_per_mtok"):
         if info.get(k) is not None:
             entry[k] = info[k]
     if info.get("description"):
         entry["description"] = info["description"]
+    # When this entry came from a catalog lookup, stamp it — that's what
+    # `prices_are_stale` reads to decide whether the picker's background
+    # refresh needs to hit the network at all. Stamped for a catalog hit even
+    # if it carried no price: the answer "OpenRouter lists no price for this"
+    # is just as fresh as a number, and re-asking hourly won't change it.
+    entry["refreshed_at"] = round(time.time(), 3)
     return entry
+
+
+# R193: every read-modify-write of remote_context_limits.json takes this. The
+# background price refresh (R188) runs on its own thread while the main thread
+# can be doing `/model add` — two unsynchronized read-modify-writes lose one
+# side's edit outright, and two overlapping `write_text` calls can interleave
+# into invalid JSON. A corrupt file is silent and total: the loader catches
+# JSONDecodeError and returns `{}`, so EVERY model loses its context limit and
+# pricing at once, and the ctx gauge quietly falls back to a 128k default.
+_SAVE_LOCK = threading.Lock()
+
+
+def _write_entries_atomically(entries: list[dict]) -> None:
+    """R193: temp file in the same directory + `os.replace`, never a direct
+    `write_text`. `write_text` truncates first and writes after, so a crash,
+    a Ctrl+C or a full disk mid-write leaves a half-written file — and this
+    particular file failing to parse costs every model its context limit and
+    price silently. `os.replace` is atomic on POSIX: readers see either the
+    old file or the new one."""
+    d = _REMOTE_CONTEXT_LIMITS_PATH.parent
+    fd, tmp = tempfile.mkstemp(dir=str(d), prefix=".remote_context_limits.",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(entries, indent=2) + "\n")
+        os.replace(tmp, _REMOTE_CONTEXT_LIMITS_PATH)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def save_remote_model_info(model_id: str, info: dict) -> None:
@@ -200,12 +340,13 @@ def save_remote_model_info(model_id: str, info: dict) -> None:
     for a just-added model without a restart."""
     entry = _merge_model_entry(model_id, info)
     REMOTE_CONTEXT_LIMITS[model_id] = entry
-    try:
-        entries = json.loads(_REMOTE_CONTEXT_LIMITS_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        entries = []
-    entries = [e for e in entries if e.get("model") != model_id] + [entry]
-    _REMOTE_CONTEXT_LIMITS_PATH.write_text(json.dumps(entries, indent=2) + "\n")
+    with _SAVE_LOCK:
+        try:
+            entries = json.loads(_REMOTE_CONTEXT_LIMITS_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            entries = []
+        entries = [e for e in entries if e.get("model") != model_id] + [entry]
+        _write_entries_atomically(entries)
 
 
 def save_remote_model_infos(infos: dict[str, dict]) -> None:
@@ -218,8 +359,13 @@ def save_remote_model_infos(infos: dict[str, dict]) -> None:
     half-written state."""
     if not infos:
         return
+    with _SAVE_LOCK:
+        _save_remote_model_infos_locked(infos)
+
+
+def _save_remote_model_infos_locked(infos: dict[str, dict]) -> None:
     try:
-        entries = json.loads(_REMOTE_CONTEXT_LIMITS_PATH.read_text())
+        entries = json.loads(_REMOTE_CONTEXT_LIMITS_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         entries = []
     by_model = {e.get("model"): e for e in entries}
@@ -227,8 +373,34 @@ def save_remote_model_infos(infos: dict[str, dict]) -> None:
         entry = _merge_model_entry(model_id, info)
         REMOTE_CONTEXT_LIMITS[model_id] = entry
         by_model[model_id] = entry
-    _REMOTE_CONTEXT_LIMITS_PATH.write_text(
-        json.dumps(list(by_model.values()), indent=2) + "\n")
+    _write_entries_atomically(list(by_model.values()))
+
+
+def cost_for(model: str, inp: int, out: int, cached: int = 0) -> float | None:
+    """R203: THE pricing rule. `None` when the model has no listed price.
+
+    R192 taught `OpenAICompatProvider.cost` about cache reads but left this
+    module's other consumers — `/context`'s per-turn badge, its session total,
+    the per-model breakdown, and the cost a RESUMED session is seeded with —
+    computing their own `billed * price_in + out * price_out` from
+    `price_for()`. So one live session reported two different figures for
+    itself: on the real 2026-08-09 kimi-k3 session, $32.50 in `/context`
+    against $4.74 in the status bar, where $4.74 is what OpenRouter charged.
+
+    Having one function rather than four copies of the arithmetic is the
+    actual fix; the cache term is just what those copies were missing."""
+    entry = REMOTE_CONTEXT_LIMITS.get(model, {})
+    price_in = entry.get("price_in_per_mtok")
+    price_out = entry.get("price_out_per_mtok")
+    if price_in is None or price_out is None:
+        return None
+    cached = max(0, min(cached, inp))
+    price_cache = entry.get("price_cache_read_per_mtok")
+    if price_cache is None:
+        price_cache = price_in * _CACHE_READ_FALLBACK
+    return ((inp - cached) * price_in
+            + cached * price_cache
+            + out * price_out) / 1_000_000
 
 
 def price_for(model: str) -> tuple[float, float] | None:
@@ -459,13 +631,24 @@ class OpenAICompatProvider(Provider):
         entry = REMOTE_CONTEXT_LIMITS.get(model, {})
         return "price_in_per_mtok" in entry and "price_out_per_mtok" in entry
 
-    def cost(self, model: str, inp: int, out: int) -> float:
-        entry = REMOTE_CONTEXT_LIMITS.get(model, {})
-        price_in = entry.get("price_in_per_mtok")
-        price_out = entry.get("price_out_per_mtok")
-        if price_in is None or price_out is None:
-            return 0.0
-        return (inp * price_in + out * price_out) / 1_000_000
+    def cost(self, model: str, inp: int, out: int, cached: int = 0) -> float:
+        """R192: `cached` is the part of `inp` the provider served from its
+        prompt cache, and it is NOT billed at the input rate. Pricing every
+        prompt token as fresh overstated a long agentic turn several-fold —
+        each iteration resends the whole prefix, so on a real session the
+        cache hit rate runs above 90% and the error scales with turn length,
+        not with anything the user can see.
+
+        `cached` is clamped to `inp` because the two numbers come from
+        different fields of the same usage block and a provider that reports
+        them inconsistently must not produce a NEGATIVE fresh-token count.
+
+        R203: the arithmetic moved to the module-level `cost_for` so the
+        display paths share it instead of each keeping a copy. `0.0` here
+        rather than `None` because a live turn's accumulator adds this every
+        round; "unpriced" is reported separately, via `has_pricing`."""
+        usd = cost_for(model, inp, out, cached)
+        return 0.0 if usd is None else usd
 
     def _auth_headers(self) -> dict:
         h = {"Content-Type": "application/json"}

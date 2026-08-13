@@ -3,8 +3,10 @@
 <img src="images/base_logo.png" alt="Aurora logo" width="120" align="right">
 
 Micro terminal coding agent — OpenRouter / a local llama.cpp
-server, with a tool loop, approval gates, session logs, and native support
-for the [`.agentic_context`](https://github.com/ricardopsantos/AgenticContext) protocol.
+server, with a tool loop, approval gates, session logs, and support for the
+[`.agentic_context`](https://github.com/ricardopsantos/AgenticContext)
+protocol via its MCP server (`agentic_context_mcp`, configured in
+`config.yaml`'s `mcp_servers:`).
 
 > A micro terminal coding agent — small enough to read, complete enough to
 > use every day. Named after my beautiful two-year-old daughter Aurora,
@@ -37,9 +39,8 @@ each so `/rewind` can undo any step; one `/model` menu across OpenRouter and
 a local llama.cpp server, models added by pasting a URL; prompt caching and
 concurrent read-only tool calls so a multi-step task doesn't quietly burn
 tokens; a full-screen TUI with streaming markdown, collapsible thinking
-blocks and mouse support; resumable/exportable sessions, `/compact`,
-`/remember`-able cross-session memory; and a plain-`.py` extension API
-(MCP client + lint checker bundled).
+blocks and mouse support; resumable/exportable sessions, `/compact`; and a
+plain-`.py` extension API (MCP client + lint checker bundled).
 
 Full detail, screenshots and the reasoning behind each — see
 **[documents/FEATURES.md](documents/FEATURES.md)**.
@@ -107,7 +108,6 @@ double-tap control rule are in
 | `/cost` · `/context [id]` | spend across all sessions · this session's cost tree |
 | `/compact` · `/clear` · `/reset` | summarize-and-continue · start fresh · full reset |
 | `/rewind [id]` | list/restore a pre-edit checkpoint |
-| `/remember [all\|last [k]]` | save what mattered into `.agentic_context/MEMORY` |
 | `/resume` · `/search <text>` | pick a past session · find one by content |
 | **Esc** (twice) | the control key — cancel/leave-mode/quit, see below |
 | **?** or `/help` | open the help menu |
@@ -131,7 +131,7 @@ writeup: **[documents/ARCHITECTURE.md](documents/ARCHITECTURE.md)**.
 Everything below `README.md` lives in **[documents/](documents/)**:
 
 - **[CHANGELOG_TECHNICAL.md](documents/CHANGELOG_TECHNICAL.md)** — the
-  canonical spec: every numbered requirement (R1+, currently through R186),
+  canonical spec: every numbered requirement (R1+, currently through R217),
   build plan and test plan, written before the code and kept in sync with
   behaviour. When any doc disagrees with it, this one wins. (Formerly
   `AURORA.md`.)

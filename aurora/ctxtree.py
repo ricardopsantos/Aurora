@@ -170,7 +170,7 @@ def _reasoning(stats: dict) -> tuple[str, bool]:
 
 
 def _badges(stats: dict) -> str:
-    from .providers.openai_compat import price_for
+    from .providers.openai_compat import cost_for
     inp = int(stats.get("input_tokens") or 0)
     billed = int(stats.get("billed_input") or inp)
     out = int(stats.get("output_tokens") or 0)
@@ -235,9 +235,11 @@ def _badges(stats: dict) -> str:
                   f"{MAGENTA}OUT: {fmt_token_count(out)} tok{RESET}"]
     parts.append(f"{YELLOW}TOOLS: {stats.get('_tools', 0)}{RESET}")
 
-    price = price_for(stats.get("model") or "")
-    if price:
-        usd = (billed * price[0] + out * price[1]) / 1_000_000
+    # R203: `cached` included — this badge and the status bar are describing
+    # the same turn and must not disagree (they did, by ~7x on a cache-heavy
+    # session).
+    usd = cost_for(stats.get("model") or "", billed, out, cached)
+    if usd is not None:
         parts.append(f"${usd:,.4f}".rstrip("0").rstrip("."))
     return " │ ".join(parts)
 
@@ -262,22 +264,29 @@ def _runs(tool_rows: list) -> list[tuple]:
 
 
 def _session_cost(turns: list) -> tuple[float, str]:
-    """(total $, 'all' | 'some' | ''). Same basis and the same deliberate
-    UPPER bound as `/cost` (R91/R92) — cached reads bill cheaper but the
-    discount isn't reported uniformly, so nothing is subtracted."""
-    from .providers.openai_compat import price_for
+    """(total $, 'all' | 'some' | '').
+
+    R203: this used to document a deliberate UPPER bound — "cached reads bill
+    cheaper but the discount isn't reported uniformly, so nothing is
+    subtracted". R192 retired that premise: `cached_input` is on every
+    assistant record, and the rate reconciled to the cent against a real
+    OpenRouter invoice. Kept as a note rather than deleted because the old
+    reasoning was sound when written; it is the FACTS that changed."""
+    from .providers.openai_compat import cost_for
     total, seen, missing = 0.0, False, False
     for t in turns:
         if not t.stats:
             continue
-        price = price_for(t.stats.get("model") or "")
-        if not price:
+        usd = cost_for(t.stats.get("model") or "",
+                       int(t.stats.get("billed_input")
+                           or t.stats.get("input_tokens") or 0),
+                       int(t.stats.get("output_tokens") or 0),
+                       int(t.stats.get("cached_input") or 0))
+        if usd is None:
             missing = True
             continue
         seen = True
-        total += (int(t.stats.get("billed_input")
-                      or t.stats.get("input_tokens") or 0) * price[0]
-                  + int(t.stats.get("output_tokens") or 0) * price[1]) / 1_000_000
+        total += usd
     return total, ("" if not seen else "some" if missing else "all")
 
 
@@ -288,13 +297,15 @@ def model_breakdown_lines(usage_rows: dict) -> tuple[list[str], float]:
     `/context <id>` (per-session tree, only worth printing when a session
     spans more than one model — e.g. `/fallback`, R162, or a manual
     `/model` switch mid-session). Returns (lines, priced total $)."""
-    from .providers.openai_compat import price_for
+    from .providers.openai_compat import cost_for
     out, total = [], 0.0
     for model in sorted(usage_rows):
         r = usage_rows[model]
-        price = price_for(model)
-        if price:
-            usd = (r["billed"] * price[0] + r["output"] * price[1]) / 1_000_000
+        # R203: `usage_by_model` already sums `cached` per model, so the
+        # breakdown can price it properly instead of ignoring the column it
+        # prints two fields later.
+        usd = cost_for(model, r["billed"], r["output"], r.get("cached", 0))
+        if usd is not None:
             total += usd
             money = f"${usd:,.4f}".rstrip("0").rstrip(".")
         else:

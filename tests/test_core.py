@@ -1,12 +1,16 @@
 """Core tests — no network; providers are faked. Run: python -m pytest tests/"""
 
+import json
 import os
+import sys
 import tempfile
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
+import yaml
 
 os.environ.setdefault("AURORA_HOME", tempfile.mkdtemp())
 
@@ -111,15 +115,62 @@ def test_allowlist_single_token_is_exact_match_only():
     assert approve.legacy_rules() == ["rm", "xcodebuild"]
 
 
+def test_a_file_rule_cannot_be_escaped_with_dot_dot():
+    """R195: `fnmatch`'s `*` crosses `/` (it is not glob), so a stored rule
+    of `~/project/*` matched the signature `~/project/../../etc/passwd` —
+    the traversal segments were just more characters for `*` to swallow.
+    Approving "always allow writes under my project" silently auto-approved
+    writes ANYWHERE, and `tools._resolve` only expands `~`, so the write
+    really did land outside. Same class as R141's `ls && rm -rf ~`: the
+    matcher's boundary guarantee quietly stopped holding.
+
+    Fails without the fix: every escape below is reported as allowed."""
+    rule = {"write_file": ["/tmp/proj/*"], "edit_file": [], "run_command": []}
+    for escape in ("/tmp/proj/../secret/keys.txt",
+                   "/tmp/proj/./../secret/keys.txt",
+                   "/tmp/proj//../secret/keys.txt",
+                   "/tmp/proj/sub/../../secret/keys.txt"):
+        assert not approve.is_allowed("write_file", {"path": escape}, rule), \
+            f"{escape} escaped the rule's directory"
+    # and the rule still covers what it is actually for, including nested
+    # paths (`*` crossing `/` is the INTENDED half of that behaviour)
+    assert approve.is_allowed("write_file", {"path": "/tmp/proj/ok.txt"}, rule)
+    assert approve.is_allowed("write_file",
+                              {"path": "/tmp/proj/sub/deep.txt"}, rule)
+
+
+def test_a_dot_dot_path_still_matches_the_rule_it_really_lands_in():
+    """R195: normalization is lexical and applied to BOTH sides, so a
+    traversal that resolves back INSIDE an approved directory still matches —
+    the fix removes an escape, it doesn't start rejecting honest paths."""
+    rule = {"write_file": ["/tmp/proj/*"], "edit_file": [], "run_command": []}
+    assert approve.is_allowed(
+        "write_file", {"path": "/tmp/proj/sub/../ok.txt"}, rule)
+
+
+def test_a_denied_path_cannot_be_reached_by_dot_dot_either():
+    """R195: the same normalization has to apply on the deny side, or a deny
+    rule is trivially side-stepped by spelling the path with `..` — which
+    would break R120's 'deny always wins' guarantee."""
+    deny = {"write_file": ["/tmp/proj/secret/*"]}
+    assert approve.is_denied(
+        "write_file", {"path": "/tmp/proj/sub/../secret/keys.txt"}, deny)
+
+
 def test_allowlist_safe_command_generalizes_across_args():
     # a SAFE_COMMANDS single-token rule (read-only, no destructive/exec
-    # risk) prefix-matches regardless of args — "always allow" on `find
-    # /path/A` in one session must also cover `find /path/B` in another,
+    # risk) prefix-matches regardless of args — "always allow" on `grep
+    # /path/A` in one session must also cover `grep /path/B` in another,
     # instead of re-prompting per path (R: cross-session allowlist UX)
+    approve.save({"run_command": ["grep"], "write_file": [], "edit_file": []})
+    assert approve.is_allowed("run_command", {"command": "grep -r foo /path/A"})
+    assert approve.is_allowed("run_command", {"command": "grep -r foo /totally/different"})
+    assert approve.legacy_rules() == []  # not surfaced as a stale legacy rule
+    # R190: `find` still generalizes too — the whole point of SAFE_COMMANDS —
+    # for the read-only invocations that are its ordinary use.
     approve.save({"run_command": ["find"], "write_file": [], "edit_file": []})
     assert approve.is_allowed("run_command", {"command": "find /path/A -name '*.py'"})
     assert approve.is_allowed("run_command", {"command": "find /totally/different/path"})
-    assert approve.legacy_rules() == []  # not surfaced as a stale legacy rule
 
 
 def test_allowlisted_prefix_never_approves_a_chained_command():
@@ -217,6 +268,70 @@ def test_safe_and_dangerous_command_sets_never_overlap():
     assert not (approve.SAFE_COMMANDS & approve.DANGEROUS_COMMANDS)
 
 
+def test_a_safe_command_with_a_mutating_flag_never_generalizes():
+    """R190: `find` is in SAFE_COMMANDS, which generalizes a rule across ANY
+    args — but `find` is only read-only in its ORDINARY use. The binary ships
+    `-delete`, `-fprintf`, `-fls` and `-exec`, so a single "always allow" on a
+    routine `find . -name '*.log'` stored the bare rule `find` and from then
+    on auto-approved `find / -delete`, unprompted, forever.
+
+    This is R149's bug through the opposite door: R149 stopped a KNOWN
+    destructive command generalizing over its target; this stops a command
+    MIS-CLASSIFIED as safe from generalizing at all."""
+    approve.save({"run_command": ["find"], "write_file": [], "edit_file": []})
+    for cmd in ["find / -delete",
+                "find ~ -delete",
+                "find . -name '*.log' -delete",
+                "find . -fprintf /home/me/.bashrc x",
+                "find . -fls /tmp/listing",
+                "find . -exec truncate -s 0 {} +",
+                "find . -execdir ./payload.sh {} +",
+                "find . -ok rm {} +"]:
+        assert not approve.is_allowed("run_command", {"command": cmd}), cmd
+
+
+def test_always_allow_on_a_mutating_find_stores_it_whole():
+    """The feature still works for exactly what the user was shown."""
+    rule = approve.add_rule("run_command", {"command": "find ./build -delete"})
+    assert rule == "find ./build -delete"      # stored WHOLE, not as bare `find`
+    assert approve.is_allowed("run_command", {"command": "find ./build -delete"})
+    assert not approve.is_allowed("run_command", {"command": "find / -delete"})
+
+
+def test_unsafe_flag_needs_its_own_command_present():
+    """Both halves must match — a bare `-delete` belonging to some other
+    command must not make an unrelated invocation dangerous."""
+    assert not approve._is_dangerous(approve._norm_command("myctl -delete thing"))
+    assert approve._is_dangerous(approve._norm_command("find . -delete"))
+
+
+def test_writers_and_installers_never_generalize_over_their_target(tmp_path):
+    """R190: the two-token rule stores command + FIRST arg, which for a copy/
+    move is the SOURCE — leaving the destination (the thing overwritten) free
+    to vary. For a package manager the free half is the package NAME, and the
+    package is the payload: `pip install` runs setup.py from whatever it
+    fetches."""
+    approve.save({"run_command": ["mv ./notes.md", "cp ./a", "pip install",
+                                  "docker run", "docker compose", "make build"],
+                  "write_file": [], "edit_file": []})
+    for cmd in ["mv ./notes.md /home/me/.bashrc",
+                "cp ./a /home/me/.bashrc",
+                "pip install totally-evil-package",
+                "docker run --privileged -v /:/mnt alpine cat /mnt/etc/shadow",
+                "docker compose down",
+                "make install"]:
+        assert not approve.is_allowed("run_command", {"command": cmd}), cmd
+
+
+def test_denylist_still_catches_writers_by_prefix():
+    """Same asymmetry R141/R149 already established: the added strictness is
+    allowlist-only and must never weaken a deny rule."""
+    approve.save_deny({"run_command": ["mv", "docker", "find"]})
+    assert approve.is_denied("run_command", {"command": "mv ./a /etc/passwd"})
+    assert approve.is_denied("run_command", {"command": "docker run --privileged x"})
+    assert approve.is_denied("run_command", {"command": "find / -delete"})
+
+
 def test_a_dangerous_command_is_still_denied_by_a_prefix_deny_rule():
     """R149's strictness is allowlist-only, exactly as R141's is: a denied
     `rm -rf` must still be denied for every target, or hardening the approve
@@ -230,6 +345,42 @@ def test_add_rule_stores_bare_name_for_safe_commands():
     rule = approve.add_rule("run_command", {"command": "find /path/A -name '*.py'"})
     assert rule == "find"
     assert approve.is_allowed("run_command", {"command": "find /path/B"})
+
+
+def test_config_round_trips_non_ascii_under_a_non_utf8_locale(tmp_path):
+    """R199: Aurora WRITES config.yaml as UTF-8 (`write_text_atomic`) with
+    `allow_unicode=True`, but every READ used `read_text()`/`open()` with no
+    encoding — i.e. the locale's. Under LANG=C that is ASCII, so Aurora could
+    not read back a config it had written itself, and `load_config` raised
+    UnicodeDecodeError at STARTUP: the app simply would not run.
+
+    Not a corner case — `/model add` writes OpenRouter's descriptions
+    verbatim into config.yaml, and those are full of em dashes. Same defect
+    R146b fixed in session.py.
+
+    Subprocess with LC_ALL=C because `open()` resolves its default encoding
+    in C at interpreter start; an in-process `locale` patch reproduces
+    nothing. Fails without the fix at the first `load_config`."""
+    import subprocess
+    import sys
+    path = tmp_path / "config.yaml"
+    path.write_text('models:\n  - name: main\n    model: v/m\n'
+                    '    description: "Kimi K3 — a 2.8T model"\nruntime: {}\n',
+                    encoding="utf-8")
+    script = f"""
+from aurora import config
+cfg = config.load_config({str(path)!r})
+assert sum(1 for c in cfg["models"][0]["description"] if ord(c) > 127) == 1
+config.persist_model_entry(cfg, {{"name": "x", "model": "v/m2",
+                                  "description": "dash \\u2014 and \\u00fcn\\u00efcode"}})
+again = config.load_config({str(path)!r})
+assert again["models"][-1]["description"] == "dash \\u2014 and \\u00fcn\\u00efcode"
+print("OK")
+"""
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0"}
+    r = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                       text=True, env=env)
+    assert "OK" in r.stdout, f"stdout={r.stdout!r} stderr={r.stderr[-400:]!r}"
 
 
 def test_a_crash_mid_persist_never_truncates_the_live_config(tmp_path,
@@ -963,6 +1114,106 @@ def test_clear_key_removes_from_keyring(monkeypatch):
     assert "TEST_VAR" not in fake_store
 
 
+def test_a_mistyped_passphrase_does_not_destroy_the_existing_key_store(
+        tmp_path, monkeypatch):
+    """R201: `store_key` swallowed a decrypt failure and fell back to
+    `data = {}`, then saved — replacing the WHOLE store with the one key
+    being added. The commonest way in is not corruption but a MISTYPED
+    passphrase: with OPENROUTER_API_KEY and ANTHROPIC_API_KEY already stored,
+    one typo while adding a third destroyed both, re-encrypted the file under
+    the typo, and reported success. The plaintext exists nowhere else.
+
+    Isolation per `MEMORY/bugs/20260712_000000_never-smoke-test-against-real-
+    keystore`: AURORA_HOME at a tmp dir AND a fake keyring in the same
+    process — the OS keychain is a separate store that AURORA_HOME does not
+    redirect. The fake refuses `set_password` so the encrypted-file path is
+    the one under test.
+
+    Fails without the fix: both original keys are gone."""
+    import sys
+
+    from aurora import keystore
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+
+    def _no_keyring(store):
+        mod = _fake_keyring_module(store)
+
+        def _refuse(service, name, value):
+            raise RuntimeError("no keyring backend")
+        mod.set_password = _refuse
+        return mod
+
+    monkeypatch.setitem(sys.modules, "keyring", _no_keyring({}))
+
+    def _prompter(pw):
+        return lambda label: pw if "passphrase" in label.lower() else ""
+
+    # both are module globals, so scope them to this test rather than
+    # leaking a prompter (or a cached passphrase) into whatever runs next
+    monkeypatch.setattr(keystore, "_passphrase_cache", {})
+    monkeypatch.setattr(keystore, "_prompter", _prompter("correct-horse"))
+    keystore.store_key("OPENROUTER_API_KEY", "sk-router-REAL")
+    keystore.store_key("ANTHROPIC_API_KEY", "sk-anthropic-REAL")
+    keystore.forget_passphrase()
+    assert sorted(keystore._encfile_load("correct-horse")) == [
+        "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"]
+
+    monkeypatch.setattr(keystore, "_prompter", _prompter("WRONG-passphrase"))
+    with pytest.raises(keystore.KeystoreError):
+        keystore.store_key("LLAMA_API_KEY", "sk-llama-NEW")
+    keystore.forget_passphrase()
+
+    monkeypatch.setattr(keystore, "_prompter", _prompter("correct-horse"))
+    assert sorted(keystore._encfile_load("correct-horse")) == [
+        "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"], \
+        "a mistyped passphrase destroyed the existing keys"
+    assert keystore._encfile_load("correct-horse")["OPENROUTER_API_KEY"] \
+        == "sk-router-REAL"
+
+
+def test_the_key_store_is_written_atomically_and_private(tmp_path, monkeypatch):
+    """R201: the store was `write_bytes` then `chmod(0o600)` — a crash between
+    truncate and write leaves an undecryptable blob (every key gone, since
+    nothing else holds them), and between write and chmod it carries the
+    umask's permissions."""
+    import io
+    import sys
+
+    from aurora import keystore
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+
+    def _no_keyring():
+        mod = _fake_keyring_module({})
+
+        def _refuse(service, name, value):
+            raise RuntimeError("no keyring backend")
+        mod.set_password = _refuse
+        return mod
+
+    monkeypatch.setitem(sys.modules, "keyring", _no_keyring())
+    monkeypatch.setattr(keystore, "_passphrase_cache", {})
+    monkeypatch.setattr(keystore, "_prompter", lambda label: "pw")
+    keystore.store_key("K1", "v1")
+    enc = tmp_path / "home" / "keys.enc"
+    assert enc.stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "home" / "keys.salt").stat().st_mode & 0o777 == 0o600
+
+    # the live file is never opened for writing — that is what makes a crash
+    # mid-write unable to leave it half-written
+    real_open, truncating = io.open, []
+
+    def _watch(file, mode="r", *a, **k):
+        if str(file) == str(enc) and any(c in mode for c in "wa+"):
+            truncating.append(mode)
+        return real_open(file, mode, *a, **k)
+
+    monkeypatch.setattr(io, "open", _watch)
+    keystore.store_key("K2", "v2")
+    monkeypatch.setattr(io, "open", real_open)
+    assert truncating == []
+    assert sorted(keystore._encfile_load("pw")) == ["K1", "K2"]
+
+
 def test_clear_key_on_nothing_stored_is_a_noop(monkeypatch):
     import sys
 
@@ -1337,6 +1588,43 @@ def test_agent_fails_closed_when_denylist_is_corrupt(tmp_path):
     assert not f.exists()
     assert any("denylist.yaml is unreadable" in m for _, m in
               [e for e in log if e[0] == "notify"])
+
+
+def test_agent_asks_for_approval_when_allowlist_is_corrupt(tmp_path):
+    """R196: the allowlist's counterpart to R170a. A corrupt denylist.yaml
+    was caught and failed closed; a corrupt allowlist.yaml raised
+    ApproveLoadError straight out of the agent loop, where only ProviderError
+    is caught — so a YAML typo in a file Aurora invites the user to hand-edit
+    killed the whole turn.
+
+    Empty IS fail-closed here: nothing matches, so every gated call is
+    prompted for. Fails without the fix with ApproveLoadError."""
+    approve.save_deny({})
+    (approve.aurora_home() / "allowlist.yaml").write_text("run_command: [\n - \"x\n")
+    f = tmp_path / "o.txt"
+    asked = []
+
+    prov = FakeProvider([
+        TurnResult(text="", tool_calls=[ToolCall("1", "write_file",
+                   {"path": str(f), "content": "hi"})], stop_reason="tool_use"),
+        TurnResult(text="all done", stop_reason="end"),
+    ])
+    log = []
+    cb = agent.AgentCallbacks(
+        on_text=lambda t: None,
+        on_tool_start=lambda n, a: log.append(("start", n)),
+        on_tool_result=lambda n, o: log.append(("result", n, o)),
+        approve=lambda *a, **k: (asked.append(1), "y")[1],
+        ask_continue=lambda i: True,
+        notify=lambda m: log.append(("notify", m)),
+        cancelled=lambda: False,
+    )
+    msgs = [{"role": "user", "content": "write the file"}]
+    agent.run_turn(prov, "m", msgs, "sys", cb, 5, True)
+    assert asked, "a corrupt allowlist must prompt, not pre-approve or crash"
+    assert any("allowlist.yaml is unreadable" in m for _, m in
+               [e for e in log if e[0] == "notify"])
+    assert f.read_text() == "hi"      # the turn completed rather than dying
 
 
 def test_agent_deny_option_persists_and_stops_future_prompts(tmp_path):
@@ -2168,13 +2456,6 @@ def test_bootstrap_run_choice_offers_download_only_for_url(monkeypatch):
     assert seen["keys"] == ["run", "download", "skip"]
 
 
-def test_agentic_report_cmd_no_context_found(tmp_path, monkeypatch, capsys):
-    from aurora import ui
-    monkeypatch.chdir(tmp_path)
-    ui._agentic_report_cmd(None, None)
-    assert "no context protocol folder" in capsys.readouterr().out
-
-
 def _init_repo(d, initial="v1\n"):
     import subprocess
     d.mkdir(exist_ok=True)
@@ -2338,47 +2619,6 @@ def test_commit_is_registered_in_command_dispatch():
     assert "commit" in ui.COMMAND_INFO
 
 
-def test_agentic_report_cmd_stats_choice_runs_stats_sh(tmp_path, monkeypatch, capsys):
-    from aurora import memory, ui
-    root = tmp_path / ".agentic_context"
-    (root / "KNOWLEDGE").mkdir(parents=True)
-    (root / "MEMORY").mkdir(parents=True)
-    (root / "KNOWLEDGE" / "SKILL.md").write_text("x")
-    (root / "MEMORY" / "SKILL.md").write_text("x")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(ui, "select", lambda *_a, **_k: "stats")
-    monkeypatch.setattr(memory, "run_stats", lambda r: f"STATS for {r}")
-    ui._agentic_report_cmd(None, None)
-    assert f"STATS for {root}" in capsys.readouterr().out
-
-
-def test_agentic_report_cmd_index_choice_pretty_prints_both_indexes(tmp_path, monkeypatch, capsys):
-    from aurora import mdrender, ui
-    # mdrender's markdown->ANSI is a no-op with colours off (non-tty, as
-    # capsys makes stdout) — force it on to actually exercise the
-    # pretty-printing this test is checking for
-    monkeypatch.setattr(mdrender, "RESET", "\033[0m")
-    monkeypatch.setattr(mdrender, "BOLD", "\033[1m")
-    monkeypatch.setattr(mdrender, "CYAN", "\033[36m")
-    root = tmp_path / ".agentic_context"
-    (root / "KNOWLEDGE").mkdir(parents=True)
-    (root / "MEMORY").mkdir(parents=True)
-    (root / "KNOWLEDGE" / "SKILL.md").write_text("x")
-    (root / "MEMORY" / "SKILL.md").write_text("x")
-    (root / "KNOWLEDGE" / "INDEX.md").write_text("# KNOWLEDGE index\n- `a.md` — thing\n")
-    (root / "MEMORY" / "INDEX.md").write_text("# MEMORY index\n- `b.md` — finding\n")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(ui, "select", lambda *_a, **_k: "index")
-    ui._agentic_report_cmd(None, None)
-    out = capsys.readouterr().out
-    assert "KNOWLEDGE/INDEX.md" in out and "MEMORY/INDEX.md" in out
-    assert "KNOWLEDGE index" in out and "MEMORY index" in out
-    # pretty-printed via mdrender, not raw markdown: the leading "- " bullet
-    # marker is replaced with "• " and the raw "# " header prefix is gone
-    assert "• " in out
-    assert "# KNOWLEDGE index" not in out
-
-
 # ── R164: syntax highlighting inside rendered code fences ──────────────────
 def _colours_on(monkeypatch):
     from aurora import mdrender
@@ -2469,57 +2709,6 @@ def test_colours_disabled_stays_byte_faithful_inside_a_fence():
     r.render("```python\n")
     line = "    return 42  # comment\n"
     assert r.render(line) == line
-
-
-def test_help_text_hides_agentic_report_by_default():
-    from aurora import ui
-    assert "/agentic_report" not in ui.help_text()
-    assert "/agentic_report" not in ui.help_text(False)
-    assert "/agentic_report" in ui.help_text(True)
-
-
-def test_slash_completer_hides_agentic_report_without_context(tmp_path, monkeypatch):
-    from prompt_toolkit.document import Document
-
-    from aurora import ui
-    monkeypatch.chdir(tmp_path)               # no context folder above cwd
-    comp = ui.SlashCompleter(str(tmp_path))
-    hits = list(comp.get_completions(Document("/agentic"), None))
-    assert hits == []
-
-
-def test_slash_completer_shows_agentic_report_with_context(tmp_path, monkeypatch):
-    from prompt_toolkit.document import Document
-
-    from aurora import ui
-    root = tmp_path / ".agentic_context"
-    (root / "KNOWLEDGE").mkdir(parents=True)
-    (root / "MEMORY").mkdir(parents=True)
-    (root / "KNOWLEDGE" / "SKILL.md").write_text("x")
-    (root / "MEMORY" / "SKILL.md").write_text("x")
-    monkeypatch.chdir(tmp_path)
-    comp = ui.SlashCompleter(str(tmp_path))
-    hits = list(comp.get_completions(Document("/agentic"), None))
-    assert len(hits) == 1 and hits[0].text == "agentic_report"
-
-
-def test_slash_completer_detects_context_from_cwd_not_config_dir(tmp_path, monkeypatch):
-    """R90c: detection keys on the CWD, never the config's _base_dir — the
-    config lives in the Aurora checkout, which has its own context folder,
-    so keying on it offered /agentic_report in every project."""
-    from prompt_toolkit.document import Document
-
-    from aurora import ui
-    cfg_dir = tmp_path / "checkout"
-    (cfg_dir / ".agentic_context" / "KNOWLEDGE").mkdir(parents=True)
-    (cfg_dir / ".agentic_context" / "MEMORY").mkdir(parents=True)
-    (cfg_dir / ".agentic_context" / "KNOWLEDGE" / "SKILL.md").write_text("x")
-    (cfg_dir / ".agentic_context" / "MEMORY" / "SKILL.md").write_text("x")
-    project = tmp_path / "project"
-    project.mkdir()
-    monkeypatch.chdir(project)                # cwd has no context folder
-    comp = ui.SlashCompleter(str(cfg_dir))    # ...but the config dir does
-    assert list(comp.get_completions(Document("/agentic"), None)) == []
 
 
 # ── R96a: the completer is not allowed to touch the filesystem per keystroke ─
@@ -2720,7 +2909,7 @@ def test_failed_turn_does_not_relog_the_previous_answer(tmp_path, monkeypatch):
         def assistant_message(self, r):
             return {"role": "assistant", "content": r.text}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _Prov(False))
@@ -2767,7 +2956,7 @@ def test_send_records_the_checkpoint_head_before_the_turn_runs(tmp_path, monkeyp
         def assistant_message(self, r):
             return {"role": "assistant", "content": r.text}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _Prov())
@@ -2814,7 +3003,7 @@ def test_an_exception_escaping_run_turn_still_pops_the_user_message(
         def tool_result_message(self, c, o):
             return {"role": "tool", "content": o}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _Prov())
@@ -2854,7 +3043,7 @@ def test_a_turn_stopped_at_the_gate_does_not_log_a_skip_as_the_answer(
         def tool_result_message(self, c, o):
             return {"role": "tool", "content": o}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _Prov())
@@ -2884,7 +3073,7 @@ def test_fallback_off_by_default_lets_the_error_through(tmp_path, monkeypatch):
         def assistant_message(self, r):
             return {"role": "assistant", "content": r.text}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _AlwaysFails())
@@ -2915,7 +3104,7 @@ def test_fallback_on_retries_the_same_turn_on_the_next_model(tmp_path, monkeypat
         def assistant_message(self, r):
             return {"role": "assistant", "content": r.text}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for",
@@ -2957,7 +3146,7 @@ def test_fallback_exhausted_leaves_no_reply(tmp_path, monkeypatch):
         def assistant_message(self, r):
             return {"role": "assistant", "content": r.text}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _AlwaysFails())
@@ -2989,7 +3178,7 @@ def test_cancelled_turn_does_not_fall_back_to_another_model(tmp_path, monkeypatc
         def assistant_message(self, r):
             return {"role": "assistant", "content": r.text}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _NeverCalled())
@@ -3027,7 +3216,7 @@ def test_cancelled_mid_stream_also_skips_fallback(tmp_path, monkeypatch):
         def assistant_message(self, r):
             return {"role": "assistant", "content": r.text}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _CancelledMidStream())
@@ -3067,7 +3256,7 @@ def test_cancelled_mid_tool_loop_also_skips_fallback(tmp_path, monkeypatch):
         def tool_result_message(self, call, output):
             return {"role": "tool", "tool_call_id": call.id, "content": output}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _CancelMidLoop())
@@ -3142,7 +3331,7 @@ def test_send_logs_effective_extra_body_keys(tmp_path, monkeypatch):
         def assistant_message(self, r):
             return {"role": "assistant", "content": r.text}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     prov = _Prov()
@@ -3190,7 +3379,7 @@ def test_cost_accrues_live_during_a_multi_round_turn(tmp_path, monkeypatch):
         def tool_result_message(self, c, o):
             return {"role": "tool", "content": o}
 
-        def cost(self, model, inp, out):
+        def cost(self, model, inp, out, cached=0):
             return inp * 0.001 + out * 0.01   # arbitrary linear pricing
 
     prov = _PricedProv()
@@ -3233,7 +3422,7 @@ def test_cost_visible_mid_turn_before_the_turn_finishes(tmp_path, monkeypatch):
         def tool_result_message(self, c, o):
             return {"role": "tool", "content": o}
 
-        def cost(self, model, inp, out):
+        def cost(self, model, inp, out, cached=0):
             return inp * 0.001 + out * 0.01
 
     prov = _PricedProv()
@@ -3465,6 +3654,157 @@ def test_model_picker_finds_current_by_value_not_identity(tmp_path, monkeypatch)
     monkeypatch.setattr("builtins.input", lambda *a, **k: "")  # blank = accept default
     ui._pick_model(e, ui.TerminalFrontend())
     assert e.current["model"] == "m-two"   # unchanged: default_index pointed at IT
+
+
+_CFG_OPENROUTER_PICKER = """
+providers:
+  openrouter: {type: openai, base_url: "http://y", api_key_env: PRESENT_KEY_XYZ}
+models:
+  - {model: vendor/a, provider: openrouter}
+"""
+
+
+def _openrouter_picker_engine(tmp_path, monkeypatch, cached_entry):
+    """Engine with one OpenRouter model, plus an isolated price cache (never
+    the packaged remote_context_limits.json) seeded with `cached_entry`."""
+    from aurora.engine import Engine
+    from aurora.providers import openai_compat
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PRESENT_KEY_XYZ", "some-real-key")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_CFG_OPENROUTER_PICKER)
+    monkeypatch.setattr(openai_compat, "_REMOTE_CONTEXT_LIMITS_PATH",
+                        tmp_path / "prices.json")
+    monkeypatch.setattr(openai_compat, "REMOTE_CONTEXT_LIMITS",
+                        {"vendor/a": dict(cached_entry, model="vendor/a")})
+    monkeypatch.setattr(openai_compat, "_refresh_in_flight", False)
+    return Engine(str(cfg))
+
+
+def test_model_picker_refreshes_stale_prices_in_background(tmp_path, monkeypatch):
+    # feature request, 2026-08-03: the picker used to show whatever price was
+    # last written to remote_context_limits.json, so a price OpenRouter had
+    # since changed was displayed (and budgeted against) as if current.
+    from aurora import ui
+    from aurora.providers import openai_compat
+    e = _openrouter_picker_engine(
+        tmp_path, monkeypatch,
+        {"context_size": 8000, "price_in_per_mtok": 1.0,
+         "price_out_per_mtok": 2.0})     # stale: no refreshed_at stamp at all
+    monkeypatch.setattr(openai_compat, "_looks_online", lambda *a: True)
+    monkeypatch.setattr(openai_compat, "_fetch_openrouter_catalog",
+                        lambda: ([{"id": "vendor/a", "context_length": 8000,
+                                   "pricing": {"prompt": "0.000009",
+                                               "completion": "0.000018"}}], True))
+
+    relabelled = threading.Event()
+    seen: list = []
+
+    class _Recording(ui.TerminalFrontend):
+        def update_menu_labels(self, prompt, options):
+            seen.append((prompt, options))
+            relabelled.set()
+            return True
+
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")   # accept default
+    ui._pick_model(e, _Recording())
+    assert relabelled.wait(5), "background price refresh never relabelled the menu"
+
+    prompt, options = seen[-1]
+    assert prompt == "Select model"      # the guard the TUI side matches on
+    assert "$9/$18 per M" in options[0][1]
+    # and the fresh price is persisted + live in-memory, so the NEXT open (and
+    # the status bar's $ badge) sees it without another fetch
+    entry = openai_compat.REMOTE_CONTEXT_LIMITS["vendor/a"]
+    assert (entry["price_in_per_mtok"], entry["price_out_per_mtok"]) == (9.0, 18.0)
+    assert json.loads((tmp_path / "prices.json").read_text())[0]["model"] == "vendor/a"
+    assert not openai_compat.prices_are_stale(["vendor/a"])   # stamped now
+
+
+def test_model_picker_skips_catalog_fetch_while_prices_are_fresh(
+        tmp_path, monkeypatch):
+    # TTL gate: reopening /model must not re-hit OpenRouter every time
+    from aurora import ui
+    from aurora.providers import openai_compat
+    e = _openrouter_picker_engine(
+        tmp_path, monkeypatch,
+        {"price_in_per_mtok": 1.0, "price_out_per_mtok": 2.0,
+         "refreshed_at": time.time() - 60})   # fetched a minute ago
+
+    def _no_fetch():
+        raise AssertionError("catalog fetched despite a fresh cached price")
+
+    monkeypatch.setattr(openai_compat, "_fetch_openrouter_catalog", _no_fetch)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")
+    ui._pick_model(e, ui.TerminalFrontend())
+    # ...and just past the TTL it IS stale again
+    openai_compat.REMOTE_CONTEXT_LIMITS["vendor/a"]["refreshed_at"] = (
+        time.time() - openai_compat.PRICE_TTL_SECONDS - 1)
+    assert openai_compat.prices_are_stale(["vendor/a"])
+    # a model with no cached entry at all is stale too — that's the case most
+    # worth fetching, not one to skip
+    assert openai_compat.prices_are_stale(["vendor/never-seen"])
+
+
+def test_background_price_refresh_is_offline_safe_and_not_reentrant(monkeypatch):
+    from aurora.providers import openai_compat
+    monkeypatch.setattr(openai_compat, "REMOTE_CONTEXT_LIMITS", {})
+    monkeypatch.setattr(openai_compat, "_refresh_in_flight", False)
+    calls: list = []
+
+    def _offline():
+        calls.append(1)
+        return None, False        # can't reach the catalog
+
+    monkeypatch.setattr(openai_compat, "_looks_online", lambda *a: True)
+    monkeypatch.setattr(openai_compat, "_fetch_openrouter_catalog", _offline)
+    done = []
+    assert openai_compat.refresh_prices_in_background(
+        ["vendor/a"], on_done=lambda: done.append(1)) is True
+    for _ in range(50):
+        if calls:
+            break
+        time.sleep(0.05)
+    time.sleep(0.1)
+    assert calls == [1]
+    assert done == []     # offline must not trigger a "fresh prices" repaint
+    # nothing to fetch → no thread, no network
+    monkeypatch.setattr(openai_compat, "_fetch_openrouter_catalog",
+                        lambda: (_ for _ in ()).throw(AssertionError("fetched")))
+    assert openai_compat.refresh_prices_in_background([]) is False
+    assert openai_compat.refresh_prices_in_background([None, ""]) is False
+    # a refresh already in flight → the second open doesn't start another
+    monkeypatch.setattr(openai_compat, "_refresh_in_flight", True)
+    assert openai_compat.refresh_prices_in_background(["vendor/a"]) is False
+
+
+def test_background_price_refresh_does_not_fetch_with_no_connection(monkeypatch):
+    # user, 2026-08-03: only try it if there's an internet connection — offline,
+    # the HTTP attempt is a guaranteed 10s timeout burnt behind the picker.
+    from aurora.providers import openai_compat
+    monkeypatch.setattr(openai_compat, "REMOTE_CONTEXT_LIMITS", {})
+    monkeypatch.setattr(openai_compat, "_refresh_in_flight", False)
+    monkeypatch.setattr(openai_compat, "_looks_online", lambda *a: False)
+    monkeypatch.setattr(openai_compat, "_fetch_openrouter_catalog",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("fetched while offline")))
+    openai_compat.refresh_prices_in_background(["vendor/a"])
+    for _ in range(50):     # let the thread run and clear its in-flight flag
+        if not openai_compat._refresh_in_flight:
+            break
+        time.sleep(0.05)
+    assert openai_compat._refresh_in_flight is False
+
+
+def test_online_probe_reports_offline_instead_of_raising(monkeypatch):
+    import socket
+
+    from aurora.providers import openai_compat
+    monkeypatch.setattr(socket, "getaddrinfo",
+                        lambda *a, **k: (_ for _ in ()).throw(socket.gaierror()))
+    assert openai_compat._looks_online("openrouter.ai") is False
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [("fake",)])
+    assert openai_compat._looks_online("openrouter.ai") is True
 
 
 _CFG_LOCAL_NEEDS_KEY = """
@@ -3971,6 +4311,246 @@ def test_save_remote_model_info_malformed_context_size_does_not_raise(
     assert entry["price_in_per_mtok"] == 1.0
 
 
+def _priced(monkeypatch, **prices):
+    """R192 helper: point the price table at one synthetic model."""
+    from aurora.providers import openai_compat as oc
+    monkeypatch.setattr(oc, "REMOTE_CONTEXT_LIMITS", {"vendor/m": prices})
+    return oc
+
+
+def test_cost_prices_cache_hits_at_the_cache_rate_not_the_input_rate(monkeypatch):
+    """R192: the bug that made a real session read ~4x its actual bill. Every
+    prompt token was priced as fresh input even though the provider reported
+    most of them as cache HITS, and an agentic loop resends the whole prefix
+    each round, so the overstatement grew with turn length.
+
+    Fails without the fix: the old formula returns the all-fresh figure."""
+    oc = _priced(monkeypatch, price_in_per_mtok=3.0, price_out_per_mtok=15.0,
+                 price_cache_read_per_mtok=0.3)
+    p = oc.OpenAICompatProvider.__new__(oc.OpenAICompatProvider)
+    # 1M prompt tokens of which 900k were cache hits, 10k output
+    got = p.cost("vendor/m", 1_000_000, 10_000, 900_000)
+    expected = (100_000 * 3.0 + 900_000 * 0.3 + 10_000 * 15.0) / 1_000_000
+    assert got == pytest.approx(expected)
+    assert got == pytest.approx(0.72)
+    # the all-fresh number the old formula produced — 4.3x too high
+    assert p.cost("vendor/m", 1_000_000, 10_000, 0) == pytest.approx(3.15)
+
+
+def test_cost_falls_back_to_a_tenth_of_input_when_no_cache_rate_is_listed(
+        monkeypatch):
+    """R192: entries written before the cache-rate field existed carry no
+    `price_cache_read_per_mtok`. Treating that as "no discount" is the very
+    bug being fixed, so the fallback prices a hit at 0.1x input."""
+    oc = _priced(monkeypatch, price_in_per_mtok=3.0, price_out_per_mtok=15.0)
+    p = oc.OpenAICompatProvider.__new__(oc.OpenAICompatProvider)
+    got = p.cost("vendor/m", 1_000_000, 0, 900_000)
+    assert got == pytest.approx((100_000 * 3.0 + 900_000 * 0.3) / 1_000_000)
+
+
+def test_cost_survives_a_provider_reporting_more_cached_than_prompt_tokens(
+        monkeypatch):
+    """R192: `cached` and `inp` come from different fields of the same usage
+    block. A provider reporting them inconsistently must not yield a negative
+    fresh-token count (which would price the turn BELOW zero)."""
+    oc = _priced(monkeypatch, price_in_per_mtok=3.0, price_out_per_mtok=15.0,
+                 price_cache_read_per_mtok=0.3)
+    p = oc.OpenAICompatProvider.__new__(oc.OpenAICompatProvider)
+    assert p.cost("vendor/m", 1000, 0, 5000) == pytest.approx(1000 * 0.3 / 1e6)
+    assert p.cost("vendor/m", 1000, 0, -5) == pytest.approx(1000 * 3.0 / 1e6)
+
+
+def test_catalog_entry_carries_the_cache_read_price(monkeypatch):
+    """R192: the rate has to survive the catalog→table hop, or `cost()` only
+    ever sees the fallback."""
+    from aurora.providers import openai_compat as oc
+    info = oc._model_info_from_catalog_entry(
+        {"context_length": 1000, "pricing": {"prompt": "0.000003",
+                                             "completion": "0.000015",
+                                             "input_cache_read": "0.0000003"}})
+    assert info["price_cache_read_per_mtok"] == 0.3
+    # a catalog that lists no cache rate says None, not 0 — a 0 would mean
+    # "cache reads are free", which is a different (and wrong) claim
+    assert oc._model_info_from_catalog_entry(
+        {"pricing": {"prompt": "0.000003"}})["price_cache_read_per_mtok"] is None
+
+
+def test_save_remote_model_info_persists_the_cache_read_price(
+        tmp_path, monkeypatch):
+    """R192: `_merge_model_entry` copies an explicit allowlist of price keys,
+    so a new one is dropped on the floor until it's added there."""
+    import json as _json
+
+    from aurora.providers import openai_compat as oc
+    path = tmp_path / "limits.json"
+    path.write_text("[]")
+    monkeypatch.setattr(oc, "_REMOTE_CONTEXT_LIMITS_PATH", path)
+    monkeypatch.setattr(oc, "REMOTE_CONTEXT_LIMITS", {})
+    oc.save_remote_model_info("vendor/m", {"price_in_per_mtok": 3.0,
+                                           "price_out_per_mtok": 15.0,
+                                           "price_cache_read_per_mtok": 0.3})
+    assert _json.loads(path.read_text())[0]["price_cache_read_per_mtok"] == 0.3
+
+
+def test_cached_tokens_reach_the_cost_call_round_by_round(tmp_path, monkeypatch):
+    """R192: the count is reported per ROUND and must be priced per round —
+    the first round of a turn is typically a cache MISS and later ones hits,
+    so applying one split to the turn total gets both rounds wrong.
+
+    Fails without the plumbing: `cost()` is called with cached=0 for every
+    round because `on_usage` never carried the third value."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.redact_secrets = False
+    seen = []
+
+    class _Prov:
+        api_key, extra_body, on_think, cache_prompt = "k", {}, None, False
+
+        def __init__(self):
+            self.n = 0
+
+        def turn(self, model, messages, system, tools_, on_text, cancel):
+            self.n += 1
+            if self.n == 1:   # first round: nothing cached yet
+                return TurnResult(
+                    text="", stop_reason="tool_use", input_tokens=100,
+                    output_tokens=10, cached_input_tokens=0,
+                    tool_calls=[ToolCall(id="1", name="read_file",
+                                         arguments={"path": "/nonexistent"})])
+            # second round resends the prefix — nearly all of it a cache hit
+            return TurnResult(text="done", stop_reason="end",
+                              input_tokens=200, output_tokens=20,
+                              cached_input_tokens=180)
+
+        def assistant_message(self, r):
+            return {"role": "assistant", "content": r.text}
+
+        def tool_result_message(self, c, o):
+            return {"role": "tool", "content": o}
+
+        def cost(self, model, inp, out, cached=0):
+            seen.append((inp, out, cached))
+            return 0.0
+
+    prov = _Prov()
+    monkeypatch.setattr(e, "_provider_for", lambda *a, **k: prov)
+    e._provider = prov
+    e.send("go", _FEQuiet())
+    assert seen == [(100, 10, 0), (200, 20, 180)]
+
+
+def test_a_failed_price_table_write_leaves_the_old_table_intact(
+        tmp_path, monkeypatch):
+    """R193: the table was written with `write_text`, which truncates first
+    and writes after — a crash, Ctrl+C or full disk mid-write left invalid
+    JSON behind. That failure is silent and TOTAL: `_load_remote_context_limits`
+    swallows JSONDecodeError and returns `{}`, so every model loses its
+    context limit and price at once and the ctx gauge drops to a 128k default.
+
+    Fails without the fix: the table is truncated to nothing."""
+    import json as _json
+
+    from aurora.providers import openai_compat as oc
+    good = [{"model": "vendor/keep", "provider": "openrouter", "code": "keep",
+             "context_size": 999, "price_in_per_mtok": 1.0,
+             "price_out_per_mtok": 2.0}]
+    path = tmp_path / "limits.json"
+    path.write_text(_json.dumps(good, indent=2) + "\n")
+    monkeypatch.setattr(oc, "_REMOTE_CONTEXT_LIMITS_PATH", path)
+    monkeypatch.setattr(oc, "REMOTE_CONTEXT_LIMITS", {})
+
+    # Assert the INVARIANT that makes a write crash-safe rather than trying
+    # to inject a failure: the live table file is never opened in a
+    # truncating mode at all. Injecting an exception can't compare the two
+    # mechanisms fairly — each fails at a different point — but "did anything
+    # open the real file for writing" is the same question for both, and it
+    # is exactly what decides whether a crash can leave it half-written.
+    import io
+    real_open = io.open
+    truncating = []
+
+    def _watch_open(file, mode="r", *a, **k):
+        if str(file) == str(path) and any(c in mode for c in "wa+"):
+            truncating.append(mode)
+        return real_open(file, mode, *a, **k)
+
+    monkeypatch.setattr(io, "open", _watch_open)
+    oc.save_remote_model_info("vendor/new", {"price_in_per_mtok": 5.0,
+                                             "price_out_per_mtok": 6.0})
+    monkeypatch.setattr(io, "open", real_open)
+    assert truncating == [], (
+        f"the live table was opened {truncating} — a crash mid-write would "
+        "leave it unparseable and cost every model its limit and price")
+    # and the update itself still landed
+    entries = {e["model"]: e for e in _json.loads(path.read_text())}
+    assert entries["vendor/new"]["price_in_per_mtok"] == 5.0
+    assert entries["vendor/keep"]["context_size"] == 999
+
+
+def test_price_table_writes_do_not_leave_temp_files_behind(tmp_path, monkeypatch):
+    """R193: the atomic write creates a sibling temp file. A failed write
+    must clean it up rather than litter the package directory with one
+    `.remote_context_limits.*.tmp` per crash."""
+    import json as _json
+
+    from aurora.providers import openai_compat as oc
+    path = tmp_path / "limits.json"
+    path.write_text("[]")
+    monkeypatch.setattr(oc, "_REMOTE_CONTEXT_LIMITS_PATH", path)
+    monkeypatch.setattr(oc, "REMOTE_CONTEXT_LIMITS", {})
+    oc.save_remote_model_info("vendor/a", {"price_in_per_mtok": 1.0,
+                                           "price_out_per_mtok": 2.0})
+    real_replace = oc.os.replace
+    monkeypatch.setattr(oc.os, "replace",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("nope")))
+    with pytest.raises(OSError):
+        oc.save_remote_model_info("vendor/b", {"price_in_per_mtok": 1.0,
+                                               "price_out_per_mtok": 2.0})
+    monkeypatch.setattr(oc.os, "replace", real_replace)
+    assert list(tmp_path.glob(".remote_context_limits.*")) == []
+    assert _json.loads(path.read_text())[0]["model"] == "vendor/a"
+
+
+def test_concurrent_price_table_writes_do_not_lose_an_entry(tmp_path, monkeypatch):
+    """R193: the background price refresh (R188) writes this file on its own
+    thread while the main thread can be doing `/model add`. Both did an
+    unsynchronized read-modify-write, so whichever finished second wrote back
+    a table built from a snapshot taken BEFORE the other's edit — silently
+    dropping it.
+
+    Fails without the fix: at least one model is missing from the table."""
+    import json as _json
+    import threading as _th
+
+    from aurora.providers import openai_compat as oc
+    path = tmp_path / "limits.json"
+    path.write_text("[]")
+    monkeypatch.setattr(oc, "_REMOTE_CONTEXT_LIMITS_PATH", path)
+    monkeypatch.setattr(oc, "REMOTE_CONTEXT_LIMITS", {})
+
+    # widen the read→write window so the interleaving is reliable rather than
+    # a race the test would only lose sometimes
+    real_loads = oc.json.loads
+
+    def _slow_loads(s, *a, **k):
+        time.sleep(0.02)
+        return real_loads(s, *a, **k)
+
+    monkeypatch.setattr(oc.json, "loads", _slow_loads)
+    names = [f"vendor/m{i}" for i in range(6)]
+    threads = [_th.Thread(target=oc.save_remote_model_info,
+                          args=(n, {"price_in_per_mtok": 1.0,
+                                    "price_out_per_mtok": 2.0}))
+               for n in names]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    monkeypatch.setattr(oc.json, "loads", real_loads)
+    written = {e["model"] for e in _json.loads(path.read_text())}
+    assert written == set(names), f"lost {set(names) - written}"
+
+
 def test_save_remote_model_infos_is_one_read_and_one_write_for_n_models(
         tmp_path, monkeypatch):
     """R136 review: the batch save must cost one file read + one file write
@@ -3995,13 +4575,19 @@ def test_save_remote_model_infos_is_one_read_and_one_write_for_n_models(
 
     monkeypatch.setattr(type(path), "read_text",
                         lambda self, *a, **k: _tracked_read_text())
-    real_write_text = path.write_text
+    # R193 changed the write MECHANISM (temp file + os.replace, so a crash
+    # mid-write can't corrupt the table) but not R136's contract, which is
+    # what this test guards: still one read and one write for N models.
+    # Counting `_write_entries_atomically` rather than `Path.write_text`
+    # follows the mechanism instead of quietly counting zero of a call that
+    # no longer happens.
+    real_write = oc._write_entries_atomically
 
-    def _tracked_write_text(self, data, *a, **k):
+    def _tracked_write(entries):
         writes.append(1)
-        return real_write_text(data, *a, **k)
+        return real_write(entries)
 
-    monkeypatch.setattr(type(path), "write_text", _tracked_write_text)
+    monkeypatch.setattr(oc, "_write_entries_atomically", _tracked_write)
 
     oc.save_remote_model_infos({
         "vendor/a": {"context_size": 1000, "price_in_per_mtok": 1.0,
@@ -4876,6 +5462,41 @@ def test_run_command_timeout_kills_the_whole_process_group(tmp_path):
     assert_dead(b)
 
 
+def test_run_command_output_is_bounded_for_a_runaway_command(monkeypatch):
+    """R194: `communicate()` buffered the command's COMPLETE output before any
+    truncation ran. Measured on the old path, `yes` produced 12.4GB and 9.5GB
+    of peak RSS inside a SIX SECOND timeout — enough to take the machine down,
+    and the model is the actor most likely to issue the runaway command.
+
+    Fails without the fix: capture grows to whatever the producer managed."""
+    monkeypatch.setattr(tools, "COMMAND_OUTPUT_CAP", 256 * 1024)
+    out, code = tools._run_command_once("yes ABCDEFGHIJKLMNOP", None, timeout=2)
+    assert len(out) < 2 * 1024 * 1024, f"captured {len(out)} bytes"
+    assert "output truncated" in out
+    assert code is None                      # still reported as a timeout
+
+
+def test_run_command_keeps_draining_past_the_cap(tmp_path):
+    """R194: past the cap the reads must still HAPPEN, just stop being kept.
+    Stopping the reads instead would fill the OS pipe buffer, block the child
+    on its next write, and hang the command — the R153 deadlock. A command
+    that prints more than the cap and THEN exits non-zero proves both halves:
+    it finished (so it was never blocked) and its exit code survived."""
+    script = tmp_path / "noisy.sh"
+    script.write_text("#!/bin/sh\nhead -c 400000 /dev/zero | tr '\\0' 'x'\n"
+                      "echo done\nexit 7\n")
+    script.chmod(0o755)
+    import aurora.tools as _t
+    old = _t.COMMAND_OUTPUT_CAP
+    _t.COMMAND_OUTPUT_CAP = 64 * 1024
+    try:
+        out, code = _t._run_command_once(f"sh {script}", None, timeout=20)
+    finally:
+        _t.COMMAND_OUTPUT_CAP = old
+    assert code == 7, f"command did not complete cleanly (code={code})"
+    assert "output truncated" in out
+
+
 def test_run_command_warns_when_final_reap_itself_times_out(monkeypatch):
     """R170e: `_kill_group` only reaches processes still in the killed
     group — a grandchild that escaped it (setsid, a daemonizing tool) can
@@ -4887,13 +5508,23 @@ def test_run_command_warns_when_final_reap_itself_times_out(monkeypatch):
 
     reap_timeouts = []
 
+    # R194: the runner now drains real pipes instead of calling
+    # `communicate()`, so the fake carries real fds. That models the escaped
+    # grandchild MORE closely than the old stub did: the pipes reach EOF (the
+    # shell is gone) while the process still can't be reaped.
+    def _pipe_with(data: bytes):
+        r, w = os.pipe()
+        os.write(w, data)
+        os.close(w)                      # EOF for the reader
+        return os.fdopen(r, "rb")
+
     class _FakeProc:
         pid = 12345
         returncode = None
 
-        def communicate(self, timeout=None):
-            raise _sp.TimeoutExpired(cmd="x", timeout=timeout,
-                                     output=b"partial output", stderr=b"")
+        def __init__(self):
+            self.stdout = _pipe_with(b"partial output")
+            self.stderr = _pipe_with(b"")
 
         def wait(self, timeout=None):
             reap_timeouts.append(timeout)
@@ -4913,7 +5544,10 @@ def test_run_command_warns_when_final_reap_itself_times_out(monkeypatch):
     # 5s past the command's own timeout, on top of the timeout the user
     # already waited out, for a case (escaped grandchild) this wait can't
     # even fix.
-    assert reap_timeouts == [1]
+    # R194: the first wait is the deadline-bounded reap after both pipes hit
+    # EOF (EOF is not "the process exited"); the 1s one is the post-kill
+    # anti-zombie reap this test has always guarded.
+    assert reap_timeouts[-1] == 1
 
 
 def test_gauge_uses_last_reply_not_summed_output(tmp_path, monkeypatch):
@@ -5231,7 +5865,11 @@ def test_cost_command_prices_known_models_and_flags_the_rest(tmp_path, monkeypat
     e.session.log("assistant", model="local", billed_input=999, output_tokens=1)
     out = ui._cost_report(e)
     assert "priced-model" in out and "local" in out
-    assert "$2" in out              # 1M in @$1 + 100k out @$10 = $2.00
+    # R203: was `$2` — 1M in @$1 + 100k out @$10, pricing all 1M as fresh.
+    # This fixture always said 500k of that input was a CACHE HIT, and the
+    # report has always printed a "cached" column for it; it just didn't
+    # price it. Now: 500k fresh @$1 + 500k hits @$0.10 + 100k out @$10.
+    assert "$1.55" in out
     assert "no price" in out        # local has none — never a misleading $0.00
     assert "cached" in out
 
@@ -5746,6 +6384,120 @@ def test_auto_compact_can_still_be_turned_off(tmp_path, monkeypatch):
     assert e.auto_compact_threshold_pct == 95
 
 
+def test_set_auto_compact_threshold_pct_persists(tmp_path, monkeypatch):
+    """R189: no way to change the trigger from a running session before
+    this — only hand-editing config.yaml. A small-context (64K) session
+    needs more headroom than the 80% default leaves, so this has to be
+    settable and remembered across restarts, the same way /cache and
+    /autocompact on|off already are. Reloads from the SAME config path
+    (not via `_mk_engine`, which rewrites the file back to `_CFG` and
+    would silently wipe the persisted value)."""
+    from aurora.engine import Engine
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.set_auto_compact_threshold_pct(65)
+    assert e.auto_compact_threshold_pct == 65
+    e2 = Engine(e.cfg["_path"])
+    assert e2.auto_compact_threshold_pct == 65
+
+
+def test_set_compact_keep_recent_tokens_persists(tmp_path, monkeypatch):
+    """R189: companion setter — the 20,000-token default keep-tail leaves
+    a small-context session almost no room for the fold to free anything."""
+    from aurora.engine import Engine
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.set_compact_keep_recent_tokens(8000)
+    assert e.compact_keep_recent_tokens == 8000
+    e2 = Engine(e.cfg["_path"])
+    assert e2.compact_keep_recent_tokens == 8000
+
+
+def test_a_hand_edited_bad_runtime_number_is_corrected_not_obeyed(
+        tmp_path, monkeypatch):
+    """R202: R200 range-checked the SETTERS, so `/autocompact 0` is refused —
+    but config.yaml is hand-editable and its values are read straight into
+    attributes in `Engine.__init__`, so a hand edit walked past that check and
+    reinstated the same broken states (0 auto-compacts every turn; >100
+    disables it while the UI reports it ON).
+
+    Fails without the fix: the bad value is loaded verbatim."""
+    from aurora.engine import Engine
+    e = _mk_engine(tmp_path, monkeypatch)
+    path = Path(e.cfg["_path"])
+    for bad in (0, -5, 500):
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw.setdefault("runtime", {})["auto_compact_threshold_pct"] = bad
+        path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+        e2 = Engine(str(path))
+        assert e2.auto_compact_threshold_pct == 80.0, f"{bad} was obeyed"
+        assert any("auto_compact_threshold_pct" in w
+                   for w in e2.extension_warnings), "corrected but not reported"
+
+
+def test_a_non_numeric_runtime_value_does_not_stop_aurora_starting(
+        tmp_path, monkeypatch):
+    """R202: the bare `float()`/`int()` meant a typo in a hand-editable config
+    raised ValueError out of `Engine.__init__` — Aurora simply would not
+    start. An unstartable app is a worse answer to a bad setting than a
+    corrected one, so this falls back and warns instead.
+
+    Fails without the fix with ValueError: could not convert string to
+    float."""
+    from aurora.engine import Engine
+    e = _mk_engine(tmp_path, monkeypatch)
+    path = Path(e.cfg["_path"])
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw.setdefault("runtime", {})["auto_compact_threshold_pct"] = "eighty"
+    raw["runtime"]["compact_keep_recent_tokens"] = "lots"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    e2 = Engine(str(path))                    # must not raise
+    assert e2.auto_compact_threshold_pct == 80.0
+    assert e2.compact_keep_recent_tokens == 20_000
+    assert sum("is not a number" in w for w in e2.extension_warnings) == 2
+
+
+def test_an_out_of_range_autocompact_threshold_is_refused(tmp_path, monkeypatch):
+    """R200: R189 made the threshold settable from a running session but
+    accepted any float and PERSISTED it, so one typo broke auto-compact until
+    the user hand-edited config.yaml back.
+
+    The gate is `stats.pct < threshold`. At 0 or negative it never returns
+    early, so auto-compact folds history on EVERY turn — at 5% context, with
+    a summarization request each time. Above 100 `pct` can never reach it, so
+    it never fires again while the UI keeps reporting it ON: a safety
+    mechanism silently off, which is worse than one visibly off.
+
+    Fails without the fix: every value below is accepted and written to
+    config.yaml."""
+    from aurora.engine import Engine
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.set_auto_compact_threshold_pct(65)
+    for bad in (0, -5, 101, 500):
+        with pytest.raises(ValueError, match="threshold"):
+            e.set_auto_compact_threshold_pct(bad)
+    # neither the live value nor the persisted one moved
+    assert e.auto_compact_threshold_pct == 65
+    assert Engine(e.cfg["_path"]).auto_compact_threshold_pct == 65
+    # the legal edges still work
+    e.set_auto_compact_threshold_pct(100)
+    e.set_auto_compact_threshold_pct(0.5)
+    assert e.auto_compact_threshold_pct == 0.5
+
+
+def test_a_non_positive_keep_tail_is_refused(tmp_path, monkeypatch):
+    """R200: `compact_history` reads `keep_recent_tokens=0` as the MANUAL
+    `/compact` sentinel meaning "fold the ENTIRE history". Persisted as the
+    auto value it means every auto-compact discards the current turn too —
+    the opposite of what the setting exists for."""
+    from aurora.engine import Engine
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.set_compact_keep_recent_tokens(8000)
+    for bad in (0, -1, -20000):
+        with pytest.raises(ValueError, match="keep"):
+            e.set_compact_keep_recent_tokens(bad)
+    assert e.compact_keep_recent_tokens == 8000
+    assert Engine(e.cfg["_path"]).compact_keep_recent_tokens == 8000
+
+
 def test_auto_compact_fires_only_past_threshold(tmp_path, monkeypatch):
     import types
 
@@ -6082,7 +6834,7 @@ def test_session_log_records_approvals_and_real_tool_size(tmp_path, monkeypatch)
         def tool_result_message(self, call, output):
             return {"role": "tool", "tool_call_id": call.id, "content": output}
 
-        def cost(self, m, i, o):
+        def cost(self, m, i, o, cached=0):
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _Prov())
@@ -6794,3 +7546,567 @@ def test_context_tree_never_merges_across_a_different_approval(tmp_path, monkeyp
     assert len(body) == 2
     assert "(x2)" in body[0] and "✅" in body[0]
     assert "(x" not in body[1] and "⛔" in body[1]
+
+
+def test_context_badge_and_the_live_cost_agree_on_the_same_turn(monkeypatch):
+    """R203: R192 taught the provider's `cost()` about cache reads but left
+    `/context`'s badge, its session total, the per-model breakdown, and a
+    RESUMED session's seed each computing `billed * in + out * out` from
+    `price_for()`. One live session then reported two different figures for
+    itself — on the real 2026-08-09 kimi-k3 turn, $32.50 in `/context`
+    against $4.74 in the status bar, where $4.74 is what OpenRouter charged.
+
+    Fails without the fix: the badge reads ~7x the live figure."""
+    from aurora import ctxtree
+    from aurora.providers import openai_compat
+    monkeypatch.setitem(openai_compat.REMOTE_CONTEXT_LIMITS, "m",
+                        {"model": "m", "price_in_per_mtok": 3.0,
+                         "price_out_per_mtok": 15.0,
+                         "price_cache_read_per_mtok": 0.3})
+    stats = {"model": "m", "input_tokens": 200_000, "billed_input": 10_675_848,
+             "output_tokens": 31_741, "cached_input": 10_283_008}
+    live = openai_compat.cost_for("m", 10_675_848, 31_741, 10_283_008)
+    assert live == pytest.approx(4.7395, abs=0.001)   # the real invoice
+    badge = next(p for p in ctxtree._badges(stats).split("│") if "$" in p)
+    assert f"{live:,.4f}".rstrip("0").rstrip(".") in badge
+
+
+def test_every_priced_surface_uses_one_rule(monkeypatch):
+    """R203: the fix is having ONE pricing function, not four copies that
+    happen to agree today. Per-turn badge, session total and per-model
+    breakdown must all land on the same number for the same usage."""
+    from aurora import ctxtree
+    from aurora.providers import openai_compat
+    monkeypatch.setitem(openai_compat.REMOTE_CONTEXT_LIMITS, "m",
+                        {"model": "m", "price_in_per_mtok": 3.0,
+                         "price_out_per_mtok": 15.0,
+                         "price_cache_read_per_mtok": 0.3})
+    billed, out_tok, cached = 1_000_000, 10_000, 900_000
+    expected = openai_compat.cost_for("m", billed, out_tok, cached)
+
+    turn = types.SimpleNamespace(stats={
+        "model": "m", "billed_input": billed, "output_tokens": out_tok,
+        "cached_input": cached})
+    total, coverage = ctxtree._session_cost([turn])
+    assert total == pytest.approx(expected) and coverage == "all"
+
+    _, breakdown_total = ctxtree.model_breakdown_lines(
+        {"m": {"turns": 1, "input": billed, "billed": billed,
+               "output": out_tok, "cached": cached}})
+    assert breakdown_total == pytest.approx(expected)
+
+
+# ── R206: the classic REPL emitted escapes straight to the terminal ────────
+def _repl_output(fn, *a, **k) -> str:
+    import io
+
+    from aurora import ui
+    fe = ui.TerminalFrontend(render_md=False)
+    buf, old = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        getattr(fe, fn)(*a, **k)
+    finally:
+        sys.stdout = old
+    return buf.getvalue()
+
+
+def test_the_classic_repl_does_not_emit_escapes_to_the_terminal():
+    """R206: R170l/R171/R204 stripped OSC/DCS payloads for the TUI, whose own
+    comment notes prompt_toolkit owns rendering and never passes raw bytes
+    through — so there the concern was what got STORED and copied out. The
+    `--classic` REPL has no such intermediary: it writes model and tool output
+    straight to stdout, so an OSC 52 there does not merely get stored, it
+    actually sets the user's clipboard. The more exposed of the two frontends
+    was the one without the guard.
+
+    Fails without the fix: every payload below reaches the terminal."""
+    osc = "\x1b]52;c;bG9va2F0dGhpcw==\x07"
+    assert "\x1b]52" not in _repl_output("on_text", f"reply{osc} end")
+    assert "\x1b]52" not in _repl_output("on_think", f"thinking{osc} on")
+    assert "\x1b]52" not in _repl_output(
+        "on_tool_result", "run_command", f"output{osc} more")
+    # tool ARGUMENTS are model-authored too
+    assert "\x1b]52" not in _repl_output(
+        "on_tool_start", "run_command", {"command": f"echo {osc} hi"})
+
+
+def test_the_classic_repl_still_shows_the_real_text_and_colours():
+    """R206 guard against over-stripping: only OSC/DCS/APC/PM/SOS go. Plain
+    CSI colour codes are how the REPL renders at all."""
+    out = _repl_output("on_text", "before\x1b[31mred\x1b[0mafter")
+    assert "before" in out and "red" in out and "after" in out
+    assert "\x1b[31m" in out and "\x1b[0m" in out
+
+
+def test_both_frontends_share_one_escape_rule():
+    """R206: the sanitizer moved to `colors.py` so the two frontends cannot
+    drift apart again — which is exactly how this bug existed. `tui` keeps an
+    alias, so nothing that referenced it there had to change."""
+    from aurora import colors, tui
+    assert tui._strip_dangerous_escapes is colors.strip_dangerous_escapes
+
+
+def test_export_and_scaffold_survive_a_non_utf8_locale(tmp_path):
+    """R207: R199 pinned UTF-8 on every READ of a file Aurora writes; these
+    two WRITE paths were missed. `/export` used `open(out, "w")` — the locale's
+    encoding — so exporting a transcript containing an em dash, a non-English
+    reply, or unicode in a code block raised UnicodeEncodeError under LANG=C,
+    and mode "w" truncates BEFORE it encodes, so the failure left a 0-byte .md
+    behind. `extensions.scaffold` had the same shape: `tool_name` is slugified
+    to ASCII but `name` is the user's raw text, and a 0-byte .py is then
+    something the next startup tries to load as an extension.
+
+    Subprocess under LC_ALL=C, as R193a established. Fails without the fix:
+    the export raises and leaves an empty file."""
+    import subprocess
+    script = f"""
+import os
+os.environ["AURORA_HOME"] = {str(tmp_path / "home")!r}
+os.chdir({str(tmp_path)!r})
+from aurora.session import Session
+from aurora import session as sessions, extensions
+from aurora.paths import write_text_atomic
+s = Session()
+s.log("user", text="a dash \\u2014 like this")
+s.log("assistant", text="an em dash \\u2014 yes", model="m")
+out = "aurora-session-%s.md" % s.id
+write_text_atomic(out, sessions.export_markdown(s.id))
+data = open(out, "rb").read()
+assert data.count("\\u2014".encode()) == 2, data
+p = extensions.scaffold("caf\\u00e9 tool")
+assert p.stat().st_size > 0
+print("OK")
+"""
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0"}
+    r = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                       text=True, env=env, cwd=str(tmp_path))
+    assert "OK" in r.stdout, f"stdout={r.stdout!r} stderr={r.stderr[-400:]!r}"
+
+
+def test_a_failed_export_does_not_leave_a_truncated_file(tmp_path, monkeypatch):
+    """R207: the export lands whole or not at all. `open(out, "w")` truncated
+    an existing export the moment it opened, so a re-export that then failed
+    destroyed the previous one too."""
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "export.md"
+    target.write_text("PREVIOUS EXPORT", encoding="utf-8")
+    real_replace = os.replace
+    monkeypatch.setattr(
+        os, "replace",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    from aurora.paths import write_text_atomic
+    with pytest.raises(OSError):
+        write_text_atomic(target, "NEW CONTENT")
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert target.read_text(encoding="utf-8") == "PREVIOUS EXPORT"
+    assert list(tmp_path.glob(".export.md.*")) == []      # no temp litter
+
+
+def test_copy_and_export_do_not_carry_terminal_escapes(tmp_path, monkeypatch):
+    """R208: the sanitizer's comment has claimed since R170l that "neither
+    the display NOR anything copied out of it (/copy-all, session export)
+    carries the raw sequence". Only the first half held. The TUI sanitizes
+    its own `_chat` DISPLAY buffer, but `/copy-all` and `/export` both read
+    `session.export_markdown()`, which walks the session JSONL — written by
+    the engine from the RAW model text, which passes through none of that.
+
+    So a payload in a reply reached the user's CLIPBOARD, where pasting into
+    a terminal fires it, and the exported .md, where `cat` does.
+
+    Fails without the fix: both carry the raw OSC 52."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    from aurora import ui
+    from aurora.session import Session
+
+    osc = "\x1b]52;c;bG9va2F0dGhpcw==\x07"
+    session = Session()
+    session.log("user", text="hi")
+    session.log("assistant", text=f"reply{osc} end", model="m")
+
+    engine = types.SimpleNamespace(
+        session=session,
+        nth_response=lambda n: f"reply{osc} end")
+
+    assert "\x1b]52" not in ui._all_chat_text(engine)     # /copy-all, /export
+    assert "\x1b]52" not in ui._outbound(engine.nth_response(1))   # /copy
+    assert "reply" in ui._all_chat_text(engine)           # content survives
+
+
+def test_copy_last_sanitizes_both_of_its_sources(tmp_path, monkeypatch):
+    """R208: `_last_copyable_text` picks between the raw model reply and the
+    TUI's captured shell output — the two sources the sanitizer exists for,
+    and both go straight to the clipboard."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    from aurora import ui
+    from aurora.session import Session
+
+    osc = "\x1b]52;c;WFhY\x07"
+    engine = types.SimpleNamespace(
+        session=Session(), messages=[],
+        last_prompt=lambda: "", last_response=lambda: "")
+    fake_tui = types.SimpleNamespace(
+        _last_bash_output=f"cmd out{osc} tail",
+        _last_bash_at=100.0, _last_llm_at=1.0)
+    fe = types.SimpleNamespace(_tui=fake_tui, think_buffer="")
+    text, label = ui._last_copyable_text(engine, fe)
+    assert label == "command output" and "\x1b]52" not in text
+    assert "cmd out" in text and "tail" in text
+
+
+def test_a_symlink_out_of_an_approved_directory_is_refused(tmp_path):
+    """R209: closes the residual R195 recorded as open. R195 normalized `..`
+    purely lexically and left symlinks, on the grounds that catching them
+    needs `resolve()` and a glob rule has no filesystem identity to resolve.
+
+    It does have one for the LITERAL part: split the rule at its first glob
+    character, resolve that prefix, re-attach the tail. Then an allowlist
+    match requires BOTH the lexical and the resolved pair to agree — a link
+    inside an approved directory pointing outside satisfies the first (the
+    path really is under the rule) and fails the second.
+
+    Fails without the fix: the symlink is auto-approved."""
+    proj, secret = tmp_path / "proj", tmp_path / "secret"
+    proj.mkdir()
+    secret.mkdir()
+    (secret / "keys.txt").write_text("SECRET", encoding="utf-8")
+    (proj / "innocent.txt").symlink_to(secret / "keys.txt")
+    rule = {"write_file": [f"{proj}/*"], "edit_file": [], "run_command": []}
+
+    assert not approve.is_allowed(
+        "write_file", {"path": str(proj / "innocent.txt")}, rule)
+    # the ordinary cases must be untouched
+    assert approve.is_allowed("write_file", {"path": str(proj / "ok.txt")}, rule)
+    assert approve.is_allowed(
+        "write_file", {"path": str(proj / "sub" / "deep.txt")}, rule)
+    assert not approve.is_allowed(
+        "write_file", {"path": str(proj / ".." / "secret" / "k")}, rule)
+
+
+def test_an_approved_directory_reached_through_a_symlink_still_matches(tmp_path):
+    """R209's over-prompting trap, and why BOTH sides are resolved rather
+    than just the signature. On macOS `/tmp` is itself a symlink to
+    `/private/tmp`, so comparing a resolved signature against an unresolved
+    rule would break every ordinary rule underneath it and re-prompt forever.
+    Resolving the rule's literal prefix too makes the two meet."""
+    real = tmp_path / "real"
+    (real / "proj").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (real / "proj" / "escape").symlink_to(outside)
+
+    rule = {"write_file": [f"{link}/proj/*"], "edit_file": [], "run_command": []}
+    assert approve.is_allowed(
+        "write_file", {"path": str(link / "proj" / "f.txt")}, rule)
+    # …and the escape is still caught when reached through that same link
+    assert not approve.is_allowed(
+        "write_file", {"path": str(link / "proj" / "escape" / "evil")}, rule)
+
+
+def test_the_denylist_is_not_narrowed_by_the_resolved_check(tmp_path):
+    """R209: `is_denied` matches on EITHER the lexical or the resolved pair.
+    Requiring both, as the allowlist does, would let a symlink spelling slip
+    past a deny rule — and R120's "deny always wins" must not be narrowed by
+    the change that tightened the allow side."""
+    proj = tmp_path / "proj"
+    (proj / "secret").mkdir(parents=True)
+    deny = {"write_file": [f"{proj}/secret/*"]}
+    assert approve.is_denied(
+        "write_file", {"path": str(proj / "sub" / ".." / "secret" / "k")}, deny)
+    assert approve.is_denied(
+        "write_file", {"path": str(proj / "secret" / "k")}, deny)
+
+
+def test_piped_input_actually_runs_a_turn(tmp_path):
+    """R213: `--classic` is what `__main__.py` documents as the fallback for
+    "pipes, CI" — and piped input could not be submitted at all.
+
+    From a TERMINAL, Enter arrives as `\\r` (c-m). From a PIPE, every line ends
+    with `\\n`, which IS c-j — and the REPL bound c-j to "insert a newline".
+    So each piped line was appended to the buffer, never accepted; EOF then
+    discarded the lot. `echo hello | aurora --classic` exited 0 having printed
+    nothing, logged nothing, and run no turn.
+
+    Driven as a real subprocess against an unreachable provider, because the
+    bug only exists when stdin is genuinely not a tty — which is precisely
+    why reading the code did not reveal it.
+
+    Fails without the fix: no session file, no turn."""
+    import subprocess
+    import sys
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "providers:\n  dead:\n    base_url: \"http://127.0.0.1:9/v1\"\n"
+        "    api_key: \"none\"\n"
+        "models:\n  - name: dead\n    provider: dead\n"
+        "    model: vendor/dead-model\n    tools: true\n"
+        "runtime:\n  auto_compact: false\n", encoding="utf-8")
+    home = tmp_path / "home"
+    env = {**os.environ, "AURORA_HOME": str(home)}
+    r = subprocess.run([sys.executable, "-m", "aurora", "--classic", str(cfg)],
+                       input="hello\n", capture_output=True, text=True,
+                       env=env, cwd=str(tmp_path), timeout=120)
+
+    logs = list((home / "sessions").glob("*.jsonl")) if (home / "sessions").exists() else []
+    assert logs, f"no session written — the turn never ran. stdout={r.stdout[-300:]!r}"
+    text = logs[0].read_text(encoding="utf-8")
+    assert '"event": "user"' in text and "hello" in text
+    # and the failure was actually reported, not swallowed
+    assert "unreachable" in r.stdout or "unreachable" in r.stderr
+
+
+def test_ctrl_j_still_inserts_a_newline_for_an_interactive_user(monkeypatch):
+    """R213 guard against over-correcting: Ctrl+J is a documented editing key
+    (the REPL's own tooltip row advertises it). It must stay bound whenever
+    stdin IS a tty — the fix is scoped to the piped case."""
+    import inspect
+
+    from aurora import ui
+    src = inspect.getsource(ui.run)
+    assert "if sys.stdin.isatty():" in src
+    idx = src.index("if sys.stdin.isatty():")
+    assert '@kb.add("c-j")' in src[idx:idx + 200], \
+        "the c-j binding is no longer guarded by the tty check"
+
+
+# ── R214: EOF at a menu killed the session instead of answering safely ─────
+def _eof_input(monkeypatch):
+    import builtins
+
+    def _raise(*a, **k):
+        raise EOFError("EOF when reading a line")
+
+    monkeypatch.setattr(builtins, "input", _raise)
+
+
+def test_eof_at_the_approval_gate_stops_instead_of_approving(monkeypatch):
+    """R214: `select()` called bare `input()`, so EOF propagated out of the
+    approval gate and killed the session with a traceback, mid-turn. Two ways
+    in, both ordinary: Ctrl+D at the prompt, and piped/CI input running out —
+    `echo /model | aurora --classic` reproduced it exactly.
+
+    It cannot be handled by looping the way a blank Enter is: EOF repeats
+    instantly, so re-prompting spins forever. The answer therefore has to be
+    a value, and for an approval the only safe one is "stop the agent" —
+    never "yes".
+
+    Fails without the fix: EOFError."""
+    from aurora import ui
+    _eof_input(monkeypatch)
+    fe = ui.TerminalFrontend(render_md=False)
+    key, note = fe.approve("run_command", {"command": "rm -rf /"}, "")
+    assert key == "s", f"EOF answered {key!r} at an approval gate"
+    assert note == ""
+
+
+def test_eof_at_the_other_gates_fails_safe(monkeypatch):
+    """R214: same for every menu that guards an action — the iteration cap
+    stops, a confirm answers no regardless of its default (each one guards
+    something that writes or spends), and the secret challenge stops rather
+    than keeping an unredacted value."""
+    from aurora import ui
+    _eof_input(monkeypatch)
+    fe = ui.TerminalFrontend(render_md=False)
+    assert fe.ask_continue(10) == (False, "")
+    assert ui.confirm("Run the fetch command?", default_yes=True) is False
+    assert ui.confirm("Save this?", default_yes=False) is False
+
+
+def test_select_without_an_eof_key_still_raises(monkeypatch):
+    """R214: `eof_key` is a required decision, not a default — the safe answer
+    differs per menu and only the caller knows it. A caller that passes
+    nothing gets the EOFError re-raised, which `run()` now ends the session on
+    cleanly rather than tracebacking."""
+    from aurora import ui
+    _eof_input(monkeypatch)
+    with pytest.raises(EOFError):
+        ui.select("pick", [("a", "A"), ("b", "B")])
+    assert ui.select("pick", [("a", "A"), ("b", "B")], eof_key="b") == "b"
+
+
+def test_a_menu_command_over_a_pipe_exits_cleanly(tmp_path):
+    """R214 end-to-end: `/model` opens a picker, and with piped input the
+    picker hits EOF. Before, that printed a traceback and exited 1."""
+    import subprocess
+    import sys
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "providers:\n  dead:\n    base_url: \"http://127.0.0.1:9/v1\"\n"
+        "    api_key: \"none\"\n"
+        "models:\n  - name: dead\n    provider: dead\n"
+        "    model: vendor/dead-model\n    tools: true\n", encoding="utf-8")
+    env = {**os.environ, "AURORA_HOME": str(tmp_path / "home")}
+    r = subprocess.run([sys.executable, "-m", "aurora", "--classic", str(cfg)],
+                       input="/model\n", capture_output=True, text=True,
+                       env=env, cwd=str(tmp_path), timeout=120)
+    assert r.returncode == 0, r.stdout[-400:] + r.stderr[-400:]
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+def test_the_health_probe_survives_having_no_model_configured(tmp_path, monkeypatch):
+    """R215: `_provider_for` returns None with no model configured —
+    reachable via `/model remove` of the last entry (R81), or a `models: []`
+    config. `context_stats` already guards that exact case; the startup
+    health probe did not, so it died with an AttributeError on its own daemon
+    thread and dumped a traceback to stderr before the banner. Nothing caught
+    it because nothing was meant to — the probe is fire-and-forget, so the
+    process still exited 0 and the failure was pure noise plus a lost check.
+
+    Fails without the fix: AttributeError on NoneType.api_key."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    from aurora.engine import Engine
+    cfg = tmp_path / "empty.yaml"
+    cfg.write_text("providers: {}\nmodels: []\n", encoding="utf-8")
+    e = Engine(str(cfg))
+    assert e._provider_for(e.current) is None      # the precondition
+    assert e._provider_health_uncached() == {"ok": False,
+                                             "detail": "no model configured"}
+    assert e.provider_health()["ok"] is False      # and through the cache
+
+
+def test_startup_with_no_model_is_clean_and_says_so(tmp_path):
+    """R215 end-to-end: no traceback on stderr, exit 0, and the banner names
+    the state instead of rendering the literal word "None" beside it."""
+    import subprocess
+    import sys
+    cfg = tmp_path / "empty.yaml"
+    cfg.write_text("providers: {}\nmodels: []\n", encoding="utf-8")
+    env = {**os.environ, "AURORA_HOME": str(tmp_path / "home")}
+    r = subprocess.run([sys.executable, "-m", "aurora", "--classic", str(cfg)],
+                       input="hello\n", capture_output=True, text=True,
+                       env=env, cwd=str(tmp_path), timeout=120)
+    assert r.returncode == 0
+    assert "Traceback" not in r.stdout + r.stderr
+    assert "no model configured" in r.stdout
+    assert "model    None" not in r.stdout
+    # and the turn still tells the user what to do about it
+    assert "/model" in r.stdout
+
+
+def test_a_yaml_typo_in_the_config_is_a_message_not_a_traceback(tmp_path):
+    """R216: config.yaml is hand-edited — R199 and R202 both turned on that
+    fact — so a YAML typo is a normal event, not a corruption scenario. It
+    surfaced as a raw `yaml.parser.ParserError` traceback out of `main()`.
+    The allowlist has had `ApproveLoadError` for exactly this since R170a;
+    the config, which users edit far more often, had nothing.
+
+    The parser's own message names the file, line and column, so it is kept —
+    the traceback around it was the noise.
+
+    Fails without the fix: a ParserError traceback and no useful first line."""
+    import subprocess
+    import sys
+    cfg = tmp_path / "bad.yaml"
+    cfg.write_text("providers: {\nmodels: [\n", encoding="utf-8")
+    env = {**os.environ, "AURORA_HOME": str(tmp_path / "home")}
+    r = subprocess.run([sys.executable, "-m", "aurora", "--classic", str(cfg)],
+                       input="hello\n", capture_output=True, text=True,
+                       env=env, cwd=str(tmp_path), timeout=120)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1
+    assert "Traceback" not in out
+    assert "not valid YAML" in out
+    assert "line 3" in out          # the parser's own location survives
+
+
+def test_health_distinguishes_no_model_from_no_provider(tmp_path, monkeypatch):
+    """R216: `_provider_for` returns None for two DIFFERENT reasons, and R215
+    reported both as "no model configured" — which the banner rendered beside
+    the model's own name as `model v/m  ✘ no model configured`, a line that
+    contradicts itself. A model naming a `provider:` the config doesn't
+    define is a different fault and gets a different sentence.
+
+    Fails without the fix: both cases say "no model configured"."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    from aurora.engine import Engine
+
+    none_cfg = tmp_path / "none.yaml"
+    none_cfg.write_text("providers: {}\nmodels: []\n", encoding="utf-8")
+    assert Engine(str(none_cfg))._provider_health_uncached()["detail"] \
+        == "no model configured"
+
+    noprov = tmp_path / "noprov.yaml"
+    noprov.write_text("models:\n  - name: x\n    model: v/m\n", encoding="utf-8")
+    detail = Engine(str(noprov))._provider_health_uncached()["detail"]
+    assert "no model configured" not in detail
+    assert "provider" in detail
+
+    # A model naming a provider the config does not DEFINE is a third case
+    # and takes a different path entirely: `make_provider` returns a real but
+    # keyless provider, so it never reaches the None branch above. It is
+    # already reported unhealthy, and the request itself fails with a readable
+    # "missing an 'http'" error rather than a crash. Pinned so the three cases
+    # stay distinguished.
+    dangling = tmp_path / "dangling.yaml"
+    dangling.write_text("providers: {}\nmodels:\n  - name: x\n"
+                        "    provider: nope\n    model: v/m\n", encoding="utf-8")
+    e3 = Engine(str(dangling))
+    assert e3._provider_for(e3.current) is not None
+    assert e3._provider_health_uncached()["ok"] is False
+
+
+def test_an_unusable_aurora_home_is_explained_not_tracebacked(tmp_path):
+    """R217: everything persistent goes through `aurora_home()` — sessions,
+    allowlist, key store, checkpoints — and both it and `sessions_dir()` did a
+    bare `mkdir(parents=True, exist_ok=True)`. An unusable AURORA_HOME
+    therefore surfaced as a raw PermissionError/FileExistsError traceback out
+    of whichever caller touched it first.
+
+    Both causes are environment mistakes a user can fix — AURORA_HOME set to a
+    file, or pointing somewhere unwritable (a read-only mount, a stale entry
+    in a shell rc) — so each deserves a sentence naming the variable.
+
+    Fails without the fix: a pathlib traceback."""
+    from aurora.paths import AuroraHomeError, aurora_home, sessions_dir
+
+    as_file = tmp_path / "not-a-dir"
+    as_file.write_text("", encoding="utf-8")
+    os.environ["AURORA_HOME"] = str(as_file)
+    try:
+        with pytest.raises(AuroraHomeError, match="not a directory"):
+            aurora_home()
+    finally:
+        os.environ.pop("AURORA_HOME", None)
+
+    readonly = tmp_path / "ro"
+    readonly.mkdir()
+    readonly.chmod(0o555)
+    os.environ["AURORA_HOME"] = str(readonly)
+    try:
+        with pytest.raises(AuroraHomeError, match="sessions directory"):
+            sessions_dir()
+    finally:
+        os.environ.pop("AURORA_HOME", None)
+        readonly.chmod(0o755)
+
+
+def test_a_usable_aurora_home_still_just_works(tmp_path, monkeypatch):
+    """R217 guard: the wrapper must be invisible on the normal path — it
+    creates the directory and returns it, exactly as the bare mkdir did."""
+    from aurora.paths import aurora_home, sessions_dir
+    target = tmp_path / "fresh" / "nested"
+    monkeypatch.setenv("AURORA_HOME", str(target))
+    assert aurora_home() == target and target.is_dir()
+    assert sessions_dir() == target / "sessions"
+    assert (target / "sessions").is_dir()
+
+
+def test_startup_with_an_unusable_home_exits_cleanly(tmp_path):
+    """R217 end-to-end: exit 1, no traceback, and the message names
+    AURORA_HOME so the user knows which knob to turn."""
+    import subprocess
+    import sys
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text("providers: {}\nmodels: []\n", encoding="utf-8")
+    as_file = tmp_path / "home-is-a-file"
+    as_file.write_text("", encoding="utf-8")
+    env = {**os.environ, "AURORA_HOME": str(as_file)}
+    r = subprocess.run([sys.executable, "-m", "aurora", "--classic", str(cfg)],
+                       input="hi\n", capture_output=True, text=True,
+                       env=env, cwd=str(tmp_path), timeout=120)
+    out = r.stdout + r.stderr
+    assert r.returncode == 1
+    assert "Traceback" not in out
+    assert "AURORA_HOME" in out

@@ -6,6 +6,154 @@ was published — check `aurora --man` or `python3 -c "import aurora;
 print(aurora.__version__)"` for what you're actually running. For the full
 numbered requirements record, see `CHANGELOG_TECHNICAL.md` (formerly
 `AURORA.md`).
+## 1.1.348 (2026-08-13)
+
+Mostly a hardening release. A long review pass went through every module
+looking for the same kinds of mistake in more than one place, and most of what
+it found is invisible until the day it isn't: money reported wrongly, a file
+restored as an empty file, an approval rule that didn't cover what you thought
+it covered. If you use Aurora daily, the cost figures and `/undo` are the two
+you'll notice.
+
+### Added
+- **Opening `/model` refreshes its prices in the background.** The picker's
+  `$x/$y per M` figures came from whatever was last written to
+  `remote_context_limits.json` (by `/model add`, or by the model calling the
+  `refresh_model_prices` tool), so a price OpenRouter had since changed was
+  shown — and charged against — as if it were current. The catalog is now
+  re-pulled off-thread while the menu is up, and the rows are relabelled in
+  place if the answer arrives before you pick. Rate-limited to once a day per
+  model, skipped entirely when the network isn't reachable, and silent on
+  failure: offline, opening `/model` looks exactly as it did before.
+
+- **Menu rows can be clicked**, not just navigated with `↑/↓` and Enter — the
+  `/model` picker, the Esc-Esc confirms, and the copy picker. A click selects
+  that row outright, matching the status bar's buttons, which have been
+  clickable for a while. The hint now reads `Enter/click select`.
+
+
+Prompted by pairing Aurora with the `agentic_context_mcp` server: with the
+built-in `.agentic_context` integration gone (1.1.304), MCP is the only route
+to it, so the client's failure modes matter more. Full detail in
+`CHANGELOG_TECHNICAL.md` under R187.
+
+### Fixed
+
+**Costs were wrong — by a lot.**
+- **The `$` figure counted cached input at full price.** Every prompt token
+  was billed as fresh, but on a tool-heavy turn Aurora re-sends the whole
+  conversation each round and your provider serves most of it from its prompt
+  cache at a fraction of the rate. On one real day's session the status bar
+  read **$32.50 against an actual OpenRouter charge of $4.74**. Cache hits are
+  now priced properly and the figure reconciles to the cent.
+- **`/cost` and `/context` disagreed with the status bar** about the same
+  session — the same numbers, ~7x apart, both on screen. Every place that
+  shows a price now uses one shared calculation. Historical figures move
+  *down* as a result: they now report what those sessions actually cost.
+
+**Your files and your keys.**
+- **`/undo` could destroy the file it was restoring.** Any file that wasn't
+  valid UTF-8 — a latin-1 source file, anything binary — came back with its
+  undecodable bytes replaced, and Aurora reported success. Under a non-UTF-8
+  locale (`LANG=C`, common in CI and minimal containers) it was worse: the
+  restore truncated the file and *then* failed, leaving it empty. Snapshots
+  are now byte-exact and the write is atomic.
+- **One mistyped key-store passphrase erased every stored API key.** Adding a
+  key while getting the passphrase wrong silently replaced the whole encrypted
+  store with just the new key, re-encrypted under the typo, and said
+  "stored". Aurora now refuses and writes nothing. It also stops asking you to
+  *"Choose a key-store passphrase"* when one already exists — the wording that
+  invited the typo.
+- **Aurora couldn't start under `LANG=C` if your config had a non-ASCII
+  character** — an em dash in a model description was enough, and `/model add`
+  writes those itself. `/export` hit the same wall and left a 0-byte file.
+
+**Approval and safety.**
+- **A file rule could be escaped.** "Always allow" on `~/project/*` also
+  approved `~/project/../../etc/passwd`, and a symlink inside the directory
+  pointing outside it. Writes anywhere on disk, no prompt. Both closed.
+- **Terminal escape sequences reached your terminal.** A model reply or
+  command output containing a clipboard-hijack sequence was filtered in the
+  full-screen TUI but not in `--classic`, not in the reasoning stream, and not
+  in what `/copy-all` and `/export` handed you. All four now filtered.
+- **Ctrl+D at an approval prompt killed the session** with a traceback,
+  mid-turn, instead of cancelling. It now stops the agent — never approves.
+  The same fix covers piped input running out.
+
+**Crashes and runaway resources.**
+- **A runaway command could exhaust memory.** `run_command` buffered
+  everything a command printed; a command like `yes` reached ~12GB inside a
+  six-second timeout. Output is now capped while still letting the command
+  finish. An MCP server sending one very long line could do the same.
+- **A corrupt `allowlist.yaml` killed the turn.** It now asks for approval on
+  everything until you fix it, matching what a corrupt denylist already did.
+- **Tracebacks replaced with explanations** for things you can actually fix:
+  a YAML typo in `config.yaml`, an `AURORA_HOME` that points at a file or
+  isn't writable, and starting with no model configured (which also crashed a
+  background thread).
+- **`aurora --classic` ignored piped input entirely.** It's documented as the
+  mode for pipes and CI, and `echo "..." | aurora --classic` exited 0 having
+  done nothing at all. It runs the turn now.
+- **A failing status bar went silent**, quietly dropping to the word "aurora"
+  with no clue why. It now marks itself and records the error once.
+
+### Performance
+- **Long sessions no longer slow down as the transcript grows.** Every new
+  block of output re-scanned the entire transcript; a session with 12k blocks
+  spent **96 seconds** on that bookkeeping, now 1.4. Streaming speed is
+  unchanged.
+
+### Changed
+- `/autocompact` rejects values that would break it. `0` made it fold your
+  history every single turn; anything above `100` silently disabled it while
+  still reporting "ON". Out-of-range values in `config.yaml` are corrected
+  with a warning rather than obeyed — or, previously, crashing at startup.
+- The `agentic-context` example in `config.yaml.example` now pins the
+  instance path as an argument and sets `timeout: 45`.
+- **One misbehaving MCP server no longer costs you every other server's
+  tools.** A server returning a tool with no name made *all* `mcp_*` tools
+  disappear, warning only `mcp_extension.py failed to register: KeyError:
+  'name'` — which didn't say whose fault it was. Bad tool entries are now
+  skipped individually and reported against the server that sent them.
+- **A repeated `name:` in `mcp_servers:` leaked a background process** that
+  stayed alive for the whole session. The duplicate is now refused with a
+  clear warning — its tools were unreachable anyway, since the name prefixes
+  every tool as `mcp_<name>_<tool>`.
+- **`timeout:` on an `mcp_servers:` entry now works** (and is documented). It
+  was accepted by the client but never read from config, leaving a fixed 15s
+  ceiling — and crossing it kills the server *permanently* for the session,
+  with no reconnect. That collided with `agentic_context_mcp`, which allows
+  its own scripts 30s, so a slow context operation could take the server down
+  with no way to raise the limit. Invalid values warn and fall back instead of
+  producing a ceiling that kills everything.
+- **A single malformed extension file no longer stops Aurora from starting.**
+  An extension whose `SPEC` wasn't a list of objects crashed startup outright
+  with a traceback; it's now skipped with a warning, and the rest of your
+  extensions still load. A spec with no name is also skipped rather than
+  offered to the model as an uncallable tool.
+
+- **A chatty-but-stuck MCP server could hang a turn indefinitely.** A server
+  that keeps sending progress notifications but never the actual reply now
+  hits an absolute ceiling (8x its `timeout`) instead of blocking forever.
+- Closing an MCP server no longer leaves a zombie process behind when the
+  child ignores SIGTERM, and its pipes are now closed rather than waiting on
+  garbage collection.
+- A server that answers the handshake with a **different MCP protocol
+  version** now says so in the warnings instead of looking identical to one
+  that agreed. Recorded only — the server is still used.
+
+## 1.1.304 (2026-07-29)
+
+### Removed
+- The built-in `.agentic_context` integration (`context.py`, `memory.py`):
+  system-prompt bootstrap of AGENTS.md/the three INDEX.md/`[CORE]` docs,
+  `open_context_doc`, `/remember`, and `/agentic_report` (plus its TUI
+  status-bar link) are gone. Replaced by the `agentic_context_mcp` MCP
+  server, which exposes the same operations (`read_rules`, `list_index`,
+  `read_doc`, `write_memory`, `stats`, plus tagging/promotion the built-in
+  version never had) as regular approval-gated MCP tools instead of
+  hardcoded Aurora code — see `config.yaml`'s `mcp_servers:`. `/bootstrap`
+  (the saved free-text first-turn prompt) is unaffected.
 
 ## 1.1.303 (2026-07-27)
 

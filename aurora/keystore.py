@@ -11,11 +11,17 @@ import json
 import os
 from collections.abc import Callable
 
-from .paths import aurora_home
+from .paths import aurora_home, write_bytes_atomic
 
 _SERVICE = "aurora-agent"
 _ENC_FILE = "keys.enc"
 _passphrase_cache: dict[str, bytes] = {}
+
+
+class KeystoreError(Exception):
+    """R201: raised instead of silently replacing a key store that could not
+    be read back. Named so callers can report it as a normal refusal rather
+    than a traceback — the user mistyped a passphrase, which is not a bug."""
 
 # Secret prompter — injected by the caller (the UI) so the engine never owns
 # terminal I/O. Signature: (label) -> entered string ('' = skip/cancel).
@@ -57,8 +63,10 @@ def _fernet(passphrase: str):
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     salt_path = aurora_home() / "keys.salt"
     if not salt_path.exists():
-        salt_path.write_bytes(os.urandom(16))
-        salt_path.chmod(0o600)
+        # R201: same atomic+mode path as the store itself. A salt is not
+        # secret, but a half-written one is worse than none: it would derive
+        # a different key and make an existing store undecryptable.
+        write_bytes_atomic(salt_path, os.urandom(16), mode=0o600)
     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
                      salt=salt_path.read_bytes(), iterations=600_000)
     return Fernet(base64.urlsafe_b64encode(kdf.derive(passphrase.encode())))
@@ -72,9 +80,11 @@ def _encfile_load(passphrase: str) -> dict:
 
 
 def _encfile_save(passphrase: str, data: dict) -> None:
-    p = aurora_home() / _ENC_FILE
-    p.write_bytes(_fernet(passphrase).encrypt(json.dumps(data).encode()))
-    p.chmod(0o600)
+    # R201: atomic, and 0600 before the file is visible — a half-written key
+    # store is an unrecoverable one, since nothing else holds the plaintext.
+    write_bytes_atomic(aurora_home() / _ENC_FILE,
+                       _fernet(passphrase).encrypt(json.dumps(data).encode()),
+                       mode=0o600)
 
 
 def _encfile_get(name: str, interactive: bool = True) -> str | None:
@@ -167,13 +177,41 @@ def store_key(env_var: str, value: str) -> str:
         return "OS keyring"
     pw = _passphrase_cache.get("pw")
     if pw is None:
-        pw = _prompter("Choose a key-store passphrase: ").encode()
+        # R201: "Choose" is only true for a NEW store. Asking someone to
+        # "choose" a passphrase when an encrypted store already exists invites
+        # exactly the typo that used to wipe it — they answer as if setting
+        # one, not recalling one.
+        label = ("Choose a key-store passphrase: "
+                 if not (aurora_home() / _ENC_FILE).exists()
+                 else "Aurora key-store passphrase: ")
+        pw = _prompter(label).encode()
         _passphrase_cache["pw"] = pw
-    data = {}
-    try:
-        data = _encfile_load(pw.decode())
-    except Exception:
-        pass
+    # R201: a decrypt failure here used to be swallowed, leaving `data` as
+    # `{}` — and the save below then replaced the WHOLE store with just this
+    # one key. The commonest way to reach it is not corruption but a MISTYPED
+    # passphrase: with an existing store holding OPENROUTER_API_KEY and
+    # ANTHROPIC_API_KEY, one typo while adding a third key destroyed both,
+    # re-encrypted the file under the typo, and reported success. Verified
+    # end-to-end before the fix — the correct passphrase then raised
+    # InvalidToken against a store containing only the new key.
+    #
+    # "No file yet" is the one case where an empty dict is genuinely right,
+    # and it is distinguishable without decrypting anything, so the two are
+    # split apart rather than both landing in one `except`.
+    if not (aurora_home() / _ENC_FILE).exists():
+        data = {}
+    else:
+        try:
+            data = _encfile_load(pw.decode())
+        except Exception as e:
+            # Drop the bad passphrase so the next attempt re-prompts rather
+            # than failing again against the cached typo.
+            _passphrase_cache.pop("pw", None)
+            raise KeystoreError(
+                "the existing key store could not be decrypted — wrong "
+                "passphrase, or the file is damaged. Nothing was written: "
+                "saving now would replace every key already in it."
+            ) from e
     data[env_var] = value
     _encfile_save(pw.decode(), data)
     return "encrypted file"

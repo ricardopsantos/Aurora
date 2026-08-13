@@ -66,14 +66,19 @@
   (ported from the Terminal-Agent V2 prototype); `/skills` lists them.
 
 ### Context & memory
-- **R12.** **agentic_context protocol** (see `~/repositories/AgenticContext`):
-  when the cwd has `.agentic_context/`, Aurora bootstraps it at start —
+- **R12.** *(Removed 2026-07-29 at the user's request: this built-in
+  integration — `context.py`/`memory.py`, `open_context_doc`, `/remember`,
+  `/agentic_report` — was replaced by the `agentic_context_mcp` MCP server,
+  which exposes the same operations as regular approval-gated MCP tools
+  instead of hardcoded Aurora code. See `config.yaml`'s `mcp_servers:`.)*
+  ~~**agentic_context protocol** (see `~/repositories/AgenticContext`): when
+  the cwd has `.agentic_context/`, Aurora bootstraps it at start —
   `AGENTS.md` (rules AND personality; the user shapes who Aurora is through
   the context system, not code), the three `INDEX.md`s, `[CORE]` docs,
   `rebuild-index.sh` self-heal. The per-task protocol (consult MEMORY before,
   write qualifying findings + rebuild after, flag `[PROMOTE?]`) is embedded in
   the system prompt so Aurora runs it herself; her writes pass the normal
-  approval gate. `open_context_doc` lazy-loads docs on summary match.
+  approval gate. `open_context_doc` lazy-loads docs on summary match.~~
 - **R13.** Live footer, updated every turn:
   `model │ tokens used/max (%) │ $cost │ session-id`. Token counts are the
   provider's own `usage` from the response. The context LIMIT comes from
@@ -480,7 +485,8 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   never break a switch (best-effort).
 
 ### Aurora writes its own memory (2026-07-10, R52)
-- **R52. `/remember`** (`memory.py`): the bootstrap READS `.agentic_context`;
+- **R52.** *(Removed 2026-07-29 along with R12 — see that entry.)*
+  ~~**`/remember`** (`memory.py`): the bootstrap READS `.agentic_context`;
   this closes the loop — the agent reviews the session transcript against
   MEMORY/SKILL.md's write-criteria (non-obvious + will recur + too narrow
   for KNOWLEDGE; most sessions yield 0-2 findings, none is a good answer),
@@ -492,7 +498,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   2 redrafts). After any write the context's own `rebuild-index.sh` runs
   so the INDEX never drifts. The context root is the nearest
   `.agentic_context/` (with a `MEMORY/`) walking up from cwd. memory.py is
-  engine-side: all output goes through `fe.notify`, never print().
+  engine-side: all output goes through `fe.notify`, never print().~~
 
 ### Three-area TUI layout (2026-07-11, R53–R56)
 - **R53. The full-screen TUI is three fixed areas, top to bottom, and each
@@ -1418,7 +1424,8 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   network isn't reachable.
 
 ### `/remember` scoped save + ~/AURORA_PFCS fallback (2026-07-22, R87; fallback path revised same day)
-- **R87. `/remember [all|last [k]]`** controls how much of the session
+- **R87.** *(Removed 2026-07-29 along with R12 — see that entry.)*
+  ~~**`/remember [all|last [k]]`** controls how much of the session
   `memory.py` checks before saving: no argument or `last` checks just the
   last question/reply pair, `last k` the last `k` pairs, `all` the whole
   session (the original R52 scope, still what "save everything" means
@@ -1427,8 +1434,8 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   it, so a multi-iteration tool-call reply is kept whole. A malformed
   argument (e.g. `last abc`) prints usage instead of guessing. Restored to
   `/` autocomplete and the README table (superseding the 2026-07-12
-  hide-while-reworking note above).
-- **`~/AURORA_PFCS/MEMORY/` fallback when there's no real `.agentic_context`
+  hide-while-reworking note above).~~
+- ~~**`~/AURORA_PFCS/MEMORY/` fallback when there's no real `.agentic_context`
   (originally `AURORA_MEMORY/` at the project root; revised same day).**
   `find_context_root` now requires BOTH a `KNOWLEDGE/` and a `MEMORY/`
   subfolder to count — a bare `MEMORY/` alone no longer qualifies. When
@@ -1440,10 +1447,11 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   Same house `.md` format (title/`> summary:`/discovered/context/body) via
   `render_finding(..., flat=True)`, but no group subfolders and no
   INDEX.md/rebuild-index.sh step (that tooling is specific to
-  `.agentic_context`) — the notify message says so explicitly.
+  `.agentic_context`) — the notify message says so explicitly.~~
 
 ### `find_context_root` detects by contents, never by folder name (2026-07-22, R88)
-- **R88. `memory.find_context_root` no longer hardcodes `.agentic_context`
+- **R88.** *(Removed 2026-07-29 along with R12 — see that entry.)*
+  ~~**`memory.find_context_root` no longer hardcodes `.agentic_context`
   as a literal path segment.** It walks up from cwd and, at each ancestor,
   checks every immediate subfolder for BOTH a `KNOWLEDGE/SKILL.md` and a
   `MEMORY/SKILL.md` — whichever subfolder has both, regardless of its own
@@ -1451,17 +1459,18 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   (and what this repo itself uses), but a differently-named folder with
   the same shape is now found too. Requiring the `SKILL.md` files (not
   just the `KNOWLEDGE`/`MEMORY` dirs) rules out an unrelated folder that
-  happens to have similarly-named subfolders with no actual content.
+  happens to have similarly-named subfolders with no actual content.~~
 
 ### `/agentic_report` command + status-bar link (2026-07-22, R89)
-- **R89. `/agentic_report`** (`ui._agentic_report_cmd`): asks "Stats" or
+- **R89.** *(Removed 2026-07-29 along with R12 — see that entry.)*
+  ~~**`/agentic_report`** (`ui._agentic_report_cmd`): asks "Stats" or
   "Index" via the normal `select()` menu. **Stats** runs the context
   folder's own `scripts/stats.sh` (size/count stats for
   KNOWLEDGE/MEMORY/SKILLS — `memory.run_stats`) as-is. **Index**
   pretty-prints `KNOWLEDGE/INDEX.md` and `MEMORY/INDEX.md` through
   `mdrender.LineRenderer` (the same markdown→ANSI renderer chat replies
-  use) instead of dumping raw markdown.
-- **Only exists as far as the user is concerned when a context protocol
+  use) instead of dumping raw markdown.~~
+- ~~**Only exists as far as the user is concerned when a context protocol
   folder is detected** (`memory.find_context_root(".")`, by contents —
   R88): hidden from `/` autocomplete (`SlashCompleter.__init__` computes
   `self._has_agentic_context` once per completer lifetime, not per
@@ -1469,15 +1478,15 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   appends the `/agentic_report` line only when true). Typing it manually
   when nothing is detected still works and just says so — same
   discoverability-only pattern as `/remember`'s 2026-07-12 hide (R52's
-  note above).
-- **The TUI's line-1 status bar shows a clickable, underlined "agentic
+  note above).~~
+- ~~**The TUI's line-1 status bar shows a clickable, underlined "agentic
   report" link** — same `class:status.id` style as "session id"/"copy
   last"/"copy all" — under the same detection, cached once as
   `self._agentic_root` in `Tui.__init__` (not re-walked on every render
   tick). Clicking it (`_agentic_report_click`) queues `/agentic_report`
   onto the worker's inbox exactly like the model-picker click queues
   `/model` — the Stats/Index choice is a blocking `select()`, which must
-  never run on the UI thread.
+  never run on the UI thread.~~
 
 ### Deep-dive batch 3: boundary guard, tool reach, gauge, scan cost (2026-07-22, R90)
 From a full requirements-vs-code review of the whole project.
@@ -1504,7 +1513,8 @@ From a full requirements-vs-code review of the whole project.
     the model to "read a specific range" after a big file; there was no
     parameter to do it with, so its only recourse was re-reading the same
     head. The notice now names the parameters.
-- **R90c. ONE context-root detector, shared by every surface.** R88 made
+- **R90c.** *(Removed 2026-07-29 along with R12 — see that entry.)*
+  ~~ONE context-root detector, shared by every surface. R88 made
   `memory.find_context_root` name-agnostic (by contents: an immediate
   subfolder with BOTH `KNOWLEDGE/SKILL.md` and `MEMORY/SKILL.md`, hidden or
   not, nearest first walking up) but `context.py` — the module that does the
@@ -1518,7 +1528,7 @@ From a full requirements-vs-code review of the whole project.
   - Call sites unified on the **CWD** as well: the `/`-autocomplete and
     `/help` gates keyed on the config's `_base_dir`, which is the Aurora
     checkout — it has its own context folder, so `/agentic_report` was
-    offered in every project and then reported "nothing detected" when run.
+    offered in every project and then reported "nothing detected" when run.~~
 - **R90d. The context gauge counts what's actually in the window.** It read
   `input_tokens + output_tokens`, where `input_tokens` is the LAST request's
   prompt but `output_tokens` is the SUM of completions across every
@@ -6549,3 +6559,1491 @@ matching how `/compact`/a model switch already show up in place. Tests:
 
 Cross-references bumped in this commit (per `ChangeWorkflow.md`):
 `README.md`'s "currently through R__" line, R185 → R186.
+
+### R187. Deep-dive review of the MCP client and extension loading — `mcp.py`, `extensions.py`, `tools.py`, `engine.py` (2026-07-29)
+
+A read-through of `aurora/mcp.py` + `aurora/extensions.py` prompted by pairing
+Aurora with the `agentic_context_mcp` server. Removing the built-in
+`.agentic_context` integration (release 1.1.304) made MCP the *only* route to
+that context system, so the client's failure modes now matter more than they
+did when MCP was purely additive. Every item below was reproduced against a
+real fixture server before being fixed.
+
+**R187a. One server's malformed `tools/list` silently disabled EVERY server's
+tools — `mcp.MCPServer._discover_tools`.** `tools/list` output is the
+server's data and was stored verbatim, so `_to_aurora_spec`'s
+`mcp_tool['name']` raised `KeyError` for an entry without a name. The raise
+happens inside `specs()`/`runners()`, which run in
+`mcp_extension.register()` — *after* `MCPManager.__init__`'s per-server
+`try/except` has already returned. So the "one bad server must never take
+down the others, or Aurora itself" guarantee that constructor exists to
+provide did not hold at all: `extensions.discover()` caught the error one
+level up, the whole extension failed to register, and every healthy server's
+tools went with it. The only warning was `extension mcp_extension.py failed
+to register: KeyError: 'name'`, naming no server — so the user could not tell
+which `mcp_servers:` entry was at fault. Verified: one healthy `echo` server
+plus one nameless-tool server yielded **zero** mcp tools. Fixed by validating
+each entry where the data arrives: non-dict entries, and names that aren't a
+non-blank string, are dropped into `self.tool_warnings` (bounded by `_brief`,
+same reasoning as `_STDERR_QUOTE_CHARS`) and collected by `MCPManager` into
+its existing per-server `errors` surface, so a bad entry costs exactly that
+entry and is attributed to the server that sent it. A `tools/list` that isn't
+a list at all is a protocol breach rather than one bad entry, so it still
+fails that server — via `_fail`, which routes through the same
+`__init__` cleanup that keeps R145a's no-leaked-child guarantee. Tests:
+`test_malformed_tool_entries_are_dropped_not_raised`,
+`test_one_malformed_server_does_not_lose_a_healthy_servers_tools`,
+`test_tools_list_that_isnt_a_list_fails_that_server_only`,
+`test_a_malformed_server_leaves_no_orphaned_child`, plus fixture
+`tests/fixtures/malformed_tools_mcp_server.py` (the first three fail without
+the fix).
+
+**R187b. A duplicate `mcp_servers:` name orphaned a live child process for the
+whole session — `mcp.MCPManager.__init__`.** `self._servers[name] =
+MCPServer(...)` overwrote the earlier entry, dropping the only reference to a
+child that had *already* been spawned and handshaked. `close_all()` iterates
+the dict's values, so neither it nor the `atexit` hook could reach the
+displaced server — it outlived the session, holding its pipes. Same leak class
+as R145a, reached from the other side: there the object was never stored
+because `__init__` raised; here it was stored and then displaced. Verified
+with a control — two entries with *unique* names left 0 processes alive after
+`close_all()`, two with the same name left 1. Fixed by rejecting a repeated
+name *before* spawning anything, which also keeps the tool namespace honest:
+two servers sharing a name generate colliding `mcp_<name>_<tool>` specs, so
+one set was unreachable regardless of which server won the dict slot — making
+"skip the duplicate" the same outcome the model already saw, minus the leak.
+Test: `test_duplicate_server_name_is_refused_before_spawning` (asserts the
+refused entry is never started *and* that nothing survives `close_all()`;
+fails without the fix).
+
+**R187c. A server's `timeout:` never left `config.yaml` — `mcp.MCPManager`.**
+`MCPServer.__init__` accepted `timeout` from the start, but the manager called
+`MCPServer(name, command, c.get("args"), env)` and never passed it, so the
+15s default was unreachable and `config.yaml.example` documented no such key.
+That matters more than a normal unconfigurable default, because crossing the
+timeout is **unrecoverable**: `_read_response` calls `_kill_unresponsive`, and
+there is no reconnect anywhere in `MCPManager` — the next call gets
+`connection closed: Broken pipe`, permanently. Verified end to end: one slow
+call, then `child still alive? False`, then every subsequent call broken. And
+it collides with a real server — `agentic_context_mcp` sets
+`_SCRIPT_TIMEOUT_SECONDS = 30` as its own designed ceiling, so any script run
+between 15s and 30s (a `validate.sh`/`rebuild-index.sh` over a large
+instance; ~2s on this repo's 37-file one, but the framework advertises
+instances up to 214k tokens) killed the context server mid-session with no
+way for the user to raise the client's limit. Fixed: `timeout:` is forwarded,
+validated (non-numeric/zero/negative warns and falls back rather than
+producing a ceiling that kills every server on its first call), documented in
+`config.yaml.example`, and the agentic-context example there now sets 45 —
+above the server's own 30 — with the reasoning inline. The 15s default moved
+to a named `_DEFAULT_TIMEOUT` so the client and the docs can't drift.
+**Not fixed here:** the missing reconnect. Killing an unresponsive child is
+R126's deliberate behavior and re-establishing one mid-turn needs its own
+design (re-handshake, re-discover tools, decide whether a retry is safe when
+the tool may have already run) — the configurable ceiling removes the forced
+failure, which is the part that made this a live production hazard. Tests:
+`test_config_timeout_is_forwarded_to_the_server`,
+`test_timeout_defaults_when_not_configured`,
+`test_an_invalid_timeout_warns_and_falls_back_to_the_default` (5 cases);
+6 of the 7 fail without the fix.
+
+**R187d. One malformed extension file stopped Aurora from starting at all —
+`tools.set_extensions`, `engine.py`.** `extensions.py`'s docstring promises it
+"never lets one broken extension take the rest of the session down", and
+`discover()` does guard both the import and `register()`. But the merge step
+after it — `tools.set_extensions(ext_specs, ext_runners)` at `engine.py`'s
+construction — ran bare, and it calls `spec.get("name")`. A user extension
+whose static `SPEC` isn't a list of dicts (`SPEC = ["oops"]`, or a dict, whose
+`extend` yields its keys as strings) therefore raised `AttributeError: 'str'
+object has no attribute 'get'` straight out of `Engine.__init__`: Aurora
+refused to start, with a raw traceback, over one file in
+`~/.aurora/extensions/`. Fixed on both levels — `set_extensions` skips a
+non-dict spec and one whose name isn't a non-blank string (each with a
+warning), and the call site catches anything else, records it, and continues
+with no extension tools rather than failing construction. The nameless case
+was its own smaller bug: `None` is in neither `builtin_names` nor `seen`, so
+such a spec was KEPT and shipped to the model, while `None in runners` left it
+without a runner — a tool advertised and permanently uncallable. Tests:
+`test_set_extensions_skips_a_spec_that_isnt_an_object`,
+`test_set_extensions_skips_a_nameless_spec`,
+`test_a_broken_extension_file_does_not_prevent_engine_construction` (all
+three fail without the fix; the last one constructs a real `Engine` with a
+deliberately broken file on disk and asserts the healthy bundled tools still
+load).
+
+**R187e. Three smaller client-lifecycle and protocol gaps — `mcp.MCPServer`.**
+
+*The per-read deadline reset had no absolute ceiling.* `_read_response` resets
+its deadline on every chunk that arrives, which is R126's deliberate "don't
+kill a server that's still talking" rule — but with no upper bound, a server
+emitting `notifications/progress` in a loop and never the matching reply
+blocked forever, on the turn's own thread. Verified: with the cap removed the
+new test does not finish in 25s (its own bound is 6.2s). Now capped at
+`timeout * _MAX_TOTAL_WAIT_MULT` (8x), which leaves a genuinely busy server
+its full per-read allowance and only fires on a stream that is alive but never
+answering.
+
+*`close()` could leave a zombie.* Its fallback path called `kill()` with no
+following `wait()`, so a child ignoring SIGTERM was killed and never reaped,
+holding a process-table slot until Aurora exited. `_kill_unresponsive` always
+did kill-then-wait correctly; only this path was wrong.
+
+*stdin/stdout were never closed.* Only stderr was, by the drain thread — so
+two descriptors per server stayed open until the `Popen` object was garbage
+collected. A slow fd leak for a long session with several servers. Both
+teardown paths now end in `_close_pipes()`.
+
+*The handshake result was discarded.* `_initialize` sent `protocolVersion` and
+threw the reply away, so a server answering with a different version was
+indistinguishable from one that agreed, and the mismatch surfaced later as
+whatever unrelated-looking symptom it caused. Now recorded in
+`MCPServer.warnings` (renamed from `tool_warnings` in this commit, since it
+now carries more than tool complaints) and surfaced through `MCPManager.errors`
+— **recorded, not enforced**: the spec expects a client to accept a server's
+version or fail, but Aurora can't know which differences matter, and refusing a
+server that would have worked is a worse regression than the ambiguity.
+
+Tests: `test_an_endlessly_chattering_server_still_hits_an_absolute_ceiling`,
+`test_close_reaps_the_child_and_closes_its_pipes`,
+`test_a_killed_child_also_has_its_pipes_closed`,
+`test_a_protocol_version_mismatch_is_recorded_but_not_fatal`,
+`test_a_matching_protocol_version_produces_no_warning`, plus fixture
+`tests/fixtures/babbling_mcp_server.py`. Each of the first four fails (or, for
+the ceiling, hangs) with its own fix reverted — verified one at a time, since
+reverting all three at once hangs the run.
+
+Cross-references bumped in the R187a commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line and `documents/ARCHITECTURE.md`'s
+two `R1–R__+` spans, R186 → R187.
+
+### R188. Menu rows are clickable, like the status bar's buttons — `tui.py` (2026-07-29)
+
+The arrow-key menu (`select_menu` / `_open_ui_menu` — `/model`, the Esc-Esc
+confirms, the copy picker) was keyboard-only: `↑/↓`, digit-jump, Enter. The
+status bar's buttons have been clickable since R134g/R155, so a user who taps
+a status-bar item and then gets a menu had no reason to expect the mouse to
+stop working there.
+
+`_menu_fragments()` now attaches a `_menu_row_click(i)` handler as each option
+row's third fragment element — the same `(style, text, handler)` shape the
+status bar's clickable fragments already use. A click on `MOUSE_UP` sets
+`_menu_index` and calls `_resolve_menu(index)`, so it commits to the row the
+way Enter does (there is no hover-only state in a terminal to justify
+click-to-highlight-then-confirm). Routing through `_resolve_menu` is what
+makes it work for BOTH menu paths for free: the blocking worker-thread
+`select_menu()` (answers queue) and the UI-thread `_open_ui_menu()`
+(callback) already converge there. Non-`MOUSE_UP` events are ignored, as in
+every other handler in this file, so a drag across the pane can't answer a
+menu. The hint reads `↑/↓ move · Enter/click select · number to jump`.
+
+**Process note:** the implementation landed in R187a's commit
+(`9a02fd6`) unintentionally — `git add -A aurora` swept up the
+already-edited `tui.py` while committing an unrelated MCP fix, and that
+commit message doesn't mention it. Recorded here rather than rewritten out of
+five commits of history; this entry and its tests are the missing halves of
+`ChangeWorkflow.md`'s three-part rule for it. Tests:
+`test_menu_rows_carry_a_mouse_handler` (fails without the fragment change),
+`test_clicking_a_menu_row_picks_that_row`,
+`test_a_menu_row_ignores_everything_but_mouse_up` (tests/test_tui.py).
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R187 → R188, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R189. Auto-compact threshold/keep-tail are tunable, not just on/off — `engine.py`, `ui.py`, `config.yaml` (2026-08-02)
+
+`auto_compact_threshold_pct` (default 80) and `compact_keep_recent_tokens`
+(default 20,000) were read from `runtime:` in `config.yaml` but had no
+setter and no `/set`-style command — the only way to change them was hand-
+editing the file, and there was no way at all to change them from inside a
+running session. On a small context window (64K), the gap between the 80%
+trigger and the hard limit is ~13K tokens, thin enough that a single
+reasoning-heavy round (Qwen3/DeepSeek-R1-style `<think>` output routinely
+5-20K tokens) can overflow the window in one generation — before the
+mid-turn compact check (`_maybe_auto_compact_mid_turn`, which only runs
+*before building each request after the first*) ever gets a chance to fold
+anything, since it can't interrupt a request that's already in flight.
+
+`Engine.set_auto_compact_threshold_pct(pct)` and
+`Engine.set_compact_keep_recent_tokens(n)` persist through the existing
+`persist_runtime_value` path (same as `set_auto_compact`). `/autocompact`
+now parses three forms: `on`/`off` (unchanged), a bare number (sets the
+threshold pct), and `keep=<tokens>` (sets the keep-tail size) — `ui.py`'s
+`cmd == "autocompact"` branch. `config.yaml`'s `runtime:` section now ships
+`auto_compact_threshold_pct: 65` and `compact_keep_recent_tokens: 8000` as
+this machine's defaults, sized for 64K local models (more headroom before
+the danger zone, and a fold that actually frees enough room to matter on a
+small window).
+
+Tests: `test_set_auto_compact_threshold_pct_persists`,
+`test_set_compact_keep_recent_tokens_persists` (`tests/test_core.py`).
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R188 → R189, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R190. `find` is not read-only: a SAFE_COMMANDS rule could auto-approve `find / -delete` — `approve.py` (2026-08-06)
+
+`SAFE_COMMANDS` generalizes in the widest way the allowlist offers:
+`_rule_for` stores the BARE command name and `_matches` lets that
+single-token rule prefix-match any args. That is deliberate and useful —
+"always allow" on `find /path/A` should cover `find /path/B` next session
+instead of re-prompting per path.
+
+But the list's premise ("nothing here writes, deletes, or executes
+arbitrary code") is a claim about the command NAME, and for `find` it only
+holds for how `find` is *usually* invoked. The binary ships `-delete`,
+`-fprintf`, `-fls`, `-exec` and `-execdir`. So one "always allow" on a
+routine `find . -name '*.log'` stored the rule `find`, and from then on
+**`find / -delete` was auto-approved, unprompted, forever.** Verified
+against the real matcher before the fix.
+
+This is R149's bug arriving through the opposite door. R149 stopped a
+command *known* to be destructive from generalizing over its target; R190
+stops a command *mis-classified as safe* from generalizing at all. Note
+`find . -exec rm {} +` was already caught — but only because `rm` is a
+token, so `-exec truncate`, `-exec tee` and `-exec ./script.sh` slipped
+through.
+
+`_UNSAFE_FLAGS` maps a safe-listed command to the flags that make it
+mutate; `_is_dangerous` now returns True when both the command and one of
+its own unsafe flags are present. Both halves are required, so a stray
+`-delete` belonging to some other tool doesn't trip it. A plain `find`
+still generalizes across paths — the useful behaviour is untouched.
+
+The same commit closes the smaller version of R149's gap: `mv`, `cp`, `ln`,
+`install`, `truncate`, `tee`, `docker`, `podman` and the code-executing
+package managers (`pip`, `npm`, `yarn`, `pnpm`, `gem`, `cargo`, `make`,
+`apt`, `brew`) were absent from `DANGEROUS_COMMANDS`, so their two-token
+rule stored the harmless half and left the target free: `mv ./notes.md`
+auto-approved `mv ./notes.md ~/.bashrc`, and `pip install` auto-approved
+any package — where the package *is* the payload, since installers run
+setup.py/install scripts. `git` is deliberately NOT added: `git status`
+cannot become `git clean`, so the two-token rule is already sound there.
+
+Tests: `test_a_safe_command_with_a_mutating_flag_never_generalizes`,
+`test_always_allow_on_a_mutating_find_stores_it_whole`,
+`test_unsafe_flag_needs_its_own_command_present`,
+`test_writers_and_installers_never_generalize_over_their_target`,
+`test_denylist_still_catches_writers_by_prefix` (`tests/test_core.py`).
+
+### R191. A background prune could silently destroy the checkpoint it was protecting — `rewind.py` (2026-08-06)
+
+`prune()` (R151) runs `reflog expire` + `gc --prune=now` on a **daemon
+thread**, while `checkpoint()` may be running `git add -A` + `git commit`
+against the same shadow repo. Nothing serialized the two, and both swallow
+their errors by design ("a failed prune must leave checkpointing working"),
+so the collision was completely silent.
+
+Measured before the fix, arming the counter so a prune fires mid-loop:
+**1 in 6 runs of 30 back-to-back checkpoints lost one, and one run left
+HEAD unreadable, reporting 0 commits.** A lost checkpoint is exactly the
+failure R47/R151 exist to prevent — the mutation is approved and applied,
+but `/rewind` has nothing to restore. It also surfaced as an order-dependent
+test failure (`test_prune_bounds_the_history_and_rewind_still_works` passed
+alone, failed after `test_core.py`), which is how it was found.
+
+Two fixes, both keying previously-global state per shadow repo:
+
+- **`_repo_lock(wt)`** — a per-repo `threading.Lock` held across
+  checkpoint's add/commit/rev-parse and across prune's whole body, so a gc
+  can never land mid-commit. `_prune_soon` is dispatched *outside* the lock;
+  dispatching while holding it would just make the new thread wait.
+- **`_since_prune` is now a dict keyed by shadow-repo path**, not one
+  process-wide int. The cadence was shared across every project touched in
+  one process: 49 checkpoints in project A made project B's *first*
+  checkpoint trigger a gc of B.
+
+Tests: `test_a_background_prune_never_loses_a_concurrent_checkpoint`,
+`test_the_prune_cadence_is_per_repo_not_process_wide`
+(`tests/test_rewind.py`); the existing rate-limit test now monkeypatches
+`_since_prune` as `{}`.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R189 → R191.
+
+### R192. The $ figure ignored prompt-cache hits and read ~4x the real bill — `openai_compat.py`, `engine.py`, `agent.py` (2026-08-12)
+
+`OpenAICompatProvider.cost()` priced every prompt token at the full input
+rate. Aurora has read `usage.prompt_tokens_details.cached_tokens` since R91
+and logs it as `cached_input`, but the number was only ever *displayed* —
+never priced. Cache reads bill at a fraction of the input rate, so the badge
+overstated by the size of the discount times the hit rate.
+
+An agentic loop is the worst case for this, and the error is invisible in the
+shape of the bug: each iteration resends the whole prefix, so the hit rate
+climbs with turn length and so does the overstatement. A real session
+(`moonshotai/kimi-k3`, 2026-08-09) billed 10,675,848 prompt tokens of which
+10,283,008 — **96.3%** — were cache hits. Aurora showed **$32.50**;
+OpenRouter charged **$4.74**. Reconstructed: 392,840 fresh × $3.00/M = $1.18,
+31,741 output × $15.00/M = $0.48, 10,283,008 hits × $0.30/M = $3.08. Sums to
+$4.74 exactly, which is also what pins the cache-read rate at 0.1x input.
+
+- `cost()` takes a fourth `cached` argument and splits the prompt into fresh
+  and hit halves. `cached` is clamped into `[0, inp]`: the two counts come
+  from different fields of one usage block, and a provider reporting them
+  inconsistently must not produce a negative fresh count (and so a negative
+  price).
+- `_model_info_from_catalog_entry()` now reads OpenRouter's
+  `pricing.input_cache_read` into a new `price_cache_read_per_mtok`, and
+  `_merge_model_entry()`'s explicit key allowlist carries it through to
+  `remote_context_limits.json`. A catalog silent on the rate yields `None`,
+  not `0` — "free cache reads" is a different and wrong claim.
+- `_CACHE_READ_FALLBACK = 0.1` covers entries written before the field
+  existed. It is a fraction OF the input rate, not an absolute $, and 0.1 is
+  what every provider Aurora talks to charges. Erring toward a discount is
+  the right direction: assuming none is the bug.
+- Plumbing: `AgentCallbacks.on_usage` widened to
+  `(input, output, cached)` at the one call site in `agent.py`, and
+  `Engine._live_usage` takes `cached_tokens` and forwards it to `cost()`.
+  The frontend's own `on_usage` is UNCHANGED at two arguments — the cached
+  count is accounting, not display, so only the agent→engine hop widened.
+
+R163's per-round accrual invariant survives: cache reads add a third *linear*
+term, so summing per-round costs still equals the whole-turn figure. The
+split must be applied per round rather than to the turn total, because the
+first round is typically a miss and later ones hits — only the per-round
+numbers know which was which.
+
+Scope: NEW sessions only, by decision. `price_for()` (which `/cost` uses to
+price *past* sessions from their logs) is untouched, so historical reports
+keep reading high even though the logs carry `cached_input` and could be
+recomputed. Deliberate, not an oversight — revisit if the old numbers ever
+need to reconcile against a provider invoice.
+
+Tests (tests/test_core.py, all six fail without the fix):
+`test_cost_prices_cache_hits_at_the_cache_rate_not_the_input_rate`,
+`test_cost_falls_back_to_a_tenth_of_input_when_no_cache_rate_is_listed`,
+`test_cost_survives_a_provider_reporting_more_cached_than_prompt_tokens`,
+`test_catalog_entry_carries_the_cache_read_price`,
+`test_save_remote_model_info_persists_the_cache_read_price`,
+`test_cached_tokens_reach_the_cost_call_round_by_round`.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R191 → R192, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R193. Deep-dive review: writes that could not survive a failure — `rewind.py`, `providers/openai_compat.py` (2026-08-12)
+
+One pass over the write paths, following `PerformanceReview.md`'s method
+(hypothesis → reproduce against real code → fix → measure). Theme: three
+places wrote a file in a way where an interruption, a wrong locale, or a
+second writer left the file WORSE than before the write started. Two were
+reproduced end-to-end before any code changed.
+
+#### R193a. `/undo` silently corrupted any file that wasn't valid UTF-8 — `rewind.py`
+
+`snapshot_before_write` stored `target.read_text(errors="replace")` and
+`undo()` wrote it back with `target.write_text(...)`. Three defects stacked
+on the one path, all on the command whose entire job is to restore a file
+faithfully:
+
+- **Lossy decode.** `errors="replace"` turns every undecodable byte into
+  U+FFFD, and `undo` then wrote those replacement characters back as the
+  file's "original" content — reporting `undone: reverted <path>`.
+  Reproduced: `caf\xe9 …` came back as `caf\xef\xbf\xbd …`.
+- **Locale-dependent encoding.** Neither call pinned an encoding, so both
+  used the locale's — the same defect R146b fixed in `session.py`. Under
+  `LANG=C` that is ASCII, so the snapshot mangled every non-ASCII character
+  on the way IN as well.
+- **Truncate-then-fail.** `write_text` opens mode `"w"` — it truncates
+  first and encodes after. Under `LANG=C` the encode raised
+  `UnicodeEncodeError` *after* truncation, so `undo` reported "undo failed"
+  and left the user's file EMPTY. Reproduced end to end: a 21-byte UTF-8
+  file became 0 bytes, with the failure reported as if nothing had happened.
+
+Fixed by snapshotting BYTES (`content_b64` in the marker) and restoring
+through `_atomic_write_bytes` — sibling temp file + `os.replace`, so the
+target is either the old content or the new one, never a partial write. The
+original's permission bits are copied onto the temp before the swap, since
+`mkstemp` creates 0600 and `os.replace` takes the temp's mode (an undone
+executable would otherwise come back non-executable and owner-only).
+`_snapshot_bytes` still reads the legacy `content` field, so markers written
+before this in users' checkpoint dirs keep working.
+
+Two further defects found in the same function while fixing it:
+
+- **Unbounded read on the approval path.** The whole target was held in
+  memory and JSON-encoded into the marker, for a file chosen by whatever the
+  model decided to edit. Capped at `MAX_SNAPSHOT_BYTES` (20MB); past it no
+  snapshot is taken and `/undo` falls back to the tree diff, exactly as it
+  already does for a file outside the checkpointed tree.
+- **A failed snapshot left the PREVIOUS marker in place.** `undo_preview`
+  would then report that older file as "the last mutation" and `/undo` would
+  revert the wrong file — the same shape as the two incidents `undo_preview`'s
+  docstring already documents. The marker is now invalidated on any failure
+  or skip, matching what `clear_last_mutation` does for the tools with no
+  single target path.
+
+`undo_diff` still decodes lossily, deliberately: the stored bytes are
+authoritative for the restore, and that side only renders text for a human
+to read in the confirm prompt.
+
+#### R193b. The price table could be corrupted or silently lose an entry — `providers/openai_compat.py`
+
+`remote_context_limits.json` was written with `write_text` and with no lock,
+by two writers that R188 put in genuine competition: the background price
+refresh runs on its own thread while the main thread can be doing
+`/model add`.
+
+- **Non-atomic.** A crash, Ctrl+C or full disk mid-write leaves invalid
+  JSON. That failure is silent and TOTAL — `_load_remote_context_limits`
+  catches `JSONDecodeError` and returns `{}`, so every model loses its
+  context limit and price at once, and the ctx gauge quietly drops to the
+  128k default. The file also ships inside the package, so nothing
+  regenerates it.
+- **Unsynchronized read-modify-write.** Whichever writer finished second
+  wrote back a table built from a snapshot taken before the other's edit,
+  dropping it outright.
+
+Both fixed with `_write_entries_atomically` (temp + `os.replace`, cleaning
+up the temp on failure) under a module-level `_SAVE_LOCK` taken by both save
+paths. `save_remote_model_infos` keeps R136's one-read-one-write contract;
+its guard test now counts the new mechanism rather than a `Path.write_text`
+call that no longer happens.
+
+#### Measured, NOT changed
+
+`session.py`'s read paths were benchmarked against the real store (7.1MB,
+193 sessions) before assuming anything: `search_sessions` 0.04s,
+`usage_all_sessions` 0.14s, `list_sessions` and `last_latency_by_model`
+0.02s each. `search_sessions` bypasses `iter_records`' R96e prefilter and
+`json.loads`-es every line, which looked like the obvious win — it isn't one
+at this scale, and a raw-line prefilter would need an escape-aware guard to
+avoid false NEGATIVES on any needle containing `"`, `\`, a newline or a tab.
+Not worth it until a real profile says otherwise. Recorded here so the next
+pass doesn't re-try it, per `PerformanceReview.md`'s dead-ends section.
+
+#### Found, NOT fixed — needs a decision
+
+`tools._run_command_once` reads a command's output via `communicate()`, which
+is unbounded in memory: `run_command("yes")` accumulates until
+`COMMAND_TIMEOUT` (300s) rather than being cut off. This is the same class
+R96m fixed for `grep` ("bound the PRODUCER, not the consumer"), and the model
+is again the actor most likely to issue the over-broad command. Not fixed
+here because the right cap depends on a product decision this review
+shouldn't make alone: `run_command`'s own output is already truncated to
+`TOOL_OUTPUT_LIMIT` (60k) downstream, but `_run_command_once` is ALSO the
+TUI's bash-mode path, where the user is the one who typed the command and may
+well want all of it.
+
+Tests: `tests/test_rewind.py` —
+`test_undo_restores_a_non_utf8_file_byte_for_byte`,
+`test_undo_restores_non_ascii_under_a_non_utf8_locale` (runs in a subprocess
+under `LC_ALL=C`; `open()` resolves its default encoding in C at interpreter
+start, so an in-process `locale` monkeypatch reproduces nothing and would
+pass with or without the fix),
+`test_a_failed_snapshot_invalidates_the_previous_one`,
+`test_an_oversized_file_is_not_snapshotted`, plus
+`test_undo_preserves_the_files_permission_bits` which guards the new
+mechanism rather than an old bug (the old `write_text` reused the inode and
+kept the mode for free). `tests/test_core.py` —
+`test_a_failed_price_table_write_leaves_the_old_table_intact`,
+`test_price_table_writes_do_not_leave_temp_files_behind`,
+`test_concurrent_price_table_writes_do_not_lose_an_entry`. All except the
+permissions test verified failing without their fix.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R192 → R193, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R194. A runaway command could exhaust memory — `tools.py` (2026-08-12)
+
+`_run_command_once` read output via `communicate()`, which buffers the
+command's COMPLETE stdout+stderr in memory before any caller-side truncation
+runs. Flagged as "found, not fixed" in R193 pending a decision on bash-mode
+semantics; measured, decided and closed here.
+
+Measured on the old path: `run_command("yes ABCDEFGHIJKLMNOP")` captured
+**12.4GB and grew peak RSS by 9.5GB inside a SIX SECOND timeout**. That is
+enough to take the machine down, and — exactly as R96m argued for `grep` —
+the model is the actor most likely to issue the runaway command.
+
+Replaced with the same incremental read discipline R96m/R127 established for
+`grep`: binary pipes decoded once at the end (text mode wraps each pipe in a
+TextIOWrapper whose buffered read would block past the deadline), `select`
+with the remaining budget so a stall BETWEEN chunks is caught and not just
+total runtime, and raw `os.read` rather than a buffered `.read(n)`.
+
+Two decisions worth stating, since neither is forced by the mechanism:
+
+- **The cap is 5MB, not `grep`'s 200k.** This function is also the TUI's
+  bash-mode path, where the user typed the command themselves and the output
+  is theirs to read. The tool path truncates to `TOOL_OUTPUT_LIMIT` (60k)
+  downstream regardless, so the cap is invisible there and generous here.
+- **A verbose command is NOT killed.** Past the cap the reads still happen,
+  they just stop being accumulated — draining keeps the pipe empty so the
+  command runs to completion and its exit code and side effects survive.
+  Stopping the reads instead would fill the 64KB pipe buffer and block the
+  child on its next write: the R153 deadlock. Both pipes are watched for the
+  same reason.
+
+`proc.wait()` after both pipes hit EOF is now bounded by the remaining
+deadline: EOF is not the same as "the process exited" — a double-forked
+grandchild can close the pipes and leave the shell alive, which is the R170e
+case, and an unbounded wait there would hang the worker thread.
+
+Tests: `test_run_command_output_is_bounded_for_a_runaway_command`,
+`test_run_command_keeps_draining_past_the_cap` (a command that prints past
+the cap and then exits 7 — proves it was never blocked AND that its exit code
+survived). `test_run_command_warns_when_final_reap_itself_times_out` was
+updated: its fake process now carries real pipes instead of a `communicate()`
+stub, which models the escaped grandchild more closely than the old stub did
+(pipes at EOF, process unreapable).
+
+### R195. A file allowlist rule could be escaped with `..` — `approve.py` (2026-08-12)
+
+`fnmatch`'s `*` crosses `/` — it is not `glob` — so a stored rule of
+`~/project/*` matched the signature `~/project/../../etc/passwd`: the
+traversal segments were just more characters for `*` to swallow. `_norm_path`
+expanded `~` but never normalized `..`, and `tools._resolve` only expands `~`
+too, so the write really did land outside the approved directory.
+
+Verified end-to-end before the fix: with a rule of `/tmp/x/project/*`,
+`is_allowed` returned True for `/tmp/x/project/../secret/keys.txt` and
+`write_file` then overwrote `/tmp/x/secret/keys.txt` — **no prompt**. A user
+who approved "always allow writes under my project" was silently
+auto-approving writes anywhere on the filesystem.
+
+This is the same class as R141 (`ls && rm -rf ~` prefix-matching a stored
+`ls` rule): a matcher advertising a boundary guarantee that quietly stops
+holding on a spelling nobody tested. Both were found by asking what the
+matcher does with input shaped to look like something it isn't.
+
+Fixed by adding `os.path.normpath` to `_norm_path`. Purely LEXICAL — it
+collapses `..` without touching the disk, so the deliberate "expanded but
+NOT resolved" property is preserved and a glob rule stays a glob.
+`_matches` runs rules through the same function, so both sides normalize and
+a traversal that resolves back INSIDE an approved directory still matches.
+It applies to the denylist too, without which a deny rule would be
+side-steppable by spelling the path with `..`, breaking R120's "deny always
+wins".
+
+**Residual, deliberately open:** a SYMLINK inside the approved directory
+pointing outside it still matches. Catching that needs a real `resolve()`,
+and a glob rule has no filesystem identity to resolve — closing it means
+changing what a rule *is*, not just how it is spelled. Lexical traversal was
+the reachable half and is closed; this is recorded rather than silently left.
+
+Tests: `test_a_file_rule_cannot_be_escaped_with_dot_dot` (four escape
+spellings, plus the legitimate nested path that must still match),
+`test_a_dot_dot_path_still_matches_the_rule_it_really_lands_in`,
+`test_a_denied_path_cannot_be_reached_by_dot_dot_either`. All fail without
+the fix except the middle one, which guards against over-correcting.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R193 → R195, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R196. A corrupt allowlist.yaml killed the turn instead of failing closed — `agent.py` (2026-08-12)
+
+R170a made a corrupt `denylist.yaml` fail CLOSED: caught, reported, and every
+gated call blocked until it's fixed. `allowlist.yaml` got no such treatment —
+`approve.load()` was called bare at the top of `run_turn` (and again after an
+"always allow" answer), and only `ProviderError` is caught around `run_turn`,
+so `ApproveLoadError` propagated out of the agent loop and took the whole turn
+with it. The file is YAML that Aurora explicitly invites the user to
+hand-edit, so a typo is a normal event, not a corruption scenario.
+
+Both call sites now go through `_load_allow_or_empty`, which reports and
+returns `{}`. Empty IS the fail-closed answer for this direction: no rule
+matches, so every gated call is prompted for — the pre-allowlist behaviour.
+Failing closed on the deny side means blocking; on the allow side it means
+asking. Both refuse to act on rules they cannot read, which is the property
+R170a was really after.
+
+Test: `test_agent_asks_for_approval_when_allowlist_is_corrupt` — asserts the
+gate is ASKED (not pre-approved, not crashed) and that the turn still
+completes. Fails without the fix with `ApproveLoadError`.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R195 → R196, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R197. An MCP server could grow the read buffer without limit — `mcp.py` (2026-08-12)
+
+R187e added two time ceilings to `_read_response` (the per-read deadline reset
+and `_MAX_TOTAL_WAIT_MULT`), and both bound how LONG a server may take. Nothing
+bounded how MUCH it may send. `_read_response` accumulates 64KB chunks into
+`self._buf` until it finds a newline, so a server streaming an unterminated
+line grows that buffer at pipe speed for the entire
+`timeout * _MAX_TOTAL_WAIT_MULT` window.
+
+Measured on the old code with `timeout=0.5` (a 4s window): the buffer reached
+**125MB**, peak RSS +127MB. At the default `_DEFAULT_TIMEOUT` of 15s the
+window is 120s, i.e. roughly 3.75GB on the same hardware.
+
+Not an exotic input: ONE JSON-RPC line is how a large MCP tool result
+legitimately arrives, so this is the degenerate end of ordinary behaviour
+rather than a hostile special case. Same unbounded-producer shape as R194 and
+R96m — this pass has now found it three times in three different modules,
+which is worth noting as a pattern rather than three coincidences.
+
+Capped at `_MAX_RESPONSE_BYTES` (64MB): far above any legitimate response
+(`run_tool` truncates the parsed text to `TOOL_OUTPUT_LIMIT` = 60k regardless)
+while bounding the damage. Crossing it kills the child and reports the real
+cause, rather than letting the time ceiling eventually trip and blame a
+timeout.
+
+Test: `test_a_server_sending_an_endless_line_hits_a_byte_ceiling`, with a new
+`tests/fixtures/firehose_mcp_server.py` (handshakes normally, then answers a
+tool call with bytes forever and no newline). The cap is monkeypatched down so
+the test costs megabytes rather than the real 64MB. Note the honest limit of
+that test: without the fix it fails on the missing constant, not on the
+overrun — the 125MB measurement above is the actual evidence, taken directly
+against the pre-fix code.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R196 → R197, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R198. An ESC inside an OSC payload smuggled the sequence past the sanitizer — `tui.py` (2026-08-12)
+
+`_DANGEROUS_ESCAPES` gave every alternative a body that excluded ESC
+(`[^\x1b]*`, or `[^\x07\x1b]*` for the BEL-terminated OSC) — including the two
+R171 added for UNTERMINATED sequences, which therefore could never reach their
+`\Z` anchor once another ESC intervened. With no alternative matching at the
+introducer, `re.sub` advanced past it, stripped only the INNER sequence, and
+left the outer one live:
+
+    "\x1b]52;c;PAY" + "\x1b]0;title\x07" + "LOAD"  ->  "\x1b]52;c;PAYLOAD"
+
+A still-open OSC 52 — a clipboard write — survived the sanitizer whose entire
+purpose is removing it, and `append()`/`append_bash_output()` then STORED it,
+so it also reached `/copy-all` and session export. Three further payloads leak
+the same way: an embedded CSI (`\x1b]52;c;PAY\x1b[0mLOAD`), two consecutive
+unterminated OSCs, and a DCS with an inner CSI.
+
+R171's stated reasoning was right — "no terminator anywhere in the rest of the
+text is unambiguous, so strip from the introducer to the end" — the character
+class just couldn't express it. The unterminated alternatives now use
+`[\s\S]*\Z`, consuming anything to end-of-text including ESC.
+
+Alternative ORDER is now load-bearing and is commented as such: Python's `re`
+tries alternatives left to right and takes the first match, so a properly
+terminated sequence still matches the earlier, narrower alternative and only
+IT is removed, leaving following text intact. Only a genuinely unterminated
+introducer reaches the greedy pair and takes the rest of the text with it —
+already R171's accepted trade, since a real terminal swallows that text as OSC
+payload regardless. Verified unchanged: OSC 8 hyperlink pairs, an OSC title
+followed by text, and plain CSI colour codes.
+
+Tests: `test_an_esc_inside_an_osc_payload_does_not_smuggle_it_through` (four
+payloads, fails without the fix) and
+`test_r195_fix_does_not_over_strip_terminated_sequences` (guards the
+over-correction the greedy alternatives could otherwise cause).
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R197 → R198, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R199. Aurora could not read back a config it had written itself — `config.py`, `approve.py`, `paths.py`, `providers/openai_compat.py`, `rewind.py` (2026-08-12)
+
+An asymmetry, found by sweeping for the class R193a had just turned up rather
+than by reading the file: every YAML/JSON Aurora persists is WRITTEN as
+explicit UTF-8 (`paths.write_text_atomic`, R146a) — and `persist_model_entry`
+/ `persist_runtime_value` pass `allow_unicode=True`, so real non-ASCII lands
+in the file — while every READ used `read_text()` or `open()` with **no
+encoding**, i.e. the locale's.
+
+Under `LANG=C` (cron, CI, a minimal container, a Docker image with no locale
+set) that is ASCII, so `load_config` raised `UnicodeDecodeError` at STARTUP
+and Aurora would not run at all. Reproduced with a one-line config:
+
+    description: "Kimi K3 — a 2.8T model"
+    -> UnicodeDecodeError: 'ascii' codec can't decode byte 0xe2 in position 79
+
+Not a corner case. `/model add` writes OpenRouter's own model descriptions
+verbatim into config.yaml, and those are full of em dashes — so the app
+wrote the file that then stopped it starting. This is the third appearance of
+the locale-encoding defect (R146b in `session.py`, R193a in `rewind.py`, here)
+and the second bug this pass found by pattern-matching an earlier one, which
+argues for pinning the encoding as a house rule rather than per incident.
+
+Pinned `encoding="utf-8"` on every read of a file Aurora itself writes:
+`config.load_config` (the `open()`), `load_state`, `persist_runtime_value`,
+`persist_model_entry`, `remove_model_entries`, `approve._load`,
+`paths.aurora_home`'s marker file, `_load_remote_context_limits` and both
+price-table read-modify-writes, and `rewind._read_last_mutation`.
+
+Two of those were already safe by accident and are pinned anyway, so the
+property holds by construction rather than by luck: `json.dumps` and
+`yaml.safe_dump` both default to escaping non-ASCII, so the shipped price
+table and a tool-written allowlist happen to be pure ASCII today. The
+allowlist is a file Aurora explicitly invites the user to hand-edit, and a
+hand-edited one carries whatever the editor saved.
+
+Test: `test_config_round_trips_non_ascii_under_a_non_utf8_locale` — a
+subprocess under `LC_ALL=C` (as R193a established, `open()` resolves its
+default encoding in C at interpreter start, so an in-process `locale` patch
+reproduces nothing), covering read, write, and read-back. Fails without the
+fix at the first `load_config`.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R198 → R199, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R200. `/autocompact` accepted and persisted a threshold that broke it — `engine.py`, `ui.py` (2026-08-12)
+
+R189 made the auto-compact threshold and keep-tail settable from a running
+session, but the setters took any number and wrote it straight to
+`config.yaml`. The value survives restarts, so a single typo disabled or
+inverted auto-compact until the user noticed and hand-edited the file back.
+
+The gate is `if not stats.limit or stats.pct < self.auto_compact_threshold_pct`:
+
+- **`/autocompact 0`** (or negative) — never returns early, so auto-compact
+  folds history on EVERY turn, at 5% context as readily as at 95%, spending a
+  summarization request each time and throwing away fidelity the setting
+  exists to preserve.
+- **`/autocompact 500`** — `pct` cannot reach it, so auto-compact never fires
+  again while `/autocompact`'s own output keeps reporting it ON, "once
+  context hits 500%". A safety mechanism silently off is worse than one
+  visibly off: the failure only shows up as a rejected oversized request much
+  later, which is the exact symptom R156/R158 exist to prevent.
+- **`keep=0`** — `compact_history` reads `keep_recent_tokens=0` as the MANUAL
+  `/compact` sentinel meaning "fold the ENTIRE history". As a persisted auto
+  value that makes every auto-compact discard the current turn as well.
+
+Both setters now range-check (`0 < pct <= 100`, `keep > 0`) and raise
+`ValueError`. Validation sits in the Engine rather than the command handler
+because that is where the invariant belongs and it covers any future caller —
+`/autocompact` is currently REPL-only, with no TUI equivalent.
+
+`ValueError` specifically because `/autocompact`'s handler already catches it
+for a non-numeric argument; the handler now prints the setter's reason when
+there is one, instead of a bare "usage:" line that would imply the input was
+unparseable when it parsed fine and was merely out of range.
+
+Tests: `test_an_out_of_range_autocompact_threshold_is_refused` (0, -5, 101,
+500 all refused; the live AND persisted values unmoved; the legal edges 100
+and 0.5 still accepted) and `test_a_non_positive_keep_tail_is_refused`. Both
+fail without the fix. R189's two persistence tests still pass unchanged.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R199 → R200, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R201. A mistyped passphrase silently destroyed every stored API key — `keystore.py`, `paths.py`, `ui.py`, `__main__.py` (2026-08-12)
+
+`store_key` did this:
+
+    data = {}
+    try:
+        data = _encfile_load(pw.decode())
+    except Exception:
+        pass
+    data[env_var] = value
+    _encfile_save(pw.decode(), data)
+
+A decrypt failure left `data` as `{}`, and the save then replaced the WHOLE
+store with the single key being added. The commonest way to reach that branch
+is not corruption but a **mistyped passphrase**.
+
+Reproduced end-to-end (isolated per
+`MEMORY/bugs/20260712_000000_never-smoke-test-against-real-keystore`: tmp
+AURORA_HOME **and** a fake `keyring` in the same process): a store holding
+`OPENROUTER_API_KEY` and `ANTHROPIC_API_KEY`, plus one typo while adding a
+third key, left the file containing only `LLAMA_API_KEY`, encrypted under the
+typo. The correct passphrase then raised `InvalidToken`. Both real keys were
+gone, with no other copy of the plaintext anywhere — `store_key` returned
+`"encrypted file"` and the UI printed success.
+
+Three fixes:
+
+- **Do not treat "can't decrypt" as "empty".** "No file yet" is the only case
+  where `{}` is genuinely right, and it is distinguishable without decrypting
+  anything, so the two are split apart instead of sharing one `except`. A
+  failure now raises the new `KeystoreError`, drops the bad passphrase from
+  the cache so the next attempt re-prompts, and writes nothing. Both call
+  sites (`ui._prompt_and_store_key`, `__main__`) report it as a refusal — a
+  mistyped passphrase is a user event, not a traceback.
+- **Atomic, private writes.** `_encfile_save` was `write_bytes` then
+  `chmod(0o600)` — two windows in one line: a crash between truncate and
+  write leaves an undecryptable blob (every key gone), and between write and
+  chmod the file briefly carries the umask's permissions. New
+  `paths.write_bytes_atomic(path, data, mode=)` sets the mode on the temp
+  file so the name only ever points at a complete, correctly-permissioned
+  file. The salt file gets the same treatment: not secret, but a half-written
+  salt derives a different key and makes an existing store undecryptable.
+- **Stop asking the wrong question.** The prompt said "Choose a key-store
+  passphrase" even when a store already existed — inviting exactly the typo
+  that used to wipe it, since it reads as "set one" rather than "recall one".
+  "Choose" is now used only when there is no store yet.
+
+Tests: `test_a_mistyped_passphrase_does_not_destroy_the_existing_key_store`
+and `test_the_key_store_is_written_atomically_and_private` (mode bits on both
+files, and the live store never opened for writing). Both fail without the
+fix. Both scope `_prompter` and `_passphrase_cache` with `monkeypatch` rather
+than `set_prompter` — they are module globals, and a leaked prompter breaks
+an unrelated test later in the run, which is how the first draft of these
+tests was caught.
+
+**Unrelated flake, not from this change:**
+`tests/test_secrets.py::test_scan_is_faster_with_literal_guards_on_ordinary_text`
+compares wall-clock times and tripped once during a full run, then passed
+alone and in two consecutive clean full runs (849 passed). It is load-
+sensitive by construction, and this pass added several subprocess-spawning
+tests that make the machine busier. Recorded rather than "fixed" — it is a
+pre-existing fragility in a timing assertion, not a regression.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R200 → R201, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R202. R200's range check was on the setters only; a hand edit walked past it — `engine.py` (2026-08-12)
+
+Found by re-reading R200 rather than new code: R200 validated
+`set_auto_compact_threshold_pct` / `set_compact_keep_recent_tokens`, so
+`/autocompact 0` is refused — but `config.yaml` is a file Aurora explicitly
+invites the user to hand-edit, and `Engine.__init__` read those values
+straight into attributes:
+
+    self.auto_compact_threshold_pct = float(
+        self.runtime.get("auto_compact_threshold_pct", 80))
+
+So every state R200 refused was still reachable by typing it into the file,
+which is also where R200's own setter had just persisted it. A guard on one
+door only.
+
+Two failure shapes, both verified against the pre-fix code:
+
+- **Out of range** — `0`/negative reinstates "auto-compact folds history on
+  every turn"; above 100 reinstates "never fires while the UI reports it ON".
+- **Not a number** — the bare `float()`/`int()` raised `ValueError` out of
+  `Engine.__init__`, so `auto_compact_threshold_pct: eighty` made Aurora
+  refuse to start at all. An unstartable app is a worse answer to a bad
+  setting than a corrected one, and this is a config the user is told to edit.
+
+`_runtime_number(key, default, cast, valid, hint)` now does the read: casts,
+validates, and on either failure falls back to the default and reports
+through `extension_warnings` — the surface both frontends already print at
+startup — rather than raising or inventing a second channel. It never raises.
+
+The general point, which is the reason this is its own entry rather than an
+amendment to R200: a validated setter and an unvalidated load path are the
+same defect seen from two ends, exactly like R199's write-UTF-8/read-locale
+asymmetry. Validation belongs wherever a value ENTERS the process, and a
+config file is an entry point.
+
+Tests: `test_a_hand_edited_bad_runtime_number_is_corrected_not_obeyed` (0,
+-5, 500 each corrected AND reported) and
+`test_a_non_numeric_runtime_value_does_not_stop_aurora_starting`. Both fail
+without the fix, the second with the original `ValueError`.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R201 → R202, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R203. One session reported two different costs for itself — `providers/openai_compat.py`, `ctxtree.py` (2026-08-12)
+
+R192 taught `OpenAICompatProvider.cost` about cache reads, but four other
+places computed `billed * price_in + out * price_out` from `price_for()` and
+were left behind: `/context`'s per-turn badge, its session total
+(`_session_cost`), the per-model breakdown (`model_breakdown_lines`), and —
+through that last one — the cost a RESUMED session is seeded with.
+
+So a live session disagreed with itself. On the real 2026-08-09 kimi-k3
+session: **$32.50 in `/context` against $4.74 in the status bar**, where
+$4.74 is what OpenRouter actually charged. Same log, same records, 6.9x
+apart, both on screen.
+
+This is R192's own fault and the same shape as R202: a rule applied at one of
+its entry points. The fix is therefore not "add the cache term in four more
+places" but `cost_for(model, inp, out, cached)` — one function every priced
+surface calls, with `OpenAICompatProvider.cost` delegating to it. Four copies
+of an arithmetic expression that must agree will eventually not.
+
+`_session_cost` previously documented its number as a deliberate UPPER bound:
+"cached reads bill cheaper but the discount isn't reported uniformly, so
+nothing is subtracted". R192 retired that premise — `cached_input` is on every
+assistant record, and the rate reconciled to the cent against a real invoice.
+The note is kept rather than deleted: the reasoning was sound when written,
+and it was the facts that changed, which is worth being able to see.
+
+Consequence worth stating plainly: **historical figures move down.** `/cost`
+and `/context` on old sessions now report what those sessions really cost
+rather than an upper bound. R192 deliberately left history alone on the
+grounds that it was out of scope; that stops being defensible once the same
+session shows two numbers, so the divergence is what forced this and history
+is corrected as a side effect, not as a re-pricing project.
+
+`test_cost_command_prices_known_models_and_flags_the_rest` asserted `$2` — the
+all-fresh figure. Its fixture always declared 500k of that 1M input a cache
+hit, and the report has always PRINTED a "cached" column for it; it simply
+never priced it. Now $1.55. The expectation encoded the bug.
+
+Tests: `test_context_badge_and_the_live_cost_agree_on_the_same_turn` (the real
+kimi-k3 numbers, badge against `cost_for`) and
+`test_every_priced_surface_uses_one_rule` (badge, session total and per-model
+breakdown must land on one number for one usage). Both fail without the fix.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R202 → R203, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R204. The reasoning stream was never escape-sanitized — `tui.py` (2026-08-12)
+
+R171 added `_strip_dangerous_escapes` to `append()`, reasoning that "a
+compromised or prompt-injected model can put an OSC 52 clipboard write in its
+own reply just as easily as a subprocess can, and this is the path that reply
+renders through". That argument is about the MODEL, not about which of its
+two output channels carried the payload — and `think_chunk`, the
+`reasoning_content` stream, was left raw.
+
+So the same payload through the same model was stripped via `on_text` and
+stored intact via `on_think`. `_chat` kept it, the render used it, and
+`/copy-all` and session export carried it out — the exact three consequences
+the sanitizer's own comment lists. Reasoning models emit large free-form
+streams, so this is the wider channel of the two, not the narrower one.
+
+Fifth instance this pass of one rule guarded at one of its entry points
+(R199 write/read encoding, R202 setter/load, R203 one priced surface of four,
+this). It is now the most productive thing to grep for in this codebase.
+
+Sanitized per chunk, matching `append()`, plus one full-text pass when the row
+closes. The close-time pass is defence in depth rather than the mechanism, and
+the comment says so: a sequence split across two chunks is already handled,
+because R198's unterminated alternative is greedy to end-of-text, so a chunk
+ending mid-sequence loses its partial introducer as it arrives and the
+continuation lands as ordinary text. The pass exists so that stops being
+load-bearing on another rule's greediness. Once per request, never per chunk —
+re-scanning accumulated text on every chunk would be O(n²) over a 20k-token
+reasoning stream.
+
+Tests: `test_think_chunks_are_sanitized_like_the_reply`,
+`test_a_think_payload_split_across_chunks_still_does_not_survive`,
+`test_closing_a_think_row_re_sanitizes_the_whole_text` (writes into the row
+directly, so it tests the close pass and not the per-chunk strip). All three
+fail without the fix.
+
+### R205. Scrollback eviction rescanned the whole transcript per entry — `tui.py` (2026-08-12)
+
+`_evict_locked` opened with `sum(self._entry_lines(e) for e in self._chat)`,
+and `_entry_lines` does `text.count("\n")` over an entry's whole text. So
+every NEW entry rescanned every byte of the transcript: quadratic in total
+bytes, on the path that runs whenever output does not merge into the last
+entry — tool results, notices, bash output, think rows.
+
+Measured (entries just over `_MERGE_LIMIT`, so each append creates one):
+
+| new entries | before | per append | after | per append |
+|---|---|---|---|---|
+| 2,000  | 4.3 s  | 2,140 µs | 0.07 s | 35 µs |
+| 6,000  | 36.3 s | 6,054 µs | 0.52 s | 87 µs |
+| 12,000 | **96.6 s** | **8,051 µs** | **1.36 s** | **114 µs** |
+
+71x at 12k entries. The streaming path — many small appends merging into one
+entry — is unchanged at 24.2 ms per 20k appends (was 24.5), which is the case
+that had to not regress.
+
+The counts are memoised per entry in `_line_counts`, parallel to `_chat` and
+`_cache` and cleared by the same `_dirty(i)` that invalidates the render
+cache. That preserves what the original comment was protecting: the total is
+still DERIVED from the entries rather than maintained as a running counter
+across four append sites — it is just not re-derived where nothing changed.
+A stale count is unreachable without also leaving a stale rendering, which
+the render path surfaces loudly.
+
+`PerformanceReview.md` attributed felt slowdown in long sessions to render
+cost, and its own numbers (9ms/frame at 4.4k lines) predate R96b's caching:
+re-measured today the render path is ~0.00 ms at 10k lines and
+`_live_clock_key` is 1 µs. The render half was already fixed; this was the
+half still there, in a function whose docstring described the sum as running
+"about once per `_MERGE_LIMIT` of output" — true for streamed text, and not
+true at all for the entry-creating paths.
+
+Tests: `test_the_line_count_memo_never_drifts_from_a_fresh_recompute` (memo
+vs from-scratch after every mutation kind the TUI supports) and
+`test_the_memo_stays_parallel_to_chat_across_eviction`.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R203 → R205, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R206. The classic REPL emitted terminal escapes straight to the terminal — `colors.py`, `ui.py`, `tui.py` (2026-08-12)
+
+R170l, R171 and R204 stripped OSC/DCS/APC/PM/SOS payloads out of everything
+the TUI stores. All three live in `tui.py`, and the sanitizer's own comment
+explains why that placement felt sufficient: "prompt_toolkit fully owns
+rendering and never blindly passes raw bytes through", so the concern there
+was what got STORED and later copied out by `/copy-all` or session export.
+
+`aurora --classic` has no such intermediary. `TerminalFrontend` writes model
+and tool output to `sys.stdout` directly, so an OSC 52 in a reply is not
+merely stored — the emulator interprets it and the user's clipboard is
+overwritten. The frontend WITHOUT the guard was the more exposed of the two,
+and `--classic` is not obscure: it is also the automatic fallback whenever
+stdout is not a tty.
+
+Four model- or tool-controlled paths were unfiltered, all verified emitting a
+raw OSC 52 before the fix: `on_text` (the reply), `on_think` (R204's channel,
+here for the same reason), `on_tool_result` (subprocess output — precisely
+what R170l stripped for the TUI), and `on_tool_start`, which echoes tool
+ARGUMENTS, model-authored text that nothing had ever treated as such.
+
+Sixth instance this pass of one rule guarded at one of its entry points
+(R199, R202, R203, R204, and R200/R202 as a pair). The fix is therefore
+structural rather than four more call sites: `_DANGEROUS_ESCAPES` and the
+strip function moved to `colors.py` — already the ANSI module, and already
+security-aware about this exact class, since its `URL_RE` comment describes
+an OSC-52 smuggling route through `linkify()`. `tui.py` keeps an alias, so
+nothing referencing it there changed. Two frontends can no longer drift apart
+on this rule because there is now one rule.
+
+Tests: `test_the_classic_repl_does_not_emit_escapes_to_the_terminal` (all
+four paths), `test_the_classic_repl_still_shows_the_real_text_and_colours`
+(CSI colours must survive — they are how the REPL renders at all), and
+`test_both_frontends_share_one_escape_rule`, which asserts the identity
+rather than the behaviour, so a future copy-paste back into `tui.py` fails
+here loudly.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R205 → R206, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R207. Two write paths still used the locale's encoding — `ui.py`, `extensions.py`, `rewind.py` (2026-08-12)
+
+R199 pinned `encoding="utf-8"` on every READ of a file Aurora writes, after
+finding it could not load back a config it had written itself. The sweep that
+found it was `grep read_text | grep -v encoding=`. Re-run for WRITES, two
+were still open — and both compound the encoding failure with a
+truncate-then-fail, because `open(..., "w")` and `write_text` truncate before
+they encode:
+
+- **`/export`** — `open(out, "w")` then `f.write(export_markdown(...))`.
+  A transcript containing an em dash, a non-English reply, or unicode inside a
+  code block raised `UnicodeEncodeError` under `LANG=C`, leaving a **0-byte
+  .md**. Reproduced: 108 bytes of transcript, 2 em dashes, export size 0.
+  Now `write_text_atomic`, which pins UTF-8 and lands the file whole or not at
+  all — so a re-export that fails no longer destroys the previous one either.
+- **`extensions.scaffold`** — `_TEMPLATE.format(name=name.strip(), ...)`.
+  `tool_name` is slugified to ASCII but `name` is the user's raw text, so
+  `/extensions new café` hit the same wall. The 0-byte `.py` left behind is
+  worse than a lost file: `extensions.discover()` tries to load it at the
+  next startup.
+
+Two more writes are ASCII by content (`info/exclude` from the `EXCLUDES`
+constant, `shallow` from a git SHA) and were never broken. Pinned anyway, so
+the property holds by construction rather than by what the data happens to
+contain today — the same reasoning R199 gave for pinning the price table and
+the allowlist, both of which were also safe only by accident.
+
+Tests: `test_export_and_scaffold_survive_a_non_utf8_locale` (subprocess under
+`LC_ALL=C`, both paths) and `test_a_failed_export_does_not_leave_a_truncated_file`.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R206 → R207, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R208. `/copy-all` and `/export` carried the escapes the sanitizer promised to remove — `ui.py` (2026-08-12)
+
+The sanitizer's comment has said since R170l that payloads are "stripped
+entirely before storage, so neither the display NOR anything copied out of it
+(`/copy-all`, session export) carries the raw sequence." Only the first half
+was ever true, and the comment named the two commands it was wrong about.
+
+The TUI sanitizes its own `_chat` DISPLAY buffer. `/copy-all` and `/export`
+read `session.export_markdown()`, which walks the session JSONL — written by
+the engine from the RAW model text, which passes through none of that.
+`/copy` and `/copy-last` are the same: `nth_response` reads
+`engine.messages`, and `_last_copyable_text`'s other branch is the TUI's
+captured shell output.
+
+Verified: an OSC 52 in a reply comes back intact from `export_markdown`, so
+it reached the user's **clipboard** — where pasting into a terminal fires it —
+and the exported `.md`, where `cat` does. The clipboard path is the sharper
+one, because the payload survives Aurora entirely and goes off to whatever
+the user pastes into.
+
+Seventh instance this pass of a rule guarded at one of its entry points, and
+the first where the codebase's own comment already asserted the coverage that
+did not exist. A stale claim in a comment is worse than no claim: it is the
+reason nobody looked.
+
+Fixed with `_outbound()`, applied at the four points where text leaves for a
+clipboard or a file. It lives in `ui.py` on purpose and by necessity: an
+escape is inert inside the log and dangerous only when it reaches a terminal,
+so the UI boundary is the right place — and `session.py` is engine-side,
+where `test_engine_never_imports_concrete_ui_module` forbids reaching for it.
+`/export` now goes through `_all_chat_text` rather than reading the session a
+second time, so there is one path, not two that must agree.
+
+Tests: `test_copy_and_export_do_not_carry_terminal_escapes` and
+`test_copy_last_sanitizes_both_of_its_sources` (both of that helper's
+sources — raw reply and captured shell output — since both go to the
+clipboard). Both fail without the fix.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R207 → R208, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R209. A symlink out of an approved directory is no longer auto-approved — `approve.py` (2026-08-12)
+
+R195 closed the `..` half of the file-rule escape lexically and recorded the
+symlink half as deliberately open: "catching that needs a real `resolve()`,
+and a glob rule has no filesystem identity to resolve — closing it means
+changing what a rule *is*." That was true of the rule as a whole and false of
+its LITERAL PREFIX, which is an ordinary path.
+
+`_resolved_rule` splits a rule at its first glob character, backs up to the
+last whole path segment (so `/a/b*` resolves `/a`, never `/a/b`), resolves
+that, and re-attaches the tail verbatim. An allowlist match then requires the
+lexical AND the resolved pair to agree: a symlink inside an approved directory
+pointing outside satisfies the first — the path really is under the rule —
+and fails the second.
+
+Resolving BOTH sides is what keeps this from over-prompting, and is the
+reason a naive "resolve the signature" fix would have been worse than the
+bug. On macOS `/tmp` is itself a symlink to `/private/tmp`; comparing a
+resolved signature against an unresolved rule breaks every rule underneath it
+and re-prompts forever. Tested explicitly, including an approved directory
+reached THROUGH a symlink, which must still match — and must still refuse an
+escape reached through that same link.
+
+`is_denied` keeps matching on EITHER form. Requiring both there would let a
+symlink spelling slip past a deny rule, and R120's "deny always wins" must not
+be narrowed by the change that tightened the allow side — the two directions
+fail toward different answers, as R141/R149 already established.
+
+Tests: `test_a_symlink_out_of_an_approved_directory_is_refused`,
+`test_an_approved_directory_reached_through_a_symlink_still_matches`,
+`test_the_denylist_is_not_narrowed_by_the_resolved_check`. The first two fail
+without the fix; the third guards against over-correcting.
+
+### R210. A timing assertion was measuring the machine — `tests/test_secrets.py` (2026-08-12)
+
+`test_scan_is_faster_with_literal_guards_on_ordinary_text` compared wall-clock
+times (`guarded < unguarded * 0.8`). It failed twice during full-suite runs
+while passing alone and in repeated clean runs — this pass added several
+subprocess-spawning tests, and a ratio between two timings measures whatever
+else the machine is doing.
+
+Recorded as a known flake under R201; two failures is enough. A test that
+fails randomly does not just cost a rerun, it teaches you to ignore red.
+
+Rewritten to count which patterns reach `finditer`, which is exactly the
+mechanism R96g introduced — exact, unaffected by load. The invariant is
+stated precisely: a pattern runs only if it is guard-exempt or one of its
+literals really is in the text. That distinction matters, and the test says so:
+`tui.py` contains `_live_clock_key`, so the Stripe guard `_live_` legitimately
+fires and that regex runs and finds nothing. The guard is a SUPERSET filter,
+not a predictor of matches — an earlier draft of this test asserted the
+stricter thing and was wrong about the code.
+
+Verified it still detects a broken guard: with `_LITERAL_GUARD` neutered, all
+9 patterns run and the test fails on "no pattern was skipped at all". Timing
+is what motivated R96g; it is not what R96g promises, so it is not what the
+test should assert.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R208 → R210, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R211. Editing keys leaked past the menu's key swallow — `tui.py` (2026-08-12)
+
+The `Keys.Any` binding that guards an open `select()` menu documents itself
+as swallowing "every other key (letters, space, backspace, paste) … so
+nothing leaks into the buffer rendered underneath the menu". **Two of the
+four keys it names leaked.**
+
+Its own comment states the mechanism correctly — "Keys.Any is a fallback, it
+only fires when no more-specific binding matched" — and that is exactly why
+it does not hold. prompt_toolkit's `get_bindings_for_keys` sorts bindings
+with more `Keys.Any` occurrences FIRST, and `KeyProcessor` calls
+`matches[-1]`, so every more specific binding beats the swallow. `space`,
+`c-j` and `backspace` were each bound specifically with only `_no_editor` on
+them.
+
+Measured against the real resolver rather than guessed: of the single-key
+bindings that outrank the swallow, all but three are deliberate — enter,
+arrows, escape and digits DRIVE the menu, and `!` already carries an explicit
+body guard. The three genuine leaks, both effects reproduced:
+
+- **space** — appended to the draft (`"my draft"` → `"my draft "`)
+- **c-j** — added a newline to it
+- **backspace** — edited it and, on an empty `$` prompt, **silently left bash
+  mode**. That is the sharper one: a stray backspace while answering
+  "Approve this command?" changed a mode the user never touched.
+
+Fixed with a `_no_menu` filter on those three rather than an early `return`
+in each body. Filtering is what actually hands the keystroke to `Keys.Any` —
+it uses prompt_toolkit's resolution order instead of fighting it, and a body
+guard would leave the specific binding still winning and merely doing
+nothing, which is not the same thing for a key that should fall through.
+
+Eighth instance this pass of a guarantee asserted in a comment that the code
+did not provide, and the second (after R208) where the comment named the very
+cases it was wrong about.
+
+Tests: `test_editing_keys_do_not_leak_into_the_draft_during_a_menu`,
+`test_backspace_during_a_menu_cannot_drop_bash_mode`,
+`test_menu_driving_keys_still_beat_the_swallow` (over-correction guard) and
+`test_editing_keys_are_unaffected_with_no_menu_open`. They press keys through
+a `_resolved_press` helper that picks among matching bindings the way
+`KeyProcessor` does — the existing `_press` helper calls a handler directly
+and so cannot see precedence, which is the entire subject here.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R210 → R211, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R212. A status-render failure was silent — `tui.py` (2026-08-12)
+
+The status bar's construction is wrapped in `except Exception`, which is
+right: the bar repaints on a timer, so an exception there would take the
+session down. The fallback was the problem — it replaced the whole bar with
+the string `" aurora"` and did nothing else. No log, no marker, no record. A
+bug anywhere in that block presented as a status bar that had mysteriously
+lost the model, the ctx gauge, the cost and the session id, with nothing to
+go on.
+
+Not hypothetical: `MEMORY/bugs/20260715_120000_tui_status_token_int_crash`
+records exactly such a crash — `live_token_tag()` handing a character count
+to a function expecting a string — and this handler is what a repeat of it
+would hide.
+
+The bar now renders `" aurora ⚠"` and records the error, ONCE per distinct
+failure. Once matters: the bar repaints several times a second, so logging
+every frame would bury the session log under duplicates of a single bug. The
+logging is itself wrapped — diagnostics must not become the failure — and the
+handler still never propagates, which was the original point and is pinned by
+its own test.
+
+`status()` is a closure over `_build_app`'s locals, so it was unreachable
+from a test; it is now also bound to `self._status_render`. That is what let
+the failure path be tested at all rather than reasoned about.
+
+This is a defect in the debugging surface rather than in behaviour, and it is
+the eighth time this pass that a silent fallback or an unverified comment was
+the reason a bug could sit unnoticed. Worth stating as a pattern: `except
+Exception: <substitute a default>` on a path that repaints continuously is
+indistinguishable from working, so it needs a mark on the screen and one line
+in the log, not one or the other.
+
+Tests: `test_a_status_render_failure_is_reported_once` (marker, recorded
+error, and exactly one log record across five renders),
+`test_a_healthy_status_bar_is_unmarked` (the marker has to mean something),
+and `test_a_status_render_failure_never_propagates`, which fails the render
+AND the logging of that failure and still expects no exception.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R211 → R212, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R213. `aurora --classic` could not read piped input at all — `ui.py` (2026-08-13)
+
+`__main__.py` documents the inline REPL as the fallback for "pipes, CI", and
+falls back to it automatically whenever stdout is not a tty. Piped input never
+worked.
+
+From a TERMINAL, Enter arrives as `\r` — `c-m`, which the REPL binds to
+`validate_and_handle()`. From a PIPE, every line ends with `\n`, and that IS
+`c-j` — which the REPL bound to "insert a newline". So each piped line was
+appended to the buffer and never accepted; EOF then discarded the whole
+buffer. `echo hello | aurora --classic cfg.yaml` **exited 0 having printed
+nothing, logged nothing, and run no turn.** No session file was even created.
+
+Found by running the thing rather than reading it. Nothing about the binding
+looks wrong on the page — `c-j` is a legitimate, documented editing key, and
+the REPL's own tooltip row advertises it. It is only wrong in the one context
+where `\n` is an input terminator rather than a keystroke, and that context
+cannot be reached from a unit test that fakes the input.
+
+Fixed by registering the binding only when `sys.stdin.isatty()`. NOT
+registering it (rather than filtering it) is deliberate: it hands `c-j` back
+to prompt_toolkit's own default, which accepts the line. A filter would leave
+our binding winning and doing nothing, which is the same distinction R211
+turned on.
+
+Verified end to end against an unreachable provider: the turn now runs,
+retries twice, reports `local backend unreachable`, and writes its `user`
+record — the behaviour the engine always had and the REPL never let it reach.
+
+Tests: `test_piped_input_actually_runs_a_turn`, driven as a real subprocess
+with `input="hello\n"` because the bug only exists when stdin is genuinely
+not a tty; and `test_ctrl_j_still_inserts_a_newline_for_an_interactive_user`,
+which pins that the binding survives for a real terminal.
+
+**Method note.** Every earlier finding this pass came from reading code or
+sweeping a class. This one came from executing the program, and it was
+invisible to both other techniques: the code is correct in isolation, no
+comment claims otherwise, and no class-sweep pattern matches it. Worth
+budgeting a run-it pass, not only a read-it pass.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R212 → R213, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R214. EOF at a menu killed the session instead of answering safely — `ui.py` (2026-08-13)
+
+`select()` read with a bare `input()`, so `EOFError` propagated straight out
+of whatever it was asked. Found the same way as R213 — by running the thing:
+`printf '/model\n' | aurora --classic` printed a traceback and exited 1, from
+`ui.py:332`, having escaped `run()` entirely.
+
+Two ordinary ways in, and the second is the serious one:
+
+- Piped or CI input running out mid-menu.
+- **Ctrl+D at a prompt.** That is a normal gesture, and `select()` backs the
+  APPROVAL gate (`"Approve?"`), the iteration-cap prompt, and the secret
+  challenge. So Ctrl+D while deciding whether to approve `rm -rf /` did not
+  cancel the menu — it killed the session with a traceback, mid-turn.
+
+It cannot be handled by looping the way a blank Enter is. `select()`
+deliberately re-prompts on an empty line, reasoning that "an accidental Enter
+must never silently pick 'yes' on an approval challenge" — but EOF repeats
+instantly, so re-prompting spins forever. The answer has to be a VALUE.
+
+`eof_key` is therefore a required decision rather than a default, for the same
+reason blank-Enter re-prompts: the safe answer differs per menu and only the
+caller knows it. Each caller now states its own, and every one fails safe:
+
+| menu | EOF answers |
+|---|---|
+| `Approve?` | `s` — stop the agent, never `y`/`a` |
+| iteration cap | `n` — stop |
+| secret challenge | `stop` — never `keep` an unredacted value |
+| `confirm()` | `n`, whatever `default_yes` says — each caller guards something that writes or spends |
+
+A caller passing nothing gets the `EOFError` re-raised, and `run()`'s command
+dispatch now catches it and ends the session the same way EOF at the main
+prompt already did — so an unguarded prompt anywhere below (a guidance
+comment, a paste) degrades to a clean "bye" instead of a traceback. That is
+the backstop, not the mechanism.
+
+Ninth instance this pass of a rule applied at one entry point: `run()`'s
+bootstrap ask already wrapped its prompt in `except (EOFError,
+KeyboardInterrupt)`, so the codebase knew this was needed — in one caller,
+while the shared primitive left every other caller exposed.
+
+`test_confirm_is_a_numbered_menu_with_default_first`'s fake `select` had a
+fixed signature and broke on the new argument. Widened to `**kw` — that test
+is about option ORDER — and it now also asserts `eof_key == "n"`, so the
+tolerance does not cost coverage.
+
+Tests: `test_eof_at_the_approval_gate_stops_instead_of_approving`,
+`test_eof_at_the_other_gates_fails_safe`,
+`test_select_without_an_eof_key_still_raises`, and
+`test_a_menu_command_over_a_pipe_exits_cleanly` (the original reproduction,
+as a subprocess). All fail without the fix.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R213 → R214, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R215. The startup health probe crashed with no model configured — `engine.py`, `ui.py` (2026-08-13)
+
+`_provider_for` returns `None` when no model is configured. `context_stats`
+guards that explicitly, with a comment naming how it happens: "possible after
+`/model remove` of the last entry, R81". `_provider_health_uncached` did not,
+and went straight to `provider.api_key`.
+
+The probe runs fire-and-forget on a daemon thread, so nothing caught it and
+nothing was meant to. The result: `AttributeError: 'NoneType' object has no
+attribute 'api_key'` dumped as a raw thread traceback to stderr, BEFORE the
+banner — while the process still exited 0. Loud, alarming, and costing the
+health check that was supposed to tell the user what was wrong.
+
+Found by running Aurora against a `models: []` config, which is also what a
+`/model remove` of the last entry leaves behind.
+
+Tenth instance this pass of a guard applied at one of its entry points, and
+the third where the codebase demonstrably knew about the case — `context_stats`
+carries the explanation, in a comment, six hundred lines away.
+
+The probe now returns `{"ok": False, "detail": "no model configured"}`. The
+banner also rendered `engine.current.get('model')` directly, printing the
+literal word "None" next to "✘ no model configured"; it now shows `(none)`.
+The turn path already told the user what to do ("no model selected — /model
+to pick one") and is unchanged.
+
+Tests: `test_the_health_probe_survives_having_no_model_configured` (asserts
+the precondition too, so it fails loudly if `_provider_for` ever stops
+returning None here) and `test_startup_with_no_model_is_clean_and_says_so`,
+a subprocess checking stderr carries no traceback and the banner names the
+state. Both fail without the fix.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R214 → R215, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R216. A YAML typo tracebacked; R215's health message contradicted itself — `__main__.py`, `engine.py` (2026-08-13)
+
+Two findings from running Aurora against four deliberately degenerate configs
+(dangling provider, missing provider, wrong type, malformed YAML). The other
+two behaved correctly.
+
+**A YAML typo in config.yaml surfaced as a raw `yaml.parser.ParserError`
+traceback** out of `main()`. config.yaml is hand-edited — R199 and R202 both
+turned on that fact — so a typo is a normal event, not a corruption scenario.
+The allowlist has had `ApproveLoadError` for exactly this since R170a; the
+config, which users edit far more often, had nothing. Now `not valid YAML`
+plus the parser's own message, which already names the file, line and column,
+and exit 1. The traceback was the noise; the location was the useful part and
+is kept.
+
+**R215's own message was wrong in a case R215 did not consider.**
+`_provider_for` returns `None` for two DIFFERENT reasons, and R215 reported
+both as "no model configured" — so a config whose model names no provider
+rendered as:
+
+    model    v/m  ✘ no model configured
+
+a line that contradicts itself. Split apart: no model at all keeps "no model
+configured"; a model with no provider set says so instead. Recorded as its own
+entry rather than an edit to R215 because it is a real behaviour change and
+because the shape is worth naming — R215 fixed a crash by adding a branch, and
+the branch inherited the crash's assumption about why it had been reached.
+
+A third case is distinct again and was already correct: a model naming a
+provider the config does not DEFINE gets a real but keyless provider from
+`make_provider`, never reaches the None branch, is already reported unhealthy,
+and fails the request with a readable "missing an 'http'" error. My first
+draft of the test asserted it took the None path; the code was right and the
+test was wrong, so the test now pins all three cases apart.
+
+Tests: `test_a_yaml_typo_in_the_config_is_a_message_not_a_traceback`
+(subprocess: exit 1, no traceback, `line 3` preserved) and
+`test_health_distinguishes_no_model_from_no_provider`. Both fail without the
+fix.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R215 → R216, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R217. An unusable AURORA_HOME crashed with a pathlib traceback — `paths.py`, `__main__.py` (2026-08-13)
+
+Everything persistent goes through `aurora_home()` — sessions, allowlist,
+denylist, key store, checkpoints — and both it and `sessions_dir()` did a bare
+`mkdir(parents=True, exist_ok=True)`. So an unusable AURORA_HOME surfaced as a
+raw traceback out of whichever caller touched it first, which is arbitrary.
+
+Two causes, both reproduced by running Aurora rather than reading it, and both
+ordinary environment mistakes rather than corruption:
+
+- **AURORA_HOME points at a file** — a stale path, a typo in a shell rc.
+  `FileExistsError: [Errno 17] File exists`.
+- **AURORA_HOME is not writable** — a read-only mount, wrong ownership.
+  `PermissionError: [Errno 13] Permission denied: .../sessions`.
+
+`_ensure_dir` now wraps both call sites and raises `AuroraHomeError` with a
+sentence that names the variable and says which of the two it is; `main()`
+exits 1 on it, beside R216's YAML handler. The failure is fatal either way —
+Aurora genuinely cannot run without a writable home — so this changes nothing
+about the outcome, only about whether the user can tell what to fix.
+
+Third entry in a row (R215, R216, R217) where a legitimate user-facing
+condition arrived as a traceback. The pattern is narrower than "add error
+handling": in each case the failing operation was a one-liner nobody thought
+of as a failure point — `provider.api_key`, `yaml.safe_load`, `mkdir` — sitting
+under a function whose job was described as something else.
+
+Tests: `test_an_unusable_aurora_home_is_explained_not_tracebacked` (both
+causes), `test_a_usable_aurora_home_still_just_works` (the wrapper must be
+invisible on the normal path — it still creates nested directories and
+returns them), and `test_startup_with_an_unusable_home_exits_cleanly`
+(subprocess: exit 1, no traceback, names AURORA_HOME).
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R216 → R217, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.

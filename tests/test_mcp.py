@@ -18,6 +18,23 @@ _CHATTY_SERVER = str(Path(__file__).parent / "fixtures" / "chatty_mcp_server.py"
 _REFUSING_SERVER = str(Path(__file__).parent / "fixtures" / "refusing_mcp_server.py")
 _NOISY_SERVER = str(Path(__file__).parent / "fixtures" / "noisy_mcp_server.py")
 _ENV_SERVER = str(Path(__file__).parent / "fixtures" / "env_mcp_server.py")
+_MALFORMED_SERVER = str(Path(__file__).parent / "fixtures"
+                        / "malformed_tools_mcp_server.py")
+_BABBLING_SERVER = str(Path(__file__).parent / "fixtures"
+                       / "babbling_mcp_server.py")
+_FIREHOSE_SERVER = str(Path(__file__).parent / "fixtures"
+                       / "firehose_mcp_server.py")
+
+
+def _child_python_count() -> int:
+    """Live fixture-server processes, for leak assertions. `pgrep -f` on the
+    fixtures directory rather than a PID list, so it catches a child whose
+    only reference was dropped (see the duplicate-name test)."""
+    import subprocess
+    out = subprocess.run(
+        ["pgrep", "-f", str(Path(__file__).parent / "fixtures")],
+        capture_output=True, text=True).stdout
+    return len([line for line in out.split() if line.strip()])
 
 
 # ── aurora.mcp: the client itself, against a real (fake) server process ────
@@ -271,6 +288,210 @@ def test_mcp_manager_skips_entries_missing_name_or_command():
     manager = mcp.MCPManager([{"command": sys.executable}, {"name": "x"}])
     assert manager.specs() == []
     assert len(manager.errors) == 2
+
+
+# ── R187a: a malformed tools/list must not cost the OTHER servers ──────────
+def test_malformed_tool_entries_are_dropped_not_raised():
+    # tools/list is the SERVER's data; it used to be stored verbatim, so
+    # _to_aurora_spec's mcp_tool['name'] raised KeyError on a nameless entry.
+    server = mcp.MCPServer("malformed", sys.executable, [_MALFORMED_SERVER])
+    try:
+        assert [t["name"] for t in server.tools] == ["good"]
+        # one warning per dropped entry: no name, non-string name, blank
+        # name, and a bare string instead of an object
+        assert len(server.warnings) == 4
+        assert server.call_tool("good", {}) == "ok"
+    finally:
+        server.close()
+
+
+def test_one_malformed_server_does_not_lose_a_healthy_servers_tools():
+    # the regression this fix exists for: the KeyError surfaced in
+    # specs()/runners(), which run in mcp_extension.register() — AFTER
+    # MCPManager.__init__'s per-server guard — so ALL mcp tools vanished and
+    # the warning named no server at all.
+    manager = mcp.MCPManager([
+        {"name": "fake", "command": sys.executable, "args": [_FAKE_SERVER]},
+        {"name": "bad", "command": sys.executable, "args": [_MALFORMED_SERVER]},
+    ])
+    try:
+        names = sorted(s["name"] for s in manager.specs())
+        assert names == ["mcp_bad_good", "mcp_fake_echo"]
+        assert sorted(manager.runners()) == names
+        # and the dropped entries are attributed to the server that sent them
+        assert manager.errors, "malformed entries must not be silent"
+        assert all(e.startswith("bad: ") for e in manager.errors)
+    finally:
+        manager.close_all()
+
+
+def test_tools_list_that_isnt_a_list_fails_that_server_only():
+    manager = mcp.MCPManager([
+        {"name": "fake", "command": sys.executable, "args": [_FAKE_SERVER]},
+        {"name": "wrongshape", "command": sys.executable,
+         "args": [_MALFORMED_SERVER, "--not-a-list"]},
+    ])
+    try:
+        assert [s["name"] for s in manager.specs()] == ["mcp_fake_echo"]
+        assert any("wrongshape" in e and "expected a list" in e
+                  for e in manager.errors)
+    finally:
+        manager.close_all()
+
+
+# ── R187e: lifecycle + protocol hardening ──────────────────────────────────
+def test_an_endlessly_chattering_server_still_hits_an_absolute_ceiling():
+    # the per-read reset (R126, deliberate) means "data still arriving" keeps
+    # extending the deadline — a server that never sends the reply blocked the
+    # turn thread forever
+    server = mcp.MCPServer("babble", sys.executable, [_BABBLING_SERVER],
+                          timeout=0.4)
+    started = time.monotonic()
+    try:
+        with pytest.raises(mcp.MCPServerError) as excinfo:
+            server.call_tool("babble", {})
+        assert "no reply to this request" in str(excinfo.value)
+        elapsed = time.monotonic() - started
+        # bounded by timeout * _MAX_TOTAL_WAIT_MULT, not unbounded, and not
+        # cut short at the per-read timeout either (data really is arriving)
+        assert elapsed > 0.4
+        assert elapsed < 0.4 * mcp._MAX_TOTAL_WAIT_MULT + 3
+    finally:
+        server.close()
+
+
+def test_a_server_sending_an_endless_line_hits_a_byte_ceiling(monkeypatch):
+    """R197: R187e's ceilings all bound how LONG a server may take; none
+    bounded how MUCH it may send before completing a single line.
+    `_read_response` accumulates 64KB chunks until it finds a newline, so a
+    server streaming an unterminated line grows the buffer at pipe speed for
+    the whole `timeout * _MAX_TOTAL_WAIT_MULT` window. One JSON-RPC line is
+    how a large tool result legitimately arrives, so this is the degenerate
+    end of normal behaviour rather than a hostile special case.
+
+    The cap is lowered here so the test costs megabytes, not the real 64MB.
+    Fails without the fix: the buffer grows until the TIME ceiling trips,
+    reporting a timeout rather than the real cause."""
+    monkeypatch.setattr(mcp, "_MAX_RESPONSE_BYTES", 4 * 1024 * 1024)
+    server = mcp.MCPServer("firehose", sys.executable, [_FIREHOSE_SERVER],
+                           timeout=10)
+    try:
+        with pytest.raises(mcp.MCPServerError) as excinfo:
+            server.call_tool("flood", {})
+        assert "without a complete line" in str(excinfo.value)
+        assert len(server._buf) < 8 * 1024 * 1024, "buffer outgrew the cap"
+    finally:
+        server.close()
+
+
+def test_close_reaps_the_child_and_closes_its_pipes():
+    server = mcp.MCPServer("fake", sys.executable, [_FAKE_SERVER])
+    proc = server._proc
+    server.close()
+    # reaped, not left a zombie: poll() returns a status, not None
+    assert proc.poll() is not None
+    assert proc.stdin is None or proc.stdin.closed
+    assert proc.stdout is None or proc.stdout.closed
+
+
+def test_a_killed_child_also_has_its_pipes_closed():
+    server = mcp.MCPServer("fake", sys.executable, [_FAKE_SERVER])
+    proc = server._proc
+    server._kill_unresponsive()
+    assert proc.poll() is not None
+    assert proc.stdin is None or proc.stdin.closed
+    assert proc.stdout is None or proc.stdout.closed
+    server.close()      # idempotent
+
+
+def test_a_protocol_version_mismatch_is_recorded_but_not_fatal():
+    # the handshake result was discarded, so a server answering with another
+    # version looked identical to one that agreed
+    server = mcp.MCPServer("oldver", sys.executable,
+                          [_BABBLING_SERVER, "--version", "2000-01-01"])
+    try:
+        assert any("2000-01-01" in w and "2024-11-05" in w
+                  for w in server.warnings)
+        # recorded, NOT enforced — the server still works
+        assert [t["name"] for t in server.tools] == ["babble"]
+    finally:
+        server.close()
+
+
+def test_a_matching_protocol_version_produces_no_warning():
+    server = mcp.MCPServer("fake", sys.executable, [_FAKE_SERVER])
+    try:
+        assert server.warnings == []
+    finally:
+        server.close()
+
+
+# ── R187c: `timeout:` must reach MCPServer from config ─────────────────────
+def test_config_timeout_is_forwarded_to_the_server():
+    # supported by MCPServer from the start but never forwarded, so the 15s
+    # default was unreachable — and crossing it kills the child permanently
+    manager = mcp.MCPManager([{"name": "fake", "command": sys.executable,
+                              "args": [_FAKE_SERVER], "timeout": 42}])
+    try:
+        assert manager._servers["fake"].timeout == 42.0
+    finally:
+        manager.close_all()
+
+
+def test_timeout_defaults_when_not_configured():
+    manager = mcp.MCPManager([{"name": "fake", "command": sys.executable,
+                              "args": [_FAKE_SERVER]}])
+    try:
+        assert manager._servers["fake"].timeout == mcp._DEFAULT_TIMEOUT
+    finally:
+        manager.close_all()
+
+
+@pytest.mark.parametrize("bad", ["soon", -1, 0, [], {}])
+def test_an_invalid_timeout_warns_and_falls_back_to_the_default(bad):
+    # a typo in config.yaml must not silently produce a 0s (or negative)
+    # ceiling that kills every server on its first call
+    manager = mcp.MCPManager([{"name": "fake", "command": sys.executable,
+                              "args": [_FAKE_SERVER], "timeout": bad}])
+    try:
+        assert manager._servers["fake"].timeout == mcp._DEFAULT_TIMEOUT
+        assert any("invalid timeout" in e for e in manager.errors)
+    finally:
+        manager.close_all()
+
+
+# ── R187b: a duplicate mcp_servers name must not orphan a child ───────────
+def test_duplicate_server_name_is_refused_before_spawning():
+    before = _child_python_count()
+    manager = mcp.MCPManager([
+        {"name": "dup", "command": sys.executable, "args": [_FAKE_SERVER]},
+        {"name": "dup", "command": sys.executable, "args": [_FAKE_SERVER]},
+    ])
+    try:
+        # only one server, and only one set of tools (two would have produced
+        # colliding mcp_dup_echo specs anyway)
+        assert [s["name"] for s in manager.specs()] == ["mcp_dup_echo"]
+        assert any("duplicate" in e for e in manager.errors)
+        # the refused entry must never have been started
+        assert _child_python_count() == before + 1
+    finally:
+        manager.close_all()
+    time.sleep(0.5)
+    # and nothing is left behind afterwards — previously the displaced child
+    # was unreachable from close_all()/atexit and survived the whole session
+    assert _child_python_count() <= before
+
+
+def test_a_malformed_server_leaves_no_orphaned_child(tmp_path):
+    # a tools/list breach raises from __init__, which must still not leak the
+    # child it spawned (the R145a guarantee, re-checked for this new path)
+    before = _child_python_count()
+    manager = mcp.MCPManager([
+        {"name": "wrongshape", "command": sys.executable,
+         "args": [_MALFORMED_SERVER, "--not-a-list"]}])
+    manager.close_all()
+    time.sleep(0.5)
+    assert _child_python_count() <= before
 
 
 def test_mcp_read_timeout_fires_against_a_server_that_never_replies():
@@ -567,6 +788,55 @@ def test_extension_tool_specs_includes_loaded_extension_tools(tmp_path, monkeypa
         names = {s["name"] for s in ui._extension_tool_specs()}
         assert "mcp_fake_echo" in names
         assert "lint_check" in names   # bundled alongside the configured MCP server
+    finally:
+        if e._mcp_manager:
+            e._mcp_manager.close_all()
+        tools.set_extensions([], {})
+
+
+# ── R187d: a malformed extension must not stop Aurora starting ─────────────
+def test_set_extensions_skips_a_spec_that_isnt_an_object():
+    try:
+        warnings = tools.set_extensions(["oops", {"name": "fine"}],
+                                       {"fine": lambda **_: "ok"})
+        assert [s["name"] for s in tools._EXTENSION_SPECS] == ["fine"]
+        assert any("isn't an object" in w for w in warnings)
+    finally:
+        tools.set_extensions([], {})
+
+
+def test_set_extensions_skips_a_nameless_spec():
+    # a nameless spec used to be kept, reaching the model as an unnamed tool
+    # with no runner behind it — advertised and permanently uncallable
+    try:
+        warnings = tools.set_extensions(
+            [{"description": "no name"}, {"name": "  "}], {})
+        assert tools._EXTENSION_SPECS == []
+        assert len(warnings) == 2
+        assert all("no usable name" in w for w in warnings)
+    finally:
+        tools.set_extensions([], {})
+
+
+def test_a_broken_extension_file_does_not_prevent_engine_construction(
+        tmp_path, monkeypatch):
+    # `SPEC = ["oops"]` used to raise AttributeError out of Engine.__init__
+    # (set_extensions ran unguarded there), so one bad file in
+    # ~/.aurora/extensions/ meant Aurora would not start at all
+    home = tmp_path / "home"
+    ext = home / "extensions"
+    ext.mkdir(parents=True)
+    (ext / "broken.py").write_text('SPEC = ["oops"]\nRUNNERS = {}\n')
+    monkeypatch.setenv("AURORA_HOME", str(home))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_CFG.format(command=sys.executable, arg=_FAKE_SERVER))
+    from aurora.engine import Engine
+    e = Engine(str(cfg))            # must not raise
+    try:
+        assert any("broken" in w or "isn't an object" in w
+                  for w in e.extension_warnings)
+        # the healthy bundled tools survived
+        assert "lint_check" in {s["name"] for s in tools._EXTENSION_SPECS}
     finally:
         if e._mcp_manager:
             e._mcp_manager.close_all()

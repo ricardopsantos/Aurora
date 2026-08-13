@@ -315,40 +315,51 @@ def test_literal_guard_is_a_true_superset_of_its_pattern(name, pattern, guard):
             f"guard {guard} misses a real match: {s!r}"
 
 
-def test_scan_is_faster_with_literal_guards_on_ordinary_text():
-    """R96g: most real text (source code, logs) contains none of the
-    per-pattern literals, so the guard should skip most of the ten regex
-    passes entirely rather than running all of them. Compares scan() against
-    a copy of the pre-fix loop (no guard) on the same text."""
-    import time
+def test_the_literal_guard_skips_patterns_that_cannot_match(monkeypatch):
+    """R96g: on ordinary text (source, logs) none of the per-pattern literals
+    appear, so the guard should skip most of the ten regex passes entirely
+    rather than running them all.
 
-    def scan_unguarded(text):
-        found = []
-        claimed = bytearray(len(text))
-        for name, pat in secrets.PATTERNS:
-            for m in pat.finditer(text):
-                s, e = m.span()
-                if b"\x01" in claimed[s:e]:
-                    continue
-                claimed[s:e] = b"\x01" * (e - s)
-                found.append(m)
-        return found
+    This asserted a wall-clock RATIO (`guarded < unguarded * 0.8`) until it
+    failed twice in full-suite runs while passing alone — a timing comparison
+    measures the machine, and this pass added several subprocess-spawning
+    tests that make it busier. It now counts which patterns actually reach
+    `finditer`, which is the mechanism R96g introduced, is exact, and cannot
+    be perturbed by load. Timing is what motivated the fix; it is not what
+    the fix promises."""
+    ran: list[str] = []
+
+    class _Counting:
+        def __init__(self, name, pat):
+            self._name, self._pat = name, pat
+
+        def finditer(self, text):
+            ran.append(self._name)
+            return self._pat.finditer(text)
+
+    monkeypatch.setattr(secrets, "PATTERNS",
+                        [(n, _Counting(n, p)) for n, p in secrets.PATTERNS])
 
     code = open(secrets.__file__.replace("secrets.py", "tui.py")).read()
     blob = (code * (60_000 // len(code) + 1))[:60_000]
+    secrets.scan(blob)
 
-    t0 = time.perf_counter()
-    for _ in range(10):
-        scan_unguarded(blob)
-    unguarded_ms = (time.perf_counter() - t0) / 10 * 1000
+    # The invariant, stated exactly: a pattern runs only if it is guard-exempt
+    # or one of its literals really is in the text. Note this is a SUPERSET
+    # filter, not a predictor of matches — `tui.py` contains `_live_clock_key`,
+    # so the Stripe guard `_live_` legitimately fires and that regex runs and
+    # finds nothing. That is the guard working as designed, not leaking.
+    for name in set(ran):
+        guard = secrets._LITERAL_GUARD.get(name)
+        assert guard is None or any(lit in blob for lit in guard), \
+            f"{name} ran although none of its literals appear"
+    assert len(set(ran)) < len(secrets.PATTERNS), "no pattern was skipped at all"
 
-    t1 = time.perf_counter()
-    for _ in range(10):
-        secrets.scan(blob)
-    guarded_ms = (time.perf_counter() - t1) / 10 * 1000
-
-    assert guarded_ms < unguarded_ms * 0.8, \
-        f"unguarded={unguarded_ms:.2f}ms guarded={guarded_ms:.2f}ms — guard isn't helping"
+    # and a literal that IS present must still be scanned, or the guard is
+    # not filtering but simply breaking detection
+    ran.clear()
+    secrets.scan(blob + " AKIAIOSFODNN7EXAMPLE ")
+    assert "AWS access key" in ran
 
 
 def test_a_secret_glued_onto_a_pattern_match_is_still_reported():

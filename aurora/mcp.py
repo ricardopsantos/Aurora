@@ -85,9 +85,43 @@ _STDERR_KEEP_LINES = 50
 _STDERR_QUOTE_LINES = 5
 _STDERR_QUOTE_CHARS = 400
 
+# Per-request ceiling when a server's config doesn't set `timeout:`. Generous
+# enough for a handshake and an ordinary tool call, but NOT for every server:
+# one that shells out to real work needs more (agentic_context_mcp allows its
+# scripts 30s), and since crossing this kills the child with no reconnect,
+# the config override is the difference between a slow call and a server
+# that's gone for the rest of the session. See MCPManager.__init__.
+_DEFAULT_TIMEOUT = 15.0
+
+# Absolute ceiling on ONE request, as a multiple of `timeout`. The per-read
+# deadline reset (see _read_response) deliberately lets a server that keeps
+# talking keep its allowance — but with no upper bound, a server emitting
+# notifications in a loop and never the reply blocks the turn thread forever.
+_MAX_TOTAL_WAIT_MULT = 8
+
+# R197: ceiling on the unparsed read buffer for ONE response. `_read_response`
+# accumulates 64KB chunks until it finds a newline, so a server that sends a
+# very long line — or never terminates one at all — grows this without limit.
+# The time caps above don't bound it: they permit up to
+# `timeout * _MAX_TOTAL_WAIT_MULT` seconds of a pipe running at memory speed.
+# Same unbounded-producer shape as R194, and not exotic here: one JSON-RPC
+# line IS how a large MCP tool result arrives.
+#
+# 64MB is far above any legitimate response (`run_tool` truncates the parsed
+# text to TOOL_OUTPUT_LIMIT = 60k anyway) while still bounding the damage.
+_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
 
 class MCPServerError(Exception):
     pass
+
+
+def _brief(value, limit: int = 120) -> str:
+    """A repr bounded for use in a warning on the status surface — same
+    reasoning as `_STDERR_QUOTE_CHARS`: a server that sends something huge
+    and malformed must not paste all of it into a one-line warning."""
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 class MCPServer:
@@ -97,10 +131,17 @@ class MCPServer:
     `tools.PARALLEL_SAFE`, so nothing else calls into this concurrently)."""
 
     def __init__(self, name: str, command: str, args: list[str] | None = None,
-                env: dict[str, str] | None = None, timeout: float = 15.0):
+                env: dict[str, str] | None = None,
+                timeout: float = _DEFAULT_TIMEOUT):
         self.name = name
         self.timeout = timeout
         self.tools: list[dict] = []
+        # Non-fatal complaints about this server: malformed `tools/list`
+        # entries dropped rather than raised (see _discover_tools), and a
+        # protocol-version disagreement (see _initialize). Collected by
+        # MCPManager into the same `errors` surface a failed server startup
+        # already reports through.
+        self.warnings: list[str] = []
         self._id = 0
         self._lock = threading.Lock()
         # R126: BINARY pipes with our own line buffering (`self._buf`), not
@@ -284,6 +325,7 @@ class MCPServer:
         # a buffered line is checked BEFORE ever waiting on the fd again.
         import select
         deadline = time.monotonic() + self.timeout
+        hard_deadline = time.monotonic() + self.timeout * _MAX_TOTAL_WAIT_MULT
         while True:
             line = self._next_buffered_line()
             if line is not None:
@@ -307,6 +349,27 @@ class MCPServer:
             if not chunk:
                 raise self._fail("closed the connection")
             self._buf += chunk
+            # R197: bound the UNPARSED buffer, not just the wait. Everything
+            # above caps how long a server may take; nothing capped how much
+            # it may send before completing a single line.
+            if len(self._buf) > _MAX_RESPONSE_BYTES:
+                self._kill_unresponsive()
+                raise self._fail(
+                    f"response exceeded {_MAX_RESPONSE_BYTES} bytes without a "
+                    "complete line")
+            # R187e: the per-read reset below judges liveness by "is data
+            # still arriving", which a server can satisfy forever — a
+            # notifications/progress loop that never sends the matching reply
+            # kept this blocked with no ceiling, and it runs on the turn's
+            # own thread. The absolute cap bounds that without weakening the
+            # intent: a server doing real work still gets its full per-read
+            # allowance, up to a total generous enough (_MAX_TOTAL_WAIT_MULT
+            # x timeout) that only a genuinely stuck stream reaches it.
+            if time.monotonic() >= hard_deadline:
+                self._kill_unresponsive()
+                raise self._fail(
+                    f"still sending data but no reply to this request after "
+                    f"{self.timeout * _MAX_TOTAL_WAIT_MULT:g}s")
             # Review pass: the deadline was computed once and never touched
             # again, so a server that's genuinely alive and doing real work —
             # streaming `notifications/progress` lines while a slow tool call
@@ -332,6 +395,19 @@ class MCPServer:
         del self._buf[:nl + 1]
         return line
 
+    def _close_pipes(self) -> None:
+        """R187e: stdin/stdout were never closed — only stderr, by the drain
+        thread. Two descriptors per server therefore stayed open until the
+        Popen object was garbage collected, which for a long session with
+        several configured servers is a slow fd leak against the process
+        limit. Both teardown paths (`close`, `_kill_unresponsive`) end here."""
+        for pipe in (self._proc.stdin, self._proc.stdout):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except Exception:
+                pass
+
     def _kill_unresponsive(self) -> None:
         """A timed-out server gets killed rather than left running — same
         reasoning as tools.py's grep timeout: an unresponsive child left
@@ -342,19 +418,65 @@ class MCPServer:
             self._proc.wait(timeout=3)
         except Exception:
             pass
+        self._close_pipes()
 
     def _initialize(self) -> None:
         with self._lock:
-            self._send("initialize", {
+            result = self._send("initialize", {
                 "protocolVersion": _PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": _CLIENT_INFO})
             self._send("notifications/initialized", notification=True)
+        # R187e: the handshake result used to be discarded outright, so a
+        # server answering with a different protocol version looked identical
+        # to one that agreed — and the mismatch surfaced later as whatever
+        # unrelated-looking symptom it happened to cause (a missing field, an
+        # empty tool list). Recorded, NOT enforced: the spec expects a client
+        # to accept a server's version or fail, but Aurora can't know which
+        # differences matter, and refusing a server that then works fine
+        # would be a worse regression than the ambiguity. Servers are
+        # user-configured and mostly work; this just makes the disagreement
+        # visible in the same warnings surface everything else uses.
+        served = (result or {}).get("protocolVersion")
+        if isinstance(served, str) and served != _PROTOCOL_VERSION:
+            self.warnings.append(
+                f"speaks MCP {served}, client requested {_PROTOCOL_VERSION} "
+                f"— proceeding, but treat protocol-shaped oddities as suspect")
 
     def _discover_tools(self) -> None:
+        """Keep only the tool entries Aurora can actually build a spec from,
+        recording why any were dropped (`self.warnings`).
+
+        `tools/list` output is a SERVER's data, not ours, and it used to be
+        stored verbatim — so `_to_aurora_spec`'s `mcp_tool['name']` raised
+        KeyError on an entry without a name. That raise happens in
+        `specs()`/`runners()`, which run in `mcp_extension.register()`, well
+        after `MCPManager.__init__`'s per-server try/except has finished — so
+        the "one bad server must never take down the others" guarantee that
+        constructor exists to provide did not hold: the whole extension
+        failed to register, taking every OTHER server's tools with it, and
+        the resulting warning named no server. Validating here, at the point
+        the data arrives, keeps the failure per-server and per-tool."""
         with self._lock:
             result = self._send("tools/list", {})
-        self.tools = result.get("tools", [])
+        entries = result.get("tools", [])
+        if not isinstance(entries, list):
+            raise self._fail(
+                f"tools/list returned {type(entries).__name__}, expected a list")
+        kept: list[dict] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                self.warnings.append(
+                    f"skipped a tools/list entry that isn't an object: "
+                    f"{_brief(entry)}")
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                self.warnings.append(
+                    f"skipped a tool with no usable name: {_brief(entry)}")
+                continue
+            kept.append(entry)
+        self.tools = kept
 
     def call_tool(self, tool_name: str, arguments: dict) -> str:
         with self._lock:
@@ -376,8 +498,15 @@ class MCPServer:
         except Exception:
             try:
                 self._proc.kill()
+                # R187e: the wait() was missing here, so a child that ignored
+                # SIGTERM got killed and then never reaped — a zombie holding
+                # a process-table slot until Aurora itself exited.
+                # `_kill_unresponsive` always did this correctly; this path
+                # didn't.
+                self._proc.wait(timeout=3)
             except Exception:
                 pass
+        self._close_pipes()
         # R153: the drain thread ends at EOF once the child is gone, and it
         # closes the stderr pipe itself. Joined only so a caller that closes
         # every server in a loop isn't left with threads still winding down.
@@ -420,14 +549,55 @@ class MCPManager:
                 self.errors.append(
                     f"skipped a mcp_servers entry missing name/command: {c!r}")
                 continue
+            # Rejected BEFORE spawning, not after. `self._servers[name] = ...`
+            # silently overwrote the earlier entry, dropping the only
+            # reference to a child that was already spawned AND handshaked —
+            # and since close_all() iterates the dict's values, neither it nor
+            # the atexit hook could ever reach it, so it outlived the session.
+            # (Same leak class as R145a, reached by a different route: there
+            # the object was never stored because __init__ raised, here it was
+            # stored and then displaced.) Refusing up front also keeps the
+            # tool namespace honest — two servers sharing a name produce
+            # colliding `mcp_<name>_<tool>` specs, so one set was unreachable
+            # regardless of which server won the dict slot.
+            if name in self._servers:
+                self.errors.append(
+                    f"{name}: duplicate mcp_servers name — skipped this "
+                    f"entry; names must be unique (they prefix every tool as "
+                    f"mcp_<name>_<tool>)")
+                continue
             env = _resolve_env(c.get("env") or {})
+            # `timeout:` was supported by MCPServer from the start but never
+            # forwarded from config, so the 15s default was unreachable — and
+            # a server whose own work legitimately runs longer got killed
+            # (_kill_unresponsive) with no reconnect, i.e. dead for the rest
+            # of the session on its first slow call. agentic_context_mcp
+            # allows its scripts 30s by design, so the two ceilings were in
+            # direct conflict with no way for the user to resolve it.
+            timeout = c.get("timeout")
             try:
-                self._servers[name] = MCPServer(name, command, c.get("args"), env)
+                timeout = _DEFAULT_TIMEOUT if timeout is None else float(timeout)
+                if timeout <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                self.errors.append(
+                    f"{name}: ignoring invalid timeout {c.get('timeout')!r} "
+                    f"(want a positive number of seconds), using "
+                    f"{_DEFAULT_TIMEOUT:g}s")
+                timeout = _DEFAULT_TIMEOUT
+            try:
+                server = MCPServer(name, command, c.get("args"), env,
+                                   timeout=timeout)
             except Exception as e:
                 # one bad server must never take down the others, or Aurora
                 # itself — same "a tool must not kill the turn" principle
                 # (R42), applied here at startup instead of per-call
                 self.errors.append(f"{name}: {e.__class__.__name__}: {e}")
+                continue
+            self._servers[name] = server
+            # A server that connected fine can still have sent unusable tool
+            # entries; surface those per-server rather than losing them.
+            self.errors += [f"{name}: {w}" for w in server.warnings]
         if self._servers:
             atexit.register(self.close_all)
 

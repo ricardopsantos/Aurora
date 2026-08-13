@@ -54,8 +54,9 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
-from . import bootstrap, colors, memory, rewind, tools, ui
+from . import bootstrap, colors, rewind, tools, ui
 from .colors import BOLD, CYAN, GREEN, RED, RESET, URL_RE, YELLOW, dim
+from .colors import strip_dangerous_escapes as _strip_dangerous_escapes
 from .engine import Engine
 from .paths import aurora_home
 
@@ -288,41 +289,7 @@ def _linkify_fragments(frags):
     return out
 
 
-# R170l: OSC/DCS/APC/PM/SOS strings a subprocess can emit — clipboard
-# hijack (OSC 52), a window-title/resize request, a "define this string as
-# a macro" DCS payload, and similar. `ANSI(text).__pt_formatted_text__()`
-# (used to render bash output, see `_entry_fragments`) only recognizes CSI
-# (`\x1b[`) sequences for styling; anything else after an ESC falls through
-# its "not '[' → continue" branch, which drops the ESC and the ONE
-# character read after it but then resumes parsing the REST of the
-# sequence's body as ordinary text — so the payload shows up as garbled
-# literal characters in the transcript rather than actually being
-# forwarded to the real terminal (prompt_toolkit fully owns rendering and
-# never blindly passes raw bytes through) — but a crafted payload
-# containing its OWN embedded CSI sequence could still inject real style
-# codes into that fallthrough text, and the garbled byte-soup itself is
-# confusing/unwanted regardless. Stripped entirely before storage, so
-# neither the display NOR anything copied out of it (/copy-all, session
-# export) carries the raw sequence. Plain CSI sequences (`\x1b[...m` colors,
-# the common and legitimate case) are deliberately left alone.
-_DANGEROUS_ESCAPES = re.compile(
-    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"   # OSC ... (BEL or ST terminated)
-    r"|\x1b[PX^_][^\x1b]*\x1b\\"            # DCS / SOS / PM / APC ... ST
-    # R171: a crashed binary, a tool cut off by the output cap, or a
-    # deliberately malformed payload can emit an OSC/DCS/APC/PM/SOS
-    # introducer with NO terminator at all — the two alternatives above both
-    # require one, so `"\x1b]52;c;PAYLOAD"` (no trailing BEL/ST) passed
-    # through unchanged. Since this only ever runs on a fully-captured
-    # command output (not a mid-stream chunk), "no terminator anywhere in
-    # the rest of the text" is unambiguous — strip from the introducer to
-    # the end of the string.
-    r"|\x1b\][^\x1b]*\Z"                    # unterminated OSC → end of text
-    r"|\x1b[PX^_][^\x1b]*\Z"                # unterminated DCS/SOS/PM/APC
-)
 
-
-def _strip_dangerous_escapes(text: str) -> str:
-    return _DANGEROUS_ESCAPES.sub("", text)
 
 
 class _ChatWriter(io.TextIOBase):
@@ -548,6 +515,11 @@ class Tui:
         self._debug = debug          # --debug: tint chat green, status bar pink
         self._chat: list = []        # str | think dict
         self._cache: list = []       # per-entry (fragments, nlines) | None
+        # R205: per-entry line count, parallel to _chat/_cache, invalidated by
+        # the same `_dirty(i)` that invalidates the render cache — so it stays
+        # derived from the entries themselves (the drift-free property
+        # `_evict_locked` insists on) without rescanning their bytes.
+        self._line_counts: list = []
         self._text_cache = None      # flattened fragments for the whole chat
         self._offsets: list = []     # R96b: _offsets[i] = (fragment index,
         # line count) where entry i starts inside _text_cache — lets a rebuild
@@ -633,6 +605,9 @@ class Tui:
         # highlighted and offers "copy selected" on the status bar until
         # copied or a new drag starts
         self._sel_notice: tuple = ("", 0.0)      # ("copied …", monotonic ts)
+        # R212: last distinct status-render failure, so the bar reports it
+        # once instead of every frame. See `status()`'s handler.
+        self._status_error: str | None = None
         self._input_click_at = 0.0   # R135a: last left MOUSE_UP in the prompt,
         # for the double-click gesture (monotonic)
         self._open_think = False     # a live (undone) think row exists
@@ -644,12 +619,7 @@ class Tui:
         self._open_think_items: list = []
         self._saved_draft = ""       # input text preserved across challenges
         self._help_visible = False
-        # computed once — the project layout doesn't change mid-session, and
-        # find_context_root() walks the filesystem, too costly to redo on
-        # every status-bar render tick
-        self._agentic_root = memory.find_context_root(".")
-        self._help_text = ANSI(ui.help_text(
-            self._agentic_root is not None)).__pt_formatted_text__()
+        self._help_text = ANSI(ui.help_text()).__pt_formatted_text__()
 
         self.fe = TuiFrontend(
             self,
@@ -677,6 +647,7 @@ class Tui:
         """Mark entry i for a re-parse and remember the lowest dirty index —
         the next render re-flattens only from there (R96b)."""
         self._cache[i] = None
+        self._line_counts[i] = None      # R205
         self._dirty_from = i if self._dirty_from is None \
             else min(self._dirty_from, i)
 
@@ -706,16 +677,51 @@ class Tui:
         # closing clock line), so bias slightly high rather than low
         return (item.get("text") or "").count("\n") + 2
 
+    def _entry_line_count(self, i: int) -> int:
+        """R205: `_entry_lines` for entry i, memoised in `_line_counts`.
+
+        The cache is filled lazily and cleared by `_dirty(i)` — the same call
+        that invalidates the render cache, and already made at every point an
+        entry's text changes — so a stale count is not reachable without also
+        leaving a stale rendering, which the render path would surface loudly."""
+        n = self._line_counts[i]
+        if n is None:
+            n = self._line_counts[i] = self._entry_lines(self._chat[i])
+        return n
+
+    def _total_lines(self) -> int:
+        # fill only the holes, then let `sum` run at C level over the list —
+        # a generator calling a method per entry costs more than the adds do
+        counts = self._line_counts
+        for i, n in enumerate(counts):
+            if n is None:
+                counts[i] = self._entry_lines(self._chat[i])
+        return sum(counts)
+
     def _evict_locked(self) -> int:
         """Drop oldest entries once the transcript passes
         `_SCROLLBACK_MAX_LINES`, down to `_SCROLLBACK_KEEP_LINES`. Caller holds
         `self._lock`. Returns entries dropped.
 
         Called only when a NEW entry is created, never on a merge into the
-        last one — so the O(entries) sum here runs about once per
-        `_MERGE_LIMIT` of output, not per streamed chunk. Recomputing the
-        total from the entries themselves each time (rather than maintaining a
-        running counter across four append sites) keeps it drift-free.
+        last one — so the sum here runs about once per `_MERGE_LIMIT` of
+        output, not per streamed chunk. Recomputing the total from the entries
+        themselves each time (rather than maintaining a running counter across
+        four append sites) keeps it drift-free.
+
+        R205: still recomputed, but from MEMOISED per-entry counts. The sum
+        used to call `_entry_lines` on every entry, and that does
+        `text.count("\\n")` over the entry's whole text — so each new entry
+        rescanned every byte of the transcript, and a session that creates
+        entries rather than merging into one (tool results, notices, think
+        rows) was quadratic in total bytes. Measured on entries just over
+        `_MERGE_LIMIT`: 2.1ms per new entry at 2k entries, 8.1ms at 12k,
+        against 1.2us when text merges — 96 SECONDS to append 12k entries.
+        With the memo it is an int sum over ~5k cached values.
+
+        The drift-free property is unchanged: counts are still derived from
+        the entries, just not re-derived when nothing changed — `_dirty(i)`
+        clears the memo at every point an entry's text is mutated.
 
         Trimming shifts every absolute line coordinate, so the flattened
         caches are dropped wholesale and any selection is INVALIDATED rather
@@ -723,17 +729,19 @@ class Tui:
         cheap to redo and easy to get subtly wrong. The full re-flatten this
         forces costs one frame's worth of work, amortized over the ~2k lines
         between the high and low marks."""
-        total = sum(self._entry_lines(e) for e in self._chat)
+        total = self._total_lines()
         if total <= self._SCROLLBACK_MAX_LINES:
             return 0
         dropped = 0
         # never drop the newest entry — think_chunk/append hold a reference to
         # it and keep writing into it
         while len(self._chat) > 1 and total > self._SCROLLBACK_KEEP_LINES:
-            total -= self._entry_lines(self._chat[0])
+            total -= self._entry_line_count(0)
             del self._chat[0]
             if self._cache:
                 del self._cache[0]
+            if self._line_counts:
+                del self._line_counts[0]   # R205: stays parallel to _chat
             dropped += 1
         if dropped:
             self._text_cache = None      # force a full re-flatten
@@ -763,6 +771,7 @@ class Tui:
             else:
                 self._chat.append(s)
                 self._cache.append(None)
+                self._line_counts.append(None)
                 self._dirty(len(self._chat) - 1)
                 self._evict_locked()          # R152
         try:
@@ -787,6 +796,7 @@ class Tui:
         with self._lock:
             self._chat.clear()
             self._cache.clear()
+            self._line_counts.clear()
             self._dirty_from = None
             self._text_cache = None
             self._offsets = []
@@ -809,6 +819,7 @@ class Tui:
             self._close_think_locked()
             self._chat.append({"kind": "bash_output", "text": text})
             self._cache.append(None)
+            self._line_counts.append(None)
             self._dirty(len(self._chat) - 1)
             self._evict_locked()              # R152
         try:
@@ -831,6 +842,7 @@ class Tui:
             self._chat.append(row)
             self._open_think_items.append(row)
             self._cache.append(None)
+            self._line_counts.append(None)
             self._dirty(len(self._chat) - 1)
             self._evict_locked()              # R152
             self._open_think = True
@@ -850,9 +862,17 @@ class Tui:
                 self._chat.append(last)
                 self._open_think_items.append(last)
                 self._cache.append(None)
+                self._line_counts.append(None)
                 self._evict_locked()          # R152
                 self._open_think = True
-            last["text"] += chunk
+            # R204: the reasoning stream is model output, exactly like the
+            # reply `append()` sanitizes — R171's argument ("a compromised or
+            # prompt-injected model can put an OSC 52 in its own reply just as
+            # easily as a subprocess can") is about the MODEL, not about which
+            # of its two output channels carried it. This path was missed, so
+            # a payload in `reasoning_content` reached `_chat` raw and was
+            # copied out by /copy-all with it.
+            last["text"] += _strip_dangerous_escapes(chunk)
             self._dirty(len(self._chat) - 1)
         self.app.invalidate()
 
@@ -869,6 +889,17 @@ class Tui:
                     and not item["done"]):
                 item["done"] = True
                 item["dt"] = now - item.get("t0", now)
+                # R204: one full-text pass now that the stream is complete —
+                # defence in depth, not the mechanism. A sequence SPLIT across
+                # two chunks is already handled upstream, because R198's
+                # unterminated alternative is greedy to end-of-text: a chunk
+                # ending mid-sequence has its partial introducer removed as it
+                # arrives, so the continuation lands as ordinary text. This
+                # pass exists so that stops being load-bearing on a detail of
+                # another rule's greediness. Once per request, never per
+                # chunk — re-scanning the accumulated text on every chunk
+                # would be O(n²) over a 20k-token reasoning stream.
+                item["text"] = _strip_dangerous_escapes(item["text"])
                 self._dirty(i)
         self._open_think_items = []
         self._open_think = False
@@ -1235,6 +1266,30 @@ class Tui:
                 self._saved_draft = ""
             self.app.invalidate()
 
+    def update_menu_labels(self, prompt: str,
+                           options: list[tuple[str, str]]) -> bool:
+        """Swap the labels of the currently-open menu, keeping the highlighted
+        row where it is, and repaint. Used by `/model`'s background price
+        refresh (`_pick_model`): the fetch lands a second or two after the
+        menu is already on screen, and the whole point is that the user sees
+        the fresh price without reopening the picker.
+
+        Guarded on prompt AND option count/keys matching, because the callback
+        arrives from a network thread that has no idea what happened
+        meanwhile: the user may have already picked a model and be sitting in
+        an approval menu instead, and silently overwriting THAT menu's rows
+        with model names would be a genuinely dangerous mislabel. Returns
+        whether the repaint happened. Only the rows' display text changes;
+        `_resolve_menu` keeps mapping the index onto the same key it did
+        before, so an Enter in flight can't land on a different answer."""
+        if not self._menu_options or self._menu_prompt != prompt:
+            return False
+        if [k for k, _ in options] != [k for k, _ in self._menu_options]:
+            return False
+        self._menu_options = options
+        self.app.invalidate()
+        return True
+
     def _menu_fragments(self):
         """The select() menu as formatted-text fragments for its own Window —
         each option on its own line, the pointer on the current index. Rendered
@@ -1258,13 +1313,15 @@ class Tui:
                 selected = i == self._menu_index
                 row_style = ("class:menu.selected" if selected
                              else "class:menu.option")
+                click = self._menu_row_click(i)
                 frags.append((row_style,
-                              f" ❯ {i + 1}. " if selected else f"   {i + 1}. "))
+                              f" ❯ {i + 1}. " if selected else f"   {i + 1}. ",
+                              click))
                 for style, text, *_rest in ANSI(label).__pt_formatted_text__():
-                    frags.append((f"{row_style} {style}".strip(), text))
-                frags.append((row_style, "\n"))
+                    frags.append((f"{row_style} {style}".strip(), text, click))
+                frags.append((row_style, "\n", click))
             frags.append(("class:menu.hint",
-                          " ↑/↓ move · Enter select · number to jump"))
+                          " ↑/↓ move · Enter/click select · number to jump"))
             return frags
         except Exception:
             return [("class:menu.prompt", "\n")]
@@ -1275,6 +1332,21 @@ class Tui:
             return (len(self._menu_options) + 2) if self._menu_options else 0
         except Exception:
             return 0
+
+    def _menu_row_click(self, index: int):
+        """Mouse handler for one `_menu_fragments()` row — click picks it
+        outright rather than only moving the pointer, since a menu click
+        already commits to a row the way Enter does (there's no hover-only
+        state in a terminal). Works for BOTH menu paths (`select_menu()`'s
+        blocking answers-queue and `_open_ui_menu()`'s callback) because
+        both resolve through `_resolve_menu`, same as every other status-bar
+        click handler already routes through it via Enter's key binding."""
+        def handler(mouse_event):
+            if mouse_event.event_type != MouseEventType.MOUSE_UP:
+                return
+            self._menu_index = index
+            self._resolve_menu(index)
+        return handler
 
     # R155: the four copy buttons ("session id", "copy last", "copy all",
     # "copy selected") became ONE "copy" button plus a picker. The status bar
@@ -1389,7 +1461,7 @@ class Tui:
             self._sel_notice = (f"{label} copied — {how}", time.monotonic())
         self.app.invalidate()
 
-    def _short_model(self, model: str) -> str:
+    def _short_model(self, model: str, local_model: str | None = None) -> str:
         """Status-bar name for a model: the vendor prefix dropped
         (`moonshotai/kimi-k2.7-code` → `kimi-k2.7-code`).
 
@@ -1401,7 +1473,13 @@ class Tui:
 
         UNLESS it does disambiguate — two configured models sharing a short
         name keep their full ids, since a status bar that can't tell you
-        which of them you're talking to is worse than a long one."""
+        which of them you're talking to is worse than a long one.
+
+        The `local` sentinel is the one name that identifies nothing on its
+        own, so it renders as `local: <loaded model>` when the live name is
+        known (same vendor-prefix trim)."""
+        if model == "local" and local_model:
+            return f"local: {local_model.rsplit('/', 1)[-1]}"
         short = model.rsplit("/", 1)[-1]
         if short == model:
             return model
@@ -1495,19 +1573,6 @@ class Tui:
                 self.append(f"\n{CYAN}{BOLD}> {RESET}/cost\n")
                 self.scroll_end()
                 self._inbox.put("/cost")
-        return handler
-
-    def _agentic_report_click(self):
-        """Click handler for the "agentic report" status-bar link — only
-        rendered when `self._agentic_root` was detected at startup (see
-        __init__). Same as typing `/agentic_report`: routes through the
-        inbox so the Stats/Index choice (a blocking select()) runs on the
-        worker thread, not the UI thread."""
-        def handler(mouse_event):
-            if mouse_event.event_type == MouseEventType.MOUSE_UP and self._click_guard():
-                self.append(f"\n{CYAN}{BOLD}> {RESET}/agentic_report\n")
-                self.scroll_end()
-                self._inbox.put("/agentic_report")
         return handler
 
     def _click_guard(self) -> bool:
@@ -2277,6 +2342,16 @@ class Tui:
         # handler runs and no-ops" (still swallows the key) and "the
         # binding is ineligible" (prompt_toolkit tries the next match).
         _no_editor = Condition(lambda: self._editor is None)
+        # R211: while a select() menu owns the input line, an EDITING key must
+        # not reach the buffer underneath it. The `Keys.Any` catch-all below
+        # is documented as the swallow, but it is a FALLBACK — prompt_toolkit
+        # sorts `Keys.Any` bindings first and calls `matches[-1]`, so any more
+        # specific binding beats it. Excluding those keys by FILTER (rather
+        # than an early `return` in each body) is what actually hands the
+        # keystroke to `Keys.Any`, i.e. it uses the resolution order instead of
+        # fighting it. Menu-DRIVING keys — enter, arrows, escape, digits — are
+        # deliberately not filtered: beating the swallow is their whole job.
+        _no_menu = Condition(lambda: self._menu_options is None)
 
         def _submit(event, line: str):
             """Submit/answer the current input line under the normal single-
@@ -2338,14 +2413,14 @@ class Tui:
             self.engine.set_multiline(not self.engine.multiline)
             self.fe.notify(f"multiline {'ON (Enter newline, Alt+Enter submit)' if self.engine.multiline else 'OFF'}")
 
-        @kb.add("space", filter=_no_editor)
+        @kb.add("space", filter=_no_editor & _no_menu)
         def _(event):
             buf = self.input.buffer
             if ui._expand_typed_newline(buf):
                 return
             buf.insert_text(" ")
 
-        @kb.add("c-j", filter=_no_editor)          # Ctrl+J newline
+        @kb.add("c-j", filter=_no_editor & _no_menu)          # Ctrl+J newline
         def _(event):
             self.input.buffer.insert_text("\n")
 
@@ -2375,7 +2450,7 @@ class Tui:
             else:
                 buf.insert_text("!")
 
-        @kb.add("backspace", filter=_no_editor)
+        @kb.add("backspace", filter=_no_editor & _no_menu)
         def _(event):
             # backspace on an empty `$` prompt leaves bash mode; else normal
             buf = self.input.buffer
@@ -2516,7 +2591,7 @@ class Tui:
                 mode_click = (self._leave_bash_mode_click() if self._bash_mode
                               else self._enter_bash_mode_click())
                 frags = [("class:status", " "),
-                         ("class:status.id", self._short_model(s.model),
+                         ("class:status.id", self._short_model(s.model, s.local_model),
                           self._open_model_picker())]
                 if s.cost_known:
                     # R168: the price is now its own clickable/underlined
@@ -2562,16 +2637,34 @@ class Tui:
                     frags.append(("class:status", " │ "))
                     frags.append(("class:status.id", "undo",
                                   self._undo_click()))
-                if self._agentic_root is not None:
-                    frags.append(("class:status", " │ "))
-                    frags.append(("class:status.id", "agentic report",
-                                  self._agentic_report_click()))
                 if ml:
                     frags.append(("class:status", ml))
                 if warn:
                     frags.append(("class:status", warn))
-            except Exception:
-                frags = [("class:status", " aurora")]
+            except Exception as e:
+                # R212: still never crash the render — the status bar repaints
+                # on a timer and an exception here would take the app down.
+                # But the old fallback was SILENT: any bug in the block above
+                # showed only as a bar that mysteriously read " aurora", with
+                # nothing logged and nothing to go on. That is not
+                # hypothetical — `MEMORY/bugs/20260715_120000_tui_status_token_
+                # int_crash` records exactly such a crash
+                # (`live_token_tag` passing a char count to a function wanting
+                # a string), and this handler is what a repeat of it would
+                # hide.
+                #
+                # Marked visibly, and recorded ONCE — the bar repaints several
+                # times a second, so logging every frame would bury the
+                # session log in duplicates of one bug.
+                frags = [("class:status", " aurora ⚠")]
+                detail = f"{type(e).__name__}: {e}"
+                if detail != self._status_error:
+                    self._status_error = detail
+                    try:
+                        self.engine.session.log("error", where="status_render",
+                                                error=detail)
+                    except Exception:
+                        pass    # diagnostics must not become the failure
             # Line 1 is identity only (model/ctx/session id). Line 2 shows the
             # tooltips by default, but any live/transient status takes it over —
             # thinking, awaiting-answer, exit-confirm, and copy notices never
@@ -2642,6 +2735,10 @@ class Tui:
                 ])
             return frags
 
+
+        # R212: the renderer is a closure over this method's locals; bind it
+        # so a test can drive its failure path directly.
+        self._status_render = status
         from prompt_toolkit.layout import ConditionalContainer
         menu_active = Condition(lambda: self._menu_options is not None)
         help_active = Condition(lambda: self._help_visible)
@@ -2678,7 +2775,7 @@ class Tui:
                                      and self._menu_options is None)),
                 self.input,
                 Window(height=1, char="─", style="class:separator"),
-                Window(FormattedTextControl(status), height=3,
+                Window(FormattedTextControl(self._status_render), height=3,
                        style="class:status"),
             ]),
             floats=[Float(xcursor=True, ycursor=True,

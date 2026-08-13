@@ -1,60 +1,13 @@
-"""Tests for the finishing pieces: context bootstrap, skills, engine
-compact/resume. No network — everything local/mocked."""
+"""Tests for the finishing pieces: skills, engine compact/resume. No
+network — everything local/mocked."""
 
 import textwrap
 
 import pytest
 
-from aurora import context, skills
+from aurora import skills
 from aurora.engine import Engine
 from aurora.session import Session
-
-
-# ── context bootstrap ──────────────────────────────────────────────────────
-def _make_context(root):
-    ac = root / ".agentic_context"
-    (ac / "KNOWLEDGE" / "core").mkdir(parents=True)
-    (ac / "MEMORY").mkdir()
-    (ac / "SKILLS").mkdir()
-    (ac / "AGENTS.md").write_text("# Rules\n- be terse\n")
-    # what makes a folder THE context root (R88/R90c): both SKILL.md files.
-    # Detection is by contents, never by the folder's name.
-    (ac / "KNOWLEDGE" / "SKILL.md").write_text("# Knowledge\n")
-    (ac / "MEMORY" / "SKILL.md").write_text("# Memory\n")
-    (ac / "SKILLS" / "SKILL.md").write_text("# Skills\n")
-    (ac / "KNOWLEDGE" / "INDEX.md").write_text(
-        "# KNOWLEDGE\n"
-        "- `core/Main.md` — [CORE] always-load doc. (~10 tok)\n"
-        "- `core/Lazy.md` — lazy doc. (~10 tok)\n")
-    (ac / "MEMORY" / "INDEX.md").write_text("# MEMORY\n- nothing\n")
-    (ac / "SKILLS" / "INDEX.md").write_text("# SKILLS\n- nothing\n")
-    (ac / "KNOWLEDGE" / "core" / "Main.md").write_text("CORE-BODY-MARKER")
-    (ac / "KNOWLEDGE" / "core" / "Lazy.md").write_text("LAZY-BODY-MARKER")
-    return ac
-
-
-def test_bootstrap_loads_rules_indexes_and_core_only(tmp_path):
-    _make_context(tmp_path)
-    prompt = context.bootstrap(tmp_path)
-    assert "be terse" in prompt                 # AGENTS.md
-    assert "core/Main.md" in prompt             # index listed
-    assert "CORE-BODY-MARKER" in prompt         # [CORE] body loaded
-    assert "LAZY-BODY-MARKER" not in prompt     # lazy body NOT loaded
-    assert "agentic_context protocol" in prompt
-    assert context.active()
-
-
-def test_open_context_doc_reads_and_confines(tmp_path):
-    _make_context(tmp_path)
-    context.bootstrap(tmp_path)
-    assert context.open_context_doc("KNOWLEDGE/core/Lazy.md") == "LAZY-BODY-MARKER"
-    assert "escapes" in context.open_context_doc("../outside.md")
-    assert "no such" in context.open_context_doc("KNOWLEDGE/nope.md")
-
-
-def test_no_context_dir_is_inactive(tmp_path):
-    assert context.bootstrap(tmp_path) == ""
-    assert not context.active()
 
 
 # ── skills ─────────────────────────────────────────────────────────────────
@@ -330,43 +283,6 @@ def test_failed_turn_keeps_previous_context_gauge(engine, monkeypatch):
     engine.send("hi", _FE())
     assert engine._used == 500
     assert engine.messages[-1]["role"] == "assistant"   # dangling user popped
-
-
-# ── R90c: ONE detector, by contents, walking up ────────────────────────────
-def test_bootstrap_finds_a_differently_named_context_folder(tmp_path):
-    """The folder is identified by WHAT IT CONTAINS — KNOWLEDGE/SKILL.md and
-    MEMORY/SKILL.md — never by the name `.agentic_context` (R88/R90c)."""
-    ac = _make_context(tmp_path)
-    renamed = tmp_path / "project_context"     # not hidden, not the convention
-    ac.rename(renamed)
-    prompt = context.bootstrap(tmp_path)
-    assert "be terse" in prompt and context.active()
-    assert context.find_context_root(tmp_path) == renamed
-
-
-def test_bootstrap_walks_up_from_a_subdirectory(tmp_path):
-    _make_context(tmp_path)
-    deep = tmp_path / "src" / "pkg" / "sub"
-    deep.mkdir(parents=True)
-    assert "CORE-BODY-MARKER" in context.bootstrap(deep)
-
-
-def test_a_folder_missing_either_skill_md_is_not_a_context_root(tmp_path):
-    half = tmp_path / "not_a_context"
-    (half / "KNOWLEDGE").mkdir(parents=True)
-    (half / "MEMORY").mkdir(parents=True)
-    (half / "KNOWLEDGE" / "SKILL.md").write_text("x")   # MEMORY/SKILL.md absent
-    assert context.find_context_root(tmp_path) is None
-    assert context.bootstrap(tmp_path) == ""
-
-
-def test_memory_and_context_share_one_detector(tmp_path):
-    """/remember, /agentic_report, the status-bar link and the bootstrap must
-    never disagree about whether a context is present (R90c)."""
-    from aurora import memory
-    assert memory.find_context_root is context.find_context_root
-    root = _make_context(tmp_path)
-    assert memory.find_context_root(tmp_path) == root == context.detect(tmp_path)
 
 
 def test_session_records_stream_without_loading_the_file(tmp_path, monkeypatch):

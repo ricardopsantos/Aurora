@@ -7,6 +7,64 @@ import tempfile
 from pathlib import Path
 
 
+class AuroraHomeError(Exception):
+    """R217: AURORA_HOME (or a directory under it) cannot be created or used.
+
+    Everything persistent goes through `aurora_home()` — sessions, the
+    allowlist, the key store, checkpoints — so an unusable one is fatal, and
+    it used to be fatal as a raw `PermissionError`/`FileExistsError`
+    traceback from whichever caller happened to touch it first. The cause is
+    always an environment mistake the user can fix (AURORA_HOME set to a
+    file, or pointing somewhere unwritable), so it deserves a sentence
+    naming the variable, not a stack trace through `pathlib`."""
+
+
+def _ensure_dir(path: "Path", what: str) -> "Path":
+    """R217: `mkdir(parents=True, exist_ok=True)` with a usable failure."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except FileExistsError as e:
+        raise AuroraHomeError(
+            f"{what} exists but is not a directory: {path}\n"
+            "AURORA_HOME must name a directory (or something Aurora may "
+            "create); it currently points at a file.") from e
+    except OSError as e:
+        raise AuroraHomeError(
+            f"cannot create {what}: {path}\n{e.strerror}. Check AURORA_HOME "
+            "and that its parent is writable.") from e
+    return path
+
+
+def write_bytes_atomic(path: "Path | str", data: bytes,
+                       mode: int | None = None) -> None:
+    """Byte counterpart to `write_text_atomic` below, with an optional
+    permission mode applied BEFORE the file becomes visible.
+
+    R201: the encrypted key store was written with a plain `write_bytes`
+    followed by `chmod(0o600)` — two windows in one line. A crash between
+    truncate and write left an undecryptable blob (every stored key gone,
+    since nothing else holds them), and between write and chmod the file
+    briefly carried the umask's permissions. Setting the mode on the temp
+    file closes the second window the same way `os.replace` closes the
+    first: the name only ever points at a complete, correctly-permissioned
+    file."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent),
+                               prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def write_text_atomic(path: "Path | str", text: str) -> None:
     """Replace a file's contents in one step, or not at all (R146a).
 
@@ -64,14 +122,11 @@ def aurora_home() -> Path:
     if env:
         home = Path(env).expanduser()
     elif _MARKER.exists():
-        home = Path(_MARKER.read_text().strip()).expanduser()
+        home = Path(_MARKER.read_text(encoding="utf-8").strip()).expanduser()
     else:
         home = Path.home() / ".aurora"
-    home.mkdir(parents=True, exist_ok=True)
-    return home
+    return _ensure_dir(home, "AURORA_HOME")
 
 
 def sessions_dir() -> Path:
-    d = aurora_home() / "sessions"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return _ensure_dir(aurora_home() / "sessions", "the sessions directory")

@@ -119,7 +119,8 @@ class AgentCallbacks:
     # R58: hashes (secrets.hash_value) of confirmed false positives — matches
     # against these are dropped before secret_challenge ever fires again
     secret_allowlist: set | None = None
-    on_usage: Callable[[int, int], None] | None = None
+    # R192: (input_tokens, output_tokens, cached_input_tokens) per round.
+    on_usage: Callable[[int, int, int], None] | None = None
     # R133c: every outcome of the approval gate, including the ones that never
     # ask the user (allowlisted, denied by policy). Wired at the gate itself
     # rather than around `approve` because a daily driver with an allowlist
@@ -188,12 +189,33 @@ class Turn:
     events: list = field(default_factory=list)
 
 
+def _load_allow_or_empty(cb: AgentCallbacks) -> dict:
+    """R196: the allowlist's counterpart to R170a's denylist handling.
+
+    A corrupt `denylist.yaml` is caught and fails CLOSED with a message. A
+    corrupt `allowlist.yaml` raised `ApproveLoadError` straight out of the
+    agent loop instead — only `ProviderError` is caught around `run_turn`, so
+    the whole turn died on a YAML typo in a file Aurora explicitly invites
+    the user to hand-edit.
+
+    Empty IS the fail-closed answer for this direction: no rule matches, so
+    every gated call is prompted for, which is exactly the pre-allowlist
+    behaviour. Failing closed on the deny side means blocking; on the allow
+    side it means asking. Both refuse to act on rules they cannot read."""
+    try:
+        return approve.load()
+    except approve.ApproveLoadError as e:
+        cb.notify(f"allowlist.yaml is unreadable ({e}) — asking for approval "
+                  "on every gated tool call until it's fixed")
+        return {}
+
+
 def run_turn(provider, model, messages, system, cb: AgentCallbacks,
              max_iterations: int, tools_enabled: bool) -> Turn:
     """Drive one turn. `messages` is mutated in place with the full exchange
     (assistant + tool-result messages) so history persists across turns."""
     turn = Turn()
-    allow = approve.load()
+    allow = _load_allow_or_empty(cb)
     try:
         deny = approve.load_deny()   # R120: empty dict for anyone who's never set one
         deny_broken = False
@@ -308,7 +330,10 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
         turn.reasoning_tokens += getattr(result, "reasoning_tokens", 0) or 0
         turn.reasoning_chars += getattr(result, "reasoning_chars", 0) or 0
         if cb.on_usage is not None:
-            cb.on_usage(result.input_tokens, result.output_tokens)
+            # R192: the cached count rides along so the engine can price the
+            # round; it is a SUBSET of input_tokens, never additive to it.
+            cb.on_usage(result.input_tokens, result.output_tokens,
+                        getattr(result, "cached_input_tokens", 0) or 0)
 
         if result.stop_reason == "cancelled":
             cb.notify("interrupted")
@@ -510,7 +535,7 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                 if ans == "a":
                     rule = approve.add_rule(call.name, call.arguments)
                     cb.notify(f"always-allow added: {call.name} · {rule}")
-                    allow = approve.load()
+                    allow = _load_allow_or_empty(cb)   # R196: same guard
                     _gate("always_allow", rule)
                 elif ans == "d":
                     rule = approve.add_deny_rule(call.name, call.arguments)

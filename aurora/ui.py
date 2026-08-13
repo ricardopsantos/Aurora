@@ -26,7 +26,6 @@ from . import (
     gitcommit,
     keystore,
     mdrender,
-    memory,
     rewind,
     skills,
     tokens,
@@ -44,9 +43,10 @@ from .colors import (
     YELLOW,
     colour_diff,
     dim,
+    strip_dangerous_escapes,
 )
 from .engine import Engine
-from .paths import aurora_home
+from .paths import aurora_home, write_text_atomic
 
 HELP = f"""\
 {BOLD}plain text{RESET}            talk to the model (paste is safe)
@@ -103,8 +103,6 @@ HELP = f"""\
 {CYAN}/bootstrap{RESET}            run the saved bootstrap prompt (set/show/clear to manage;
                       set accepts a local file OR a URL — startup offers
                       cached vs re-download for a URL-sourced prompt)
-{CYAN}/remember [all|last [k]]{RESET}  save what's worth keeping from the session into
-                      MEMORY — last exchange (default), last k, or all
 {CYAN}/nano <file>{RESET}           TUI only — open a text file (.txt/.md/.json/.yml/
                       .yaml/.xml/.sh, up to 1MB) in the built-in editor;
                       clicking a matching filename in bash-mode output
@@ -112,15 +110,8 @@ HELP = f"""\
 {CYAN}/help  /quit{RESET}          this help · quit immediately (Esc Esc asks first)"""
 
 
-def help_text(has_agentic_context: bool = False) -> str:
-    """HELP, plus the `/agentic_report` line ONLY when a context protocol
-    folder was detected — that command doesn't exist as far as the user is
-    concerned otherwise (see SlashCompleter, which hides it from
-    autocomplete the same way)."""
-    if not has_agentic_context:
-        return HELP
-    return HELP + (f"\n{CYAN}/agentic_report{RESET}      context folder "
-                   "health: Stats (stats.sh) or a pretty-printed Index")
+def help_text() -> str:
+    return HELP
 
 
 class TerminalFrontend:
@@ -150,6 +141,12 @@ class TerminalFrontend:
 
     # streaming
     def on_text(self, chunk: str) -> None:
+        # R206: the TUI has stripped these since R170l/R171, but this
+        # frontend writes STRAIGHT to the terminal — there is no
+        # prompt_toolkit between the model and the emulator here, so an OSC 52
+        # in a reply does not merely get stored, it actually sets the user's
+        # clipboard. Same rule, the more exposed of the two frontends.
+        chunk = strip_dangerous_escapes(chunk)
         if self._think_marker_shown and not self.show_thinking:
             self._think_marker_shown = False
             sys.stdout.write("\n")           # separate answer from the marker
@@ -164,6 +161,7 @@ class TerminalFrontend:
         sys.stdout.flush()
 
     def on_think(self, chunk: str) -> None:
+        chunk = strip_dangerous_escapes(chunk)   # R206, and R204's channel
         self.think_buffer += chunk
         if self.show_thinking:
             sys.stdout.write(f"{DIM}{chunk}{RESET}")
@@ -177,10 +175,13 @@ class TerminalFrontend:
     def on_tool_start(self, name: str, args: dict) -> None:
         print(f"\n{CYAN}⚙ {name}{RESET}")
         for k, v in args.items():
-            print(f"  {dim(k)}: {v}")
+            # R206: tool ARGUMENTS are model-authored too — echoing them back
+            # unfiltered is the same channel as echoing its reply.
+            print(f"  {dim(k)}: {strip_dangerous_escapes(str(v))}")
 
     def on_tool_result(self, name: str, output: str) -> None:
-        head = output.strip().splitlines()
+        # R206: this is the subprocess output R170l stripped for the TUI.
+        head = strip_dangerous_escapes(output).strip().splitlines()
         shown = "\n".join(head[:6])
         more = f"\n  … +{len(head) - 6} lines" if len(head) > 6 else ""
         print(dim(f"  ↳ {shown}{more}"))
@@ -219,7 +220,7 @@ class TerminalFrontend:
             ("s", "Stop the agent"),
             ("c", "Comment — steer the model instead"),
             ("e", "Explain — describe what this will do, then ask again"),
-        ])
+        ], eof_key="s")   # R214: no user left to ask — stop, never approve
         note = ""
         if key == "c":
             note = input(f"{YELLOW}guidance for the model:{RESET} ").strip()
@@ -236,7 +237,7 @@ class TerminalFrontend:
         ]
         if allow_silent:
             options.insert(1, ("k", "Keep going — don't ask again this turn"))
-        key = select(prompt, options)
+        key = select(prompt, options, eof_key="n")   # R214: EOF stops
         if key == "c":
             note = input(f"{YELLOW}guidance for the model:{RESET} ").strip()
             return True, note
@@ -286,7 +287,7 @@ class TerminalFrontend:
                 ("v", ("Show" if masked else "Mask")
                      + " the token (safe for a shared screen)"),
                 ("stop", "Stop"),
-            ])
+            ], eof_key="stop")   # R214: never "keep" a secret unattended
             if choice == "v":
                 masked = not masked
                 continue
@@ -301,26 +302,53 @@ class TerminalFrontend:
         (R154). The engine-side gauge update it accompanies still happens —
         this is only the "now repaint it" half."""
 
+    def update_menu_labels(self, prompt: str,
+                           options: list[tuple[str, str]]) -> bool:
+        """No-op: the classic REPL's `select()` already PRINTED its numbered
+        list, so there's nothing to relabel in place — a background price
+        refresh (`/model`) simply shows up the next time the picker is opened.
+        The TUI overrides this to repaint the open menu."""
+        return False
+
     def cancelled(self) -> bool:
         return self.cancel_event.is_set()
 
 
 def select(prompt: str, options: list[tuple[str, str]],
-          default_index: int | None = None) -> str:
+          default_index: int | None = None,
+          eof_key: str | None = None) -> str:
     """Numbered-menu choice. `options` is [(key, label), ...]; returns the
     chosen key. `default_index`, if given, is annotated "(current)" and is
     what a blank Enter accepts — opt-in, so approve/confirm-style callers that
     DON'T pass it keep blank-Enter re-prompting (an accidental Enter must
     never silently pick "yes" on an approval challenge). The TUI
     monkeypatches this name (same trick as `builtins.input`) to render an
-    arrow-key-navigable menu instead, pre-highlighted on `default_index`."""
+    arrow-key-navigable menu instead, pre-highlighted on `default_index`.
+
+    R214: `eof_key` is what to return when `input()` hits EOF — Ctrl+D at the
+    menu, or piped/CI input running out. It used to propagate `EOFError`
+    straight out of the approval gate and kill the session with a traceback,
+    mid-turn. It cannot be handled by looping, the way a blank Enter is: EOF
+    repeats instantly, so re-prompting spins forever.
+
+    It is a required decision rather than a default, and for the same reason
+    blank-Enter re-prompts here: the safe answer differs per menu and only the
+    caller knows it — for an approval that is "stop", never "yes". A caller
+    that passes nothing gets the `EOFError` re-raised, which the REPL loop now
+    ends the session on cleanly instead of tracebacking."""
     print(f"\n{YELLOW}{prompt}{RESET}")
     for i, (_, label) in enumerate(options, 1):
         mark = " (current)" if default_index is not None and i - 1 == default_index else ""
         print(f"  {i}. {label}{mark}")
     valid_keys = {k.lower() for k, _ in options}
     while True:
-        raw = input(f"{YELLOW}› {RESET}").strip()
+        try:
+            raw = input(f"{YELLOW}› {RESET}").strip()
+        except EOFError:
+            if eof_key is None:
+                raise
+            print(f"  {DIM}(end of input — {eof_key}){RESET}")
+            return eof_key
         if not raw:
             if default_index is not None:
                 return options[default_index][0]
@@ -338,7 +366,9 @@ def confirm(prompt: str, default_yes: bool = True) -> bool:
     preserving the old '[Y/n]' / '[y/N]' default-on-empty behaviour."""
     opts = ([("y", "Yes"), ("n", "No")] if default_yes
             else [("n", "No"), ("y", "Yes")])
-    return select(prompt, opts) == "y"
+    # R214: EOF is "no" regardless of the default — an unattended confirm must
+    # not act, and every caller here guards something that writes or spends.
+    return select(prompt, opts, eof_key="n") == "y"
 
 
 def _short(v, n: int = 60) -> str:
@@ -443,7 +473,9 @@ def _footer(engine: Engine):
                 draft = f" (+~{estimate_tokens(text)} draft)"
         except Exception:
             pass
-        return (f" {s.model}{cost} │ ctx {used}/{limit}{draft} ({s.pct:.0f}%)"
+        model = (f"local: {s.local_model.rsplit('/', 1)[-1]}"
+                if s.model == "local" and s.local_model else s.model)
+        return (f" {model}{cost} │ ctx {used}/{limit}{draft} ({s.pct:.0f}%)"
                 f" │ session {s.session_id}{folds}{warn}{ml}\n"
                 + _FOOTER_HINT)
     return render
@@ -540,13 +572,20 @@ def _prompt_and_store_key(engine: Engine, env: str) -> None:
     if not val:
         print(f"· skipped — set it later with: aurora key set {env}")
         return
-    where = keystore.store_key(env, val)
+    # R201: a mistyped passphrase against an existing store is a refusal,
+    # not a crash — and nothing was written, which is the part worth saying.
+    try:
+        where = keystore.store_key(env, val)
+    except keystore.KeystoreError as e:
+        print(f"{RED}not stored — {e}{RESET}")
+        return
     print(f"{GREEN}stored {env} in {where}{RESET}")
 
 
 def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
     loaded = None
 
+    from .providers import openai_compat
     from .providers.openai_compat import REMOTE_CONTEXT_LIMITS
 
     def _price(price_in: float | None, price_out: float | None) -> str:
@@ -568,8 +607,6 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
             parts.append(price)
         return dim(" · ".join(parts)) if parts else ""
 
-    entries = []       # (label, payload)
-    current_index = 0  # which entry is the active model — pre-highlighted
     # identity (`is`) isn't reliable here: switch_model() stores whatever dict
     # it was handed, which is rarely the SAME object as the matching entry in
     # engine.list_models() (a fresh copy parsed from config.yaml) — compare by
@@ -580,50 +617,85 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
     # latency/complexity to opening the picker itself, so this is read-only
     # and can be stale or simply absent for a model not used recently.
     latencies = sessions.last_latency_by_model()
-    # alphabetical picker: config models A→Z
-    for m in sorted(engine.list_models(),
-                    key=lambda m: str(m.get("model", "")).lower()):
-        name = m.get("model", "")
-        is_openrouter = name != "local" and "openrouter" in str(m.get("provider", ""))
-        remote = REMOTE_CONTEXT_LIMITS.get(name, {}) if is_openrouter else {}
-        # a known-$0 OpenRouter model (e.g. a ":free" variant) is genuinely
-        # free, not "paid, happens to cost nothing" — tag it [free] like
-        # local, not [$]. Only an UNKNOWN price defaults to assuming paid.
-        known_free = (remote.get("price_in_per_mtok") == 0
-                     and remote.get("price_out_per_mtok") == 0)
-        paid = is_openrouter and not known_free
-        tag = f"{YELLOW}[$]{RESET}" if paid else f"{GREEN}[free]{RESET}"
-        if is_openrouter:
-            info = _info(remote.get("context_size"),
-                        price_in=remote.get("price_in_per_mtok"),
-                        price_out=remote.get("price_out_per_mtok"))
-        else:
-            info = ""
-        latency = latencies.get(name)
-        if latency is not None:
-            shown = f"{latency * 1000:.0f}ms" if latency < 1 else f"{latency:.1f}s"
-            info = f"{info} · {shown}" if info else shown
-        if name == "local":  # show what "local" actually is
-            live = loaded
-            if not live:
-                # R170j: nonblocking — a direct provider.live_model_name()
-                # call here is a live /props probe that can wait out its own
-                # 4s timeout against a dead local server, freezing picker
-                # construction before the menu even renders. Serves cache
-                # (or None the first time) and refreshes in the background.
-                provider = engine._provider_for(m)
-                live = engine._live_model_name_nonblocking(provider)
-            if live:
-                name = f"local {DIM}→ {live}{RESET}"
-        is_current = (m.get("provider"), m.get("model")) == cur_key
-        mark = f"  {GREEN}{BOLD}✔{RESET}" if is_current else ""
-        no_key = f"  {RED}(no key set){RESET}" if not engine.has_key(m.get("provider")) else ""
-        if is_current:
-            current_index = len(entries)
-        entries.append((f"{name}{mark}  {tag} {info}{no_key}", m))
 
+    def _build_entries() -> tuple[list[tuple[str, dict]], int]:
+        """(entries, current_index) — the labelled rows, read fresh out of
+        REMOTE_CONTEXT_LIMITS. Called a second time when the background price
+        refresh below lands, so the open menu can be relabelled in place."""
+        entries = []       # (label, payload)
+        current_index = 0  # which entry is the active model — pre-highlighted
+        # alphabetical picker: config models A→Z
+        for m in sorted(engine.list_models(),
+                        key=lambda m: str(m.get("model", "")).lower()):
+            name = m.get("model", "")
+            is_openrouter = name != "local" and "openrouter" in str(m.get("provider", ""))
+            remote = REMOTE_CONTEXT_LIMITS.get(name, {}) if is_openrouter else {}
+            # a known-$0 OpenRouter model (e.g. a ":free" variant) is genuinely
+            # free, not "paid, happens to cost nothing" — tag it [free] like
+            # local, not [$]. Only an UNKNOWN price defaults to assuming paid.
+            known_free = (remote.get("price_in_per_mtok") == 0
+                         and remote.get("price_out_per_mtok") == 0)
+            paid = is_openrouter and not known_free
+            tag = f"{YELLOW}[$]{RESET}" if paid else f"{GREEN}[free]{RESET}"
+            if is_openrouter:
+                info = _info(remote.get("context_size"),
+                            price_in=remote.get("price_in_per_mtok"),
+                            price_out=remote.get("price_out_per_mtok"))
+            else:
+                info = ""
+            latency = latencies.get(name)
+            if latency is not None:
+                shown = f"{latency * 1000:.0f}ms" if latency < 1 else f"{latency:.1f}s"
+                info = f"{info} · {shown}" if info else shown
+            if name == "local":  # show what "local" actually is
+                live = loaded
+                if not live:
+                    # R170j: nonblocking — a direct provider.live_model_name()
+                    # call here is a live /props probe that can wait out its own
+                    # 4s timeout against a dead local server, freezing picker
+                    # construction before the menu even renders. Serves cache
+                    # (or None the first time) and refreshes in the background.
+                    provider = engine._provider_for(m)
+                    live = engine._live_model_name_nonblocking(provider)
+                if live:
+                    name = f"local {DIM}→ {live}{RESET}"
+            is_current = (m.get("provider"), m.get("model")) == cur_key
+            mark = f"  {GREEN}{BOLD}✔{RESET}" if is_current else ""
+            no_key = (f"  {RED}(no key set){RESET}"
+                      if not engine.has_key(m.get("provider")) else "")
+            if is_current:
+                current_index = len(entries)
+            entries.append((f"{name}{mark}  {tag} {info}{no_key}", m))
+        return entries, current_index
+
+    entries, current_index = _build_entries()
+    prompt = "Select model"
     options = [(str(i), label) for i, (label, _) in enumerate(entries, 1)]
-    chosen = select("Select model", options, default_index=current_index)
+
+    # feature request, 2026-08-03: the picker's prices used to be whatever was
+    # last written to remote_context_limits.json (by `/model add` or the
+    # `refresh_model_prices` tool), so a price OpenRouter changed since then
+    # was shown, and charged against, as if current. Re-pull the catalog while
+    # the menu is up — off-thread, because a 10s catalog timeout must not sit
+    # between typing `/model` and seeing it — and relabel the rows in place if
+    # the answer arrives before the user picks. TTL-gated inside
+    # refresh_prices_in_background, so repeatedly opening `/model` doesn't
+    # repeatedly hit the network.
+    def _relabel():
+        fresh, _ = _build_entries()
+        fe.update_menu_labels(
+            prompt, [(str(i), label) for i, (label, _) in enumerate(fresh, 1)])
+
+    openai_compat.refresh_prices_in_background(
+        # same "is this an OpenRouter model" test the labels use above, not
+        # `provider == "openrouter"`: a config that names the provider e.g.
+        # `openrouter-free` shows a price in the picker, so it must be one of
+        # the models that price gets refreshed for.
+        [m.get("model") for _, m in entries
+         if m.get("model") != "local"
+         and "openrouter" in str(m.get("provider", ""))], on_done=_relabel)
+
+    chosen = select(prompt, options, default_index=current_index)
     if chosen is None:   # TUI: menu dismissed (e.g. a second click on the
         return            # status bar's model name) — no change
     idx = int(chosen) - 1
@@ -769,8 +841,6 @@ COMMAND_INFO = {
     "extensions": "list loaded extension tools + how to add one",
     "bootstrap": "run the saved bootstrap prompt (set/show/clear)",
     "multiline": "toggle multiline mode: Enter newline, Alt+Enter submit (persisted)",
-    "remember":  "save what's worth keeping from the session into MEMORY (last [k]|all)",
-    "agentic_report": "context folder health: Stats (stats.sh) or a pretty-printed Index",
     "nano":      "open a text file (.txt/.md/.json/.yml/.yaml/.xml/.sh, up to 1MB) "
                  "in the built-in editor (TUI only)",
     "help":      "all commands and keys",
@@ -787,12 +857,6 @@ class SlashCompleter(Completer):
 
     def __init__(self, config_base: str | None):
         self.config_base = config_base
-        # computed once per completer lifetime (= per session), not per
-        # keystroke — find_context_root() walks the filesystem.
-        # From the CWD, never config's _base_dir (R90c): the config lives in
-        # the Aurora checkout, which has its own context folder, so keying on
-        # it offered /agentic_report in every project regardless.
-        self._has_agentic_context = memory.find_context_root(".") is not None
         self._skills_stamp: tuple | None = None
         self._skills: dict[str, str] = {}
 
@@ -826,10 +890,6 @@ class SlashCompleter(Completer):
             return
         prefix = "" if empty else text[1:]
         entries = dict(COMMAND_INFO)
-        if not self._has_agentic_context:
-            # doesn't exist as far as the user is concerned otherwise (see
-            # ui.help_text, which hides it from /help the same way)
-            entries.pop("agentic_report", None)
         for name, blurb in self._skill_entries().items():
             entries.setdefault(name, blurb)
         for name, info in sorted(entries.items(), key=lambda kv: kv[0].lower()):
@@ -897,29 +957,6 @@ def _run_bootstrap(engine: Engine, fe: TerminalFrontend, redownload: bool = Fals
         _send_turn(engine, fe, text, is_bootstrap=True)
     else:
         _run_turn(engine, fe, text, is_bootstrap=True)
-
-
-def _agentic_report_cmd(engine: Engine, fe: TerminalFrontend) -> None:
-    """/agentic_report: "Stats" runs the context folder's stats.sh as-is;
-    "Index" pretty-prints KNOWLEDGE/INDEX.md and MEMORY/INDEX.md through
-    the same markdown→ANSI renderer used for chat replies, instead of
-    dumping raw markdown. Also the target of the status bar's "agentic
-    report" click, gated on the same detection (see TuiFrontend._worker)."""
-    root = memory.find_context_root(".")
-    if root is None:
-        print("· no context protocol folder detected here")
-        return
-    choice = select("Agentic report", [("stats", "Stats"), ("index", "Index")])
-    if choice == "stats":
-        print(memory.run_stats(root))
-        return
-    for rel in ("KNOWLEDGE/INDEX.md", "MEMORY/INDEX.md"):
-        p = root / rel
-        text = p.read_text(encoding="utf-8") if p.is_file() else "(missing)"
-        print(f"\n{BOLD}{CYAN}{rel}{RESET}")
-        renderer = mdrender.LineRenderer()
-        for line in text.splitlines():
-            print(renderer.render(line))
 
 
 def _bootstrap_cmd(engine: Engine, fe: TerminalFrontend, arg: str) -> None:
@@ -1075,20 +1112,17 @@ def _commit_cmd(engine: Engine, fe: TerminalFrontend, arg: str) -> None:
 
 def _extension_tool_specs() -> list[dict]:
     """R119/R121: the tool specs that came from extensions specifically —
-    `tools.specs()` also folds in the built-ins plus the `.agentic_context`
-    doc tool when active, neither of which is an extension, so those are
-    named out explicitly rather than assuming "everything past the built-ins"
-    is extension-provided. Shared by `/extensions` and the startup banner so
-    the two can never disagree about what's loaded.
+    `tools.specs()` also folds in the built-ins, which aren't an extension,
+    so those are named out explicitly rather than assuming "everything past
+    the built-ins" is extension-provided. Shared by `/extensions` and the
+    startup banner so the two can never disagree about what's loaded.
 
     R157: `web_search`/`web_fetch` are deliberately NOT excluded any more.
     They now come from `extensions_bundled/web_extension.py`, so `/extensions`
     listing them is correct — it reports what is actually loaded, and a
     bundled extension is still an extension (the MCP tools have always shown
     up here the same way)."""
-    from . import context as ctxmod
-    non_ext_names = ({s["name"] for s in tools.SPEC}
-                     | {s["name"] for s in ctxmod.SPEC})
+    non_ext_names = {s["name"] for s in tools.SPEC}
     return [s for s in tools.specs() if s["name"] not in non_ext_names]
 
 
@@ -1214,9 +1248,33 @@ def _last_copyable_text(engine: Engine, fe: TerminalFrontend) -> tuple[str, str]
     bash_at = getattr(tui, "_last_bash_at", 0.0) if tui else 0.0
     llm_at = getattr(tui, "_last_llm_at", 0.0) if tui else 0.0
     llm_text = _raw_last_response_text(engine, fe)
+    # R208: both branches go to the clipboard. `bash_text` is subprocess
+    # output and `llm_text` is the raw model reply — the two sources the
+    # sanitizer exists for, neither of which has passed through it here.
     if bash_text and (not llm_text or bash_at >= llm_at):
-        return bash_text, "command output"
-    return llm_text, "raw response"
+        return _outbound(bash_text), "command output"
+    return _outbound(llm_text), "raw response"
+
+
+def _outbound(text: str) -> str:
+    """R208: strip terminal escapes from text on its way OUT of Aurora — to
+    the clipboard, or to a file the user will later `cat`.
+
+    The sanitizer's own comment has claimed since R170l that "neither the
+    display NOR anything copied out of it (/copy-all, session export) carries
+    the raw sequence". Only the first half was true. The TUI sanitizes its own
+    `_chat` DISPLAY buffer, but `/copy-all` and `/export` both read
+    `session.export_markdown()`, which walks the session JSONL — written by
+    the engine from the RAW model text, which never passes through any of
+    that. So a payload in a reply reached the clipboard (where pasting it
+    into a terminal fires it) and the exported .md.
+
+    It lives here, at the UI layer, because that is the boundary that matters:
+    an escape is inert inside the log and dangerous the moment it reaches a
+    terminal. It also has to live here — `session.py` is engine-side, and
+    `test_engine_never_imports_concrete_ui_module` forbids it reaching for
+    this."""
+    return strip_dangerous_escapes(text)
 
 
 def _all_chat_text(engine: Engine) -> str:
@@ -1224,7 +1282,7 @@ def _all_chat_text(engine: Engine) -> str:
     markdown — same text `/export` writes to a file, via
     `session.export_markdown()`. No reasoning: matches the standing rule
     that thinking never enters history/`/copy`/exports."""
-    return sessions.export_markdown(engine.session.id)
+    return _outbound(sessions.export_markdown(engine.session.id))
 
 
 def _cost_report(engine: Engine) -> str:
@@ -1288,7 +1346,7 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
     if cmd in ("exit", "quit"):
         return False
     if cmd == "help":
-        print(help_text(memory.find_context_root(".") is not None))
+        print(help_text())
     elif cmd == "model":
         sub, _, rest = arg.partition(" ")
         if sub.lower() == "add":
@@ -1310,7 +1368,7 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
         print(f"· compacted {n} messages into one" if n else "· nothing to compact")
     elif cmd == "copy":
         n = int(arg) if arg.isdigit() else 1
-        text = engine.nth_response(n)
+        text = _outbound(engine.nth_response(n))   # R208
         if not text:
             print("· no such response")
         else:
@@ -1367,11 +1425,29 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
     elif cmd == "autocompact":
         if arg.lower() in ("on", "off"):
             engine.set_auto_compact(arg.lower() == "on")
+        elif arg.lower().startswith("keep="):
+            try:
+                engine.set_compact_keep_recent_tokens(int(arg.split("=", 1)[1]))
+            except ValueError as e:
+                # R200: show WHY. The setter now range-checks and raises with
+                # a reason, and "usage:" alone would hide it behind a line
+                # that looks like the input was unparseable when it parsed
+                # fine and was simply out of range.
+                print(f"· {e}" if str(e).startswith(("keep", "threshold"))
+                      else "· usage: /autocompact keep=<tokens>")
+        elif arg.strip():
+            try:
+                engine.set_auto_compact_threshold_pct(float(arg.strip()))
+            except ValueError as e:
+                print(f"· {e}" if str(e).startswith(("keep", "threshold"))
+                      else "· usage: /autocompact on|off|<pct>|keep=<tokens>")
         state = "ON" if engine.auto_compact else "OFF"
         print(f"· auto-compact {state} (persisted) — folds older history "
               f"once context hits {engine.auto_compact_threshold_pct:.0f}%, "
               f"keeping the last ~{engine.compact_keep_recent_tokens} tokens "
-              "raw")
+              "raw\n"
+              + dim("  /autocompact on|off · /autocompact <pct> · "
+                    "/autocompact keep=<tokens>"))
     elif cmd == "fallback":
         if arg.lower() in ("on", "off"):
             engine.set_model_fallback(arg.lower() == "on")
@@ -1457,8 +1533,13 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
             print("· no such session — enter a number from the list, or empty to cancel")
     elif cmd == "export":
         out = f"aurora-session-{engine.session.id}.md"
-        with open(out, "w") as f:
-            f.write(sessions.export_markdown(engine.session.id))
+        # R207: `open(out, "w")` used the LOCALE's encoding, so exporting a
+        # transcript containing any non-ASCII — an em dash, a non-English
+        # reply, unicode in a code block — raised UnicodeEncodeError under
+        # LANG=C. And mode "w" truncates before it encodes, so the failure
+        # left a 0-byte .md behind. `write_text_atomic` pins UTF-8 and lands
+        # the file whole or not at all.
+        write_text_atomic(out, _all_chat_text(engine))   # R208
         print(f"· wrote {out}")
     elif cmd == "skills":
         print(skills.listing(engine.cfg.get("_base_dir")))
@@ -1496,10 +1577,6 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
             "  full docs: documents/EXTENSIONS.md in the Aurora repo"))
     elif cmd == "bootstrap":
         _bootstrap_cmd(engine, fe, arg)
-    elif cmd == "remember":
-        memory.remember(engine, fe, arg)
-    elif cmd == "agentic_report":
-        _agentic_report_cmd(engine, fe)
     elif cmd == "nano":
         tui = getattr(fe, "_tui", None)
         if tui is None:
@@ -1532,7 +1609,11 @@ def _banner(engine: Engine) -> None:
     mark = f"{GREEN}✔{RESET}" if h["ok"] else f"{RED}✘{RESET}"
 
     info_lines = [f"{CYAN}{BOLD}Aurora{RESET} {dim(version)}",
-                  f"  model    {BOLD}{engine.current.get('model')}{RESET}  "
+                  # R215: `.get('model')` is None with no model configured
+                  # (`/model remove` of the last entry, R81) and rendered as
+                  # the literal word "None" beside "✘ no model configured".
+                  f"  model    {BOLD}{engine.current.get('model') or '(none)'}"
+                  f"{RESET}  "
                   f"{mark} {dim(h['detail'])}",
                   f"  cwd      {os.getcwd()}",
                   f"  session  {engine.session.id}"
@@ -1580,9 +1661,18 @@ def run(engine: Engine) -> None:
     _ml_on = Condition(lambda: engine.multiline)
     _ml_off = Condition(lambda: not engine.multiline)
 
-    @kb.add("c-j")       # Ctrl+J newline
-    def _(event):
-        event.current_buffer.insert_text("\n")
+    # R213: Ctrl+J only when a human is typing. From a TERMINAL, Enter
+    # arrives as `\r` (c-m); from a PIPE, every line ends with `\n` — which
+    # IS c-j. Binding it to "insert a newline" therefore made piped input
+    # unsubmittable: the buffer accumulated the line, EOF discarded it, and
+    # `aurora --classic` exited 0 having silently done nothing. That is the
+    # exact mode `__main__.py` documents as the fallback for "pipes, CI".
+    # Not registering the binding at all (rather than filtering it) hands
+    # `c-j` back to prompt_toolkit's own default, which accepts the line.
+    if sys.stdin.isatty():
+        @kb.add("c-j")   # Ctrl+J newline
+        def _(event):
+            event.current_buffer.insert_text("\n")
 
     @kb.add("space")
     def _(event):
@@ -1624,16 +1714,24 @@ def run(engine: Engine) -> None:
         if not line:
             continue
         if line == "?":  # same gesture as ! for bash mode
-            print(help_text(memory.find_context_root(".") is not None))
+            print(help_text())
             continue
         if line.startswith("!"):  # local bash, no LLM (R10)
             subprocess.run(line[1:], shell=True)
             continue
-        if line.startswith("/"):
-            if not _handle_command(engine, fe, line):
-                break
-            continue
-        _run_turn(engine, fe, line)
+        # R214: a prompt anywhere UNDER here (a menu, a guidance comment, a
+        # paste) reads stdin too, and its EOF used to escape `run()` entirely
+        # and print a traceback. `select()` now answers EOF safely for the
+        # menus that matter; this is the backstop for the rest, and it ends
+        # the session exactly the way EOF at the main prompt already does.
+        try:
+            if line.startswith("/"):
+                if not _handle_command(engine, fe, line):
+                    break
+                continue
+            _run_turn(engine, fe, line)
+        except EOFError:
+            break
 
     print(f"\nResume this session with:\n  aurora --resume {engine.session.id}")
     print("bye")

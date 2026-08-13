@@ -96,9 +96,8 @@ every tool call, approval, and cache hit rate for one session:
   curated set of languages (python, js/ts, bash, go, rust, ruby) — timed
   collapsible thinking blocks, mouse support and drag-to-copy — with a
   classic REPL fallback for plain terminals.
-- Resume past conversations, export them as markdown, `/compact` long ones
-  into a summary, or `/remember` what mattered into a persistent
-  cross-session memory.
+- Resume past conversations, export them as markdown, or `/compact` long
+  ones into a summary.
 - Reusable prompt-driven skills, plus a per-project bootstrap prompt so
   the agent starts every session already knowing the codebase.
 - **[Extensions](EXTENSIONS.md)**: drop a `.py` file into

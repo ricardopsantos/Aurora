@@ -52,4 +52,4 @@ fi
 echo
 echo "Done. Next:"
 echo "  aurora key set            # store your OpenRouter/local key (keyring/encrypted)"
-echo "  aurora                    # run (auto-detects .agentic_context/)"
+echo "  aurora                    # run"

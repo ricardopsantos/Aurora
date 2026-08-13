@@ -23,5 +23,11 @@ If you'd rather not type a key in, `config.yaml`'s `key_fetch:` block lets
 the value lives) and store its output — approve with `y` and it's stored
 without copy-pasting. See the commented example in `config.yaml`.
 
+If the encrypted-file store is in use and you mistype its passphrase while
+adding a key, Aurora refuses and writes nothing — `not stored — the existing
+key store could not be decrypted`. That is deliberate: it used to replace the
+whole store with just the key being added, re-encrypted under the typo, and
+report success. Re-run the command and enter the right passphrase.
+
 No OpenRouter key? Aurora still works — only the paid remote models are
 unusable; pick your local model with `/model`.

@@ -77,7 +77,12 @@ def scaffold(name: str) -> Path:
     path = d / f"{slug}.py"
     if path.exists():
         raise FileExistsError(str(path))
-    path.write_text(_TEMPLATE.format(name=name.strip(), tool_name=slug))
+    # R207: explicit UTF-8. `tool_name` is slugified to ASCII but `name` is
+    # the user's raw text, so `/extensions new café` hit the locale encoding —
+    # and write_text truncates first, leaving a 0-byte .py that the next
+    # startup then tries to load as an extension.
+    path.write_text(_TEMPLATE.format(name=name.strip(), tool_name=slug),
+                    encoding="utf-8")
     return path
 
 

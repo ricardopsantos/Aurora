@@ -2,6 +2,7 @@
 built but never run (no terminal needed)."""
 
 import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -111,6 +112,7 @@ class _Stats:
         "m", 1200, 64000, 2.0, 0, "s1", False
     compactions = 0          # R159: default "never folded" — the counter
     # fragment is only rendered when this is non-zero
+    local_model = None       # only set for the "local" sentinel
 
 
 class _FakeEngine:
@@ -142,9 +144,6 @@ class _FakeEngine:
 
 @pytest.fixture
 def t(monkeypatch):
-    # deterministic regardless of the real cwd's .agentic_context (pytest
-    # normally runs from this repo's own root, which has one for real)
-    monkeypatch.setattr(tui.memory, "find_context_root", lambda *_a, **_k: None)
     # Application() builds fine headless; only .run() needs a terminal
     return tui.Tui(_FakeEngine())
 
@@ -1299,14 +1298,20 @@ def test_ask_continue_comment_choice_is_guidance(monkeypatch):
 def test_confirm_is_a_numbered_menu_with_default_first(monkeypatch):
     from aurora import ui
     seen = {}
-    def fake_select(prompt, options):
-        seen["options"] = options
+    def fake_select(prompt, options, **kw):
+        # **kw: R214 added `eof_key`, which `confirm` now passes. This test is
+        # about OPTION ORDER, so it tolerates the widened signature rather
+        # than re-pinning it — but the assertion below keeps the EOF answer
+        # honest, since "no" is the whole point of that parameter here.
+        seen["options"], seen["kw"] = options, kw
         return options[0][0]                 # pick the default (first, Enter)
     monkeypatch.setattr(ui, "select", fake_select)
     assert ui.confirm("Run it?") is True                       # [Y/n]: Yes first
     assert seen["options"][0] == ("y", "Yes")
     assert ui.confirm("Evict?", default_yes=False) is False     # [y/N]: No first
     assert seen["options"][0] == ("n", "No")
+    # R214: whatever the default, an unattended confirm must answer no
+    assert seen["kw"].get("eof_key") == "n"
 
 
 # ── select() arrow-key menu (TUI) ─────────────────────────────────────────
@@ -1328,6 +1333,60 @@ def test_select_menu_roundtrip_returns_chosen_key(t):
     th.join(timeout=2)
     assert got["key"] == "n"
     assert t._menu_options is None      # torn down after the answer
+
+# ── R188: menu rows are clickable, like the status bar's buttons ───────────
+def test_menu_rows_carry_a_mouse_handler(t):
+    t._menu_prompt, t._menu_options = "Approve?", _OPTS
+    t._menu_index = 0
+    try:
+        frags = t._menu_fragments()
+        # the prompt line and the hint stay plain 2-tuples; every option row
+        # fragment carries a third element (the handler), same shape the
+        # status bar's clickable fragments use
+        rows = [f for f in frags if len(f) == 3]
+        assert rows, "no clickable fragments in the menu"
+        assert all(callable(f[2]) for f in rows)
+        assert "click" in frags[-1][1]      # the hint advertises it
+    finally:
+        t._menu_prompt = t._menu_options = None
+
+
+def test_clicking_a_menu_row_picks_that_row(t):
+    """A click commits to the row, as Enter does — there is no hover-only
+    state in a terminal. Goes through `_resolve_menu`, so it works for a
+    blocking `select_menu()` too (see the roundtrip test)."""
+    got = {}
+
+    def worker():
+        got["key"] = t.select_menu("Approve?", _OPTS)
+
+    th = threading.Thread(target=worker)
+    th.start()
+    while t._menu_options is None:
+        pass
+    t._menu_row_click(1)(_mouse_up())      # click the SECOND row
+    th.join(timeout=2)
+    assert got["key"] == "n"
+    assert t._menu_options is None
+
+
+def test_a_menu_row_ignores_everything_but_mouse_up(t):
+    """Mirrors every other click handler here: a MOUSE_DOWN or a scroll must
+    not resolve the menu, or a drag over the pane would answer it."""
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.mouse_events import (MouseButton, MouseEvent,
+                                             MouseEventType)
+    t._menu_prompt, t._menu_options = "Approve?", _OPTS
+    t._menu_index = 0
+    try:
+        for ev in (MouseEventType.MOUSE_DOWN, MouseEventType.SCROLL_UP):
+            t._menu_row_click(1)(MouseEvent(
+                position=Point(x=0, y=0), event_type=ev,
+                button=MouseButton.LEFT, modifiers=frozenset()))
+            assert t._menu_options is not None, f"{ev} resolved the menu"
+    finally:
+        t._menu_prompt = t._menu_options = None
+
 
 def test_a_worker_menu_opened_over_an_esc_confirm_still_gets_its_answer(t):
     """R142a: the Esc-Esc confirms (_open_ui_menu, UI thread) and the blocking
@@ -1470,6 +1529,40 @@ def test_menu_esc_is_noop_while_open(t):
     assert t._menu_options is not None
     assert t._answers.empty()
 
+def test_update_menu_labels_repaints_open_menu_without_moving_the_cursor(t):
+    # /model's background price refresh (feature request, 2026-08-03) lands
+    # after the menu is already on screen; the fresh price has to appear
+    # without the user reopening the picker, and without the highlighted row
+    # sliding out from under them mid-keystroke.
+    t._menu_prompt, t._menu_options, t._menu_index = "Select model", [
+        ("1", "vendor/a  [$] $1/$2 per M"), ("2", "local  [free]")], 1
+    assert t.update_menu_labels("Select model", [
+        ("1", "vendor/a  [$] $9/$18 per M"), ("2", "local  [free]")]) is True
+    text = "".join(f[1] for f in t._menu_fragments())
+    assert "$9/$18 per M" in text and "$1/$2" not in text
+    assert t._menu_index == 1               # cursor stayed put
+    t._resolve_menu(1)
+    assert t._answers.get() == "2"          # index → key mapping unchanged
+
+
+def test_update_menu_labels_refuses_to_relabel_a_different_menu(t):
+    # the callback arrives from a network thread: by then the user may have
+    # picked a model and be sitting in an approval menu, and overwriting THAT
+    # menu's rows with model names would mislabel what Enter approves.
+    t._menu_prompt, t._menu_options, t._menu_index = "Approve?", _OPTS, 0
+    assert t.update_menu_labels(
+        "Select model", [("1", "vendor/a")]) is False
+    assert t._menu_options == _OPTS
+    # right prompt, but the option keys moved on (config changed under it)
+    t._menu_prompt = "Select model"
+    assert t.update_menu_labels(
+        "Select model", [("1", "vendor/a"), ("2", "vendor/b")]) is False
+    assert t._menu_options == _OPTS
+    # and no menu open at all is not something to paint into
+    t._menu_prompt = t._menu_options = None
+    assert t.update_menu_labels("Select model", [("1", "vendor/a")]) is False
+
+
 def test_model_picker_esc_cancels(t):
     # Only the model picker allows a bare Esc to back out with no change —
     # same "no change" outcome as a second click on the status bar's model
@@ -1544,43 +1637,12 @@ def test_status_hint_mentions_esc_for_model_picker(t):
     assert _status_line2(t) == "select one, or ESC to cancel"
 
 
-def test_agentic_report_hidden_when_no_context_detected(t):
-    assert t._agentic_root is None
-    assert "agentic report" not in _status_line1(t)
-
-
-def test_agentic_report_shown_and_underlined_when_detected(t, tmp_path):
-    t._agentic_root = tmp_path / ".agentic_context"
-    assert "agentic report" in _status_line1(t)
-    from prompt_toolkit.layout.controls import FormattedTextControl
-    ctrl = next(c for c in t.app.layout.find_all_controls()
-                if isinstance(c, FormattedTextControl)
-                # R155: anchored on the ctx gauge, not the (removed) session-id
-                # button — a label that only one control ever renders
-                and any("ctx " in f[1] for f in
-                        (c.text() if callable(c.text) else c.text)))
-    frag = next(f for f in ctrl.text() if f[1] == "agentic report")
-    # class:status.id carries "underline" in the app's Style.from_dict —
-    # same class used for every other clickable status-bar link
-    assert frag[0] == "class:status.id"
-
-
-def test_agentic_report_click_queues_the_command(t, tmp_path):
-    # the click doesn't call anything directly (a Stats/Index choice blocks
-    # on select(), which must never run on the UI thread) — it just queues
-    # /agentic_report for the worker, same as the model-picker click
-    t._agentic_root = tmp_path / ".agentic_context"
-    t._agentic_report_click()(_mouse_up())
-    assert t._inbox.get_nowait() == "/agentic_report"
-    assert any("/agentic_report" in e for e in t._chat if isinstance(e, str))
-
-
 def test_copy_all_click_queues_the_command_instead_of_working_inline(t, monkeypatch):
     """R129: the "copy all" button's work is UNBOUNDED — it parses the whole
     session JSONL (which only grows, R20) and then spawns a clipboard
     subprocess with a 5s timeout, all from a mouse handler on the UI
     event-loop thread. It now queues `/copy-all` for the worker instead,
-    same as the agentic-report button (R89).
+    same as every other status-bar link that blocks or does real work (R89).
 
     Asserted by proving neither expensive call happens on the calling
     thread: a failure here is a frozen UI, which no output assertion would
@@ -2189,7 +2251,6 @@ def test_nano_page_down_then_up_scrolls_editor_window(tmp_path):
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    tui.memory.find_context_root = lambda *_a, **_k: None
     p = tmp_path / "notes.txt"
     p.write_text("\n".join(f"line {i}" for i in range(200)))
 
@@ -2233,7 +2294,6 @@ def test_nano_rapid_page_up_clicks_reach_the_top(tmp_path):
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    tui.memory.find_context_root = lambda *_a, **_k: None
     p = tmp_path / "notes.txt"
     p.write_text("\n".join(f"line {i}" for i in range(200)))
 
@@ -2281,7 +2341,6 @@ def test_nano_wheel_scroll_up_reaches_the_true_top_on_wrapped_lines(tmp_path):
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    tui.memory.find_context_root = lambda *_a, **_k: None
     p = tmp_path / "notes.md"
     # long lines that force wrapping at DummyOutput's 80-column width
     p.write_text("\n".join(f"paragraph {i} " + "x" * 200 for i in range(60)))
@@ -2362,6 +2421,42 @@ def test_strip_dangerous_escapes_removes_unterminated_dcs():
     out = tui._strip_dangerous_escapes(payload)
     assert "\x1bP" not in out
     assert out == "before"
+
+
+# ── R198: an ESC inside the payload defeated every alternative ─────────────
+def test_an_esc_inside_an_osc_payload_does_not_smuggle_it_through():
+    """R198: every alternative's body excluded ESC (`[^\\x1b]*`), including
+    the two R171 added for unterminated sequences — which therefore could
+    never reach their `\\Z` anchor once another ESC intervened. No
+    alternative matched at the introducer, so the scan advanced PAST it,
+    stripped only the INNER sequence, and left the outer one live:
+
+        "\\x1b]52;c;PAY" + "\\x1b]0;t\\x07" + "LOAD"  ->  "\\x1b]52;c;PAYLOAD"
+
+    A still-open OSC 52 clipboard write survived the sanitizer whose whole
+    job is removing it. Fails without the fix on every payload below."""
+    for payload in ("\x1b]52;c;PAY\x1b]0;title\x07LOAD",     # embedded OSC
+                    "\x1b]52;c;PAY\x1b[0mLOAD",              # embedded CSI
+                    "\x1b]52;c;A\x1b]52;c;B",                # two open OSCs
+                    "\x1bP0;1|payload\x1b[0mtail"):          # DCS + inner CSI
+        out = tui._strip_dangerous_escapes(payload)
+        assert "\x1b]" not in out and "\x1bP" not in out, \
+            f"{payload!r} smuggled an introducer through as {out!r}"
+
+
+def test_r195_fix_does_not_over_strip_terminated_sequences():
+    """R198 guard against over-correcting: the unterminated alternatives are
+    greedy to end-of-text, so ordering is load-bearing. A properly terminated
+    sequence must still match the earlier, narrower alternative and take only
+    ITSELF, leaving following text alone."""
+    assert tui._strip_dangerous_escapes(
+        "\x1b]0;my title\x07hello world") == "hello world"
+    # an OSC 8 hyperlink pair brackets its text; both halves go, text stays
+    assert tui._strip_dangerous_escapes(
+        "\x1b]8;;http://x\x1b\\text\x1b]8;;\x1b\\") == "text"
+    # and colours are still untouched
+    assert tui._strip_dangerous_escapes(
+        "a\x1b[31mred\x1b[0mb") == "a\x1b[31mred\x1b[0mb"
 
 
 def test_append_strips_dangerous_escapes_from_llm_text(t):
@@ -2601,7 +2696,6 @@ def test_editing_keys_reach_the_editor_not_the_hidden_input():
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
-    tui.memory.find_context_root = lambda *_a, **_k: None
     with create_pipe_input() as inp:
         eng = _FakeEngine()
         tui_ = tui.Tui(eng)
@@ -3047,6 +3141,13 @@ def test_status_bar_drops_the_vendor_prefix_from_the_model(t):
     assert t._short_model("local") == "local"           # nothing to drop
 
 
+def test_status_bar_names_the_loaded_local_model(t):
+    """"local" alone doesn't say which model is serving — show it when the
+    live name is known, still without the vendor prefix."""
+    assert t._short_model("local", "unsloth/Qwen3-30B") == "local: Qwen3-30B"
+    assert t._short_model("local", None) == "local"     # not known (yet)
+
+
 def test_status_bar_keeps_the_vendor_prefix_when_it_disambiguates(t):
     """...unless two configured models share a short name, in which case a
     status bar that can't tell you which one you're on is worse than a long
@@ -3140,3 +3241,222 @@ def test_eviction_never_drops_the_entry_still_being_written(t):
     t.think_chunk("final")
     assert isinstance(t._chat[-1], (str, dict))
     del last
+
+
+# ── R204: the reasoning stream is model output too ─────────────────────────
+def test_think_chunks_are_sanitized_like_the_reply(t):
+    """R204: R171 added escape-stripping to `append()` reasoning that "a
+    compromised or prompt-injected model can put an OSC 52 clipboard write in
+    its own reply just as easily as a subprocess can". That argument is about
+    the MODEL, not about which of its two output channels carried it — and
+    `think_chunk` (the `reasoning_content` stream) was left raw, so a payload
+    there reached `_chat` intact and went out with /copy-all.
+
+    Fails without the fix: the row holds the raw OSC 52."""
+    payload = "reasoning\x1b]52;c;bG9va2F0dGhpcw==\x07 continues"
+    t.begin_think()
+    t.think_chunk(payload)
+    t.finish_think()
+    row = next(e for e in t._chat
+               if isinstance(e, dict) and e.get("kind") == "think")
+    assert "\x1b]52" not in row["text"]
+    assert "reasoning" in row["text"] and "continues" in row["text"]
+
+
+def test_a_think_payload_split_across_chunks_still_does_not_survive(t):
+    """R204: stripping per chunk cannot see a sequence split at a chunk
+    boundary. It is covered anyway — R198's unterminated alternative is
+    greedy to end-of-text, so the partial introducer goes as it arrives and
+    the continuation lands as ordinary text — and the close-time pass makes
+    that no longer depend on another rule's greediness."""
+    t.begin_think()
+    t.think_chunk("thinking\x1b]52;c;AA")
+    t.think_chunk("BB\x07 and on")
+    t.finish_think()
+    row = next(e for e in t._chat
+               if isinstance(e, dict) and e.get("kind") == "think")
+    assert "\x1b]52" not in row["text"]
+    assert "thinking" in row["text"]
+
+
+def test_closing_a_think_row_re_sanitizes_the_whole_text(t):
+    """R204: the close-time pass is the backstop. Written directly into the
+    row (bypassing `think_chunk`'s own strip) so it is THIS pass being
+    tested, not the per-chunk one."""
+    t.begin_think()
+    row = next(e for e in t._chat
+               if isinstance(e, dict) and e.get("kind") == "think")
+    row["text"] = "raw\x1b]52;c;SMUGGLED\x07 tail"
+    t.finish_think()
+    assert "\x1b]52" not in row["text"]
+    assert "raw" in row["text"] and "tail" in row["text"]
+
+
+# ── R205: eviction's line total is memoised, not re-scanned ────────────────
+def test_the_line_count_memo_never_drifts_from_a_fresh_recompute(t):
+    """R205: the memo is only safe if it is invalidated everywhere an entry's
+    text changes. `_dirty(i)` is that point and is already called at all of
+    them, but this pins it: after every kind of mutation the tui supports,
+    the memoised total must equal a from-scratch recompute."""
+    def fresh():
+        return sum(t._entry_lines(e) for e in t._chat)
+
+    t.append("one\ntwo\n")
+    assert t._total_lines() == fresh()
+    t.append("merged into the same entry\n")          # merge path
+    assert t._total_lines() == fresh()
+    t.append("x" * (t._MERGE_LIMIT + 10) + "\n")      # new-entry path
+    assert t._total_lines() == fresh()
+    t.append_bash_output("bash\noutput\n")
+    assert t._total_lines() == fresh()
+    t.begin_think()
+    t.think_chunk("thinking\nmore\n")                 # mutates in place
+    assert t._total_lines() == fresh()
+    t.finish_think()
+    assert t._total_lines() == fresh()
+    t.clear_screen()
+    assert t._total_lines() == fresh()
+
+
+def test_the_memo_stays_parallel_to_chat_across_eviction(t):
+    """R205: `_line_counts` is indexed by entry, so it has to be trimmed in
+    lockstep with `_chat` — a length drift would silently misprice every
+    entry after the split, and eviction is the one place both are trimmed."""
+    big = "y" * (t._MERGE_LIMIT + 10) + "\n"
+    for _ in range(60):
+        t.append(big)
+    assert len(t._line_counts) == len(t._chat) == len(t._cache)
+    t._SCROLLBACK_MAX_LINES, t._SCROLLBACK_KEEP_LINES = 20, 10
+    t.append(big)
+    with t._lock:
+        t._evict_locked()
+    assert len(t._line_counts) == len(t._chat) == len(t._cache)
+    assert t._total_lines() == sum(t._entry_lines(e) for e in t._chat)
+
+
+# ── R211: editing keys leaked past the menu's Keys.Any swallow ─────────────
+def _resolved_press(t, key, event=None):
+    """Press a key the way prompt_toolkit really would — pick among the
+    bindings that MATCH and whose filter passes, then call `matches[-1]`.
+    `_press` above calls a handler directly and so cannot see precedence,
+    which is the entire subject of these tests."""
+    kb = t.app.key_bindings
+    matches = [b for b in kb.get_bindings_for_keys((key,)) if b.filter()]
+    assert matches, f"no active binding for {key}"
+    matches[-1].handler(event)
+    return matches[-1]
+
+
+def test_editing_keys_do_not_leak_into_the_draft_during_a_menu(t):
+    """R211: the `Keys.Any` binding is documented as swallowing "every other
+    key (letters, space, backspace, paste) … so nothing leaks into the buffer
+    rendered underneath the menu". Two of the four keys it NAMES leaked.
+
+    `Keys.Any` is a fallback: prompt_toolkit sorts Any-bindings first and
+    calls `matches[-1]`, so every more specific binding beats it. `space`,
+    `c-j` and `backspace` were bound specifically with no menu filter, so
+    while an approval menu was open a space appended to the draft, Ctrl+J
+    added a newline to it, and backspace edited it.
+
+    Fails without the fix: the draft grows a trailing space."""
+    _type(t, "my draft")
+    t._menu_options, t._menu_prompt = ["yes", "no"], "Approve?"
+    _resolved_press(t, " ")
+    _resolved_press(t, Keys.ControlJ)
+    assert t.input.buffer.text == "my draft"
+
+
+def test_backspace_during_a_menu_cannot_drop_bash_mode(t):
+    """R211, the sharper half: backspace on an empty `$` prompt leaves bash
+    mode. With a menu open that fired anyway — so a stray backspace while
+    answering "Approve this command?" silently changed a mode the user never
+    touched.
+
+    Fails without the fix: bash mode is off."""
+
+    class _Ev:
+        arg = 1
+
+    t._bash_mode = True
+    t._menu_options, t._menu_prompt = ["yes", "no"], "Approve?"
+    _resolved_press(t, Keys.Backspace, _Ev())
+    assert t._bash_mode is True
+
+
+def test_menu_driving_keys_still_beat_the_swallow(t):
+    """R211 guard against over-correcting: enter, arrows, escape and digits
+    are SUPPOSED to outrank `Keys.Any` — driving the menu is their job. Only
+    the editing keys were filtered."""
+    t._menu_options, t._menu_prompt = ["yes", "no"], "Approve?"
+    for key in (Keys.ControlM, Keys.Up, Keys.Down, Keys.Escape, "1"):
+        kb = t.app.key_bindings
+        matches = [b for b in kb.get_bindings_for_keys((key,)) if b.filter()]
+        assert matches and matches[-1].keys != (Keys.Any,), \
+            f"{key} no longer reaches the menu"
+
+
+def test_editing_keys_are_unaffected_with_no_menu_open(t):
+    """R211: the filter is menu-scoped — with no menu, space and backspace
+    edit exactly as before."""
+
+    class _Ev:
+        arg = 1
+
+    _type(t, "ab")
+    _resolved_press(t, " ")
+    assert t.input.buffer.text == "ab "
+    _resolved_press(t, Keys.Backspace, _Ev())
+    assert t.input.buffer.text == "ab"
+
+
+# ── R212: a status-render failure was silent ───────────────────────────────
+def test_a_status_render_failure_is_reported_once(t, tmp_path, monkeypatch):
+    """R212: the status block is wrapped in `except Exception` so a render
+    error cannot take the app down — correct, since the bar repaints on a
+    timer. But the fallback was SILENT: any bug in it showed only as a bar
+    that mysteriously read " aurora", with nothing logged.
+
+    Not hypothetical. `MEMORY/bugs/20260715_120000_tui_status_token_int_crash`
+    records exactly such a crash (`live_token_tag` handing a char count to a
+    function wanting a string) — this handler is what a repeat would hide.
+
+    Reported once, not per frame: the bar repaints several times a second and
+    logging each one would bury the session log in duplicates of one bug.
+
+    Fails without the fix: no marker, no `_status_error`, no record."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    from aurora.session import Session
+    t.engine.session = Session()
+
+    def _boom():
+        raise TypeError("object of type 'int' has no len()")
+
+    t.engine.context_stats = _boom
+    for _ in range(5):
+        frags = t._status_render()
+
+    assert "⚠" in "".join(f[1] for f in frags)
+    assert t._status_error == "TypeError: object of type 'int' has no len()"
+    errors = [r for r in t.engine.session.iter_records()
+              if r.get("event") == "error" and r.get("where") == "status_render"]
+    assert len(errors) == 1, f"logged {len(errors)} times across 5 renders"
+
+
+def test_a_healthy_status_bar_is_unmarked(t):
+    """R212 guard: the marker must mean something. A normal render carries no
+    warning sign and leaves `_status_error` unset."""
+    frags = t._status_render()
+    assert "⚠" not in "".join(f[1] for f in frags[:4])
+    assert t._status_error is None
+
+
+def test_a_status_render_failure_never_propagates(t, tmp_path, monkeypatch):
+    """R212: the whole point of the handler survives the change — the bar
+    repaints on a timer, so raising here would take the session down. Even a
+    failure while LOGGING the failure must not escape."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    t.engine.context_stats = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    t.engine.session = types.SimpleNamespace(
+        log=lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    frags = t._status_render()          # must not raise
+    assert "⚠" in "".join(f[1] for f in frags)

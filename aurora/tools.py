@@ -32,7 +32,7 @@ def needs_approval(name: str) -> bool:
 # filesystem or the network, so ordering between them is unobservable — the
 # model asked for all of them at once anyway.
 PARALLEL_SAFE = {"read_file", "list_dir", "grep", "find_files",
-                 "open_context_doc", "web_search", "web_fetch"}
+                 "web_search", "web_fetch"}
 
 # R94: run a round's PARALLEL_SAFE calls concurrently. runtime.parallel_tools
 # turns it off.
@@ -357,6 +357,19 @@ def set_command_timeout(seconds: float) -> None:
     COMMAND_TIMEOUT = max(1, int(seconds))
 
 
+# R194: how much of a command's output is held in memory. `communicate()` had
+# no bound at all, so `run_command("yes")` grew until COMMAND_TIMEOUT (300s by
+# default) — the same unbounded-producer shape R96m fixed for grep, and the
+# model is again the actor most likely to issue the runaway command.
+#
+# 5MB rather than grep's 200k because this is ALSO the TUI's bash-mode path,
+# where the user typed the command themselves and the output is theirs to
+# read; the tool path truncates to TOOL_OUTPUT_LIMIT (60k) downstream anyway,
+# so this cap is invisible there and generous here. Approximate, not exact:
+# the chunk that crosses the cap is kept whole.
+COMMAND_OUTPUT_CAP = 5 * 1024 * 1024
+
+
 def _run_command_once(command: str, workdir: str | None,
                       timeout: float | None = None) -> tuple[str, int | None]:
     """Run one shell command to completion (or `timeout`, default
@@ -380,14 +393,16 @@ def _run_command_once(command: str, workdir: str | None,
     # session makes the shell a group leader so the timeout can kill the
     # whole tree.
     import os
-    # R144a: `errors="replace"`, same as read_file/grep already use. `text=True`
-    # decodes as strict UTF-8, so a command emitting ANY non-UTF-8 byte — a
-    # latin-1 log, a binary blob, a tool printing raw bytes — raised
-    # UnicodeDecodeError and lost the whole output, including the part that
-    # decoded fine. Worse in bash mode, which calls this directly, outside
-    # run_tool's exception guard.
-    proc = subprocess.Popen(command, shell=True, cwd=workdir, text=True,
-                            errors="replace",
+    import select
+    import time as _time
+    # R144a: `errors="replace"`, same as read_file/grep already use — a command
+    # emitting ANY non-UTF-8 byte (a latin-1 log, a binary blob) must not lose
+    # the whole output, including the part that decoded fine.
+    # R194: BINARY pipes, decoded once at the end, exactly as R127 did for
+    # grep. Text mode wraps each pipe in a TextIOWrapper, and a buffered read
+    # on that blocks until its buffer fills — which would defeat the deadline
+    # the read loop below exists to enforce.
+    proc = subprocess.Popen(command, shell=True, cwd=workdir,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
     # Read the group id NOW, while the shell is certainly alive. Looking it
@@ -400,39 +415,99 @@ def _run_command_once(command: str, workdir: str | None,
         pgid = os.getpgid(proc.pid)
     except OSError:
         pgid = None
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as e:
-        _kill_group(proc, pgid)
-        # TimeoutExpired carries what was read before the deadline — a
-        # partial build log is far more useful than a bare timeout line.
-        # (Re-draining via communicate() is unreliable once the group is
-        # killed, so take it from the exception.)
-        partial = (_text(e.stdout) + _text(e.stderr)).strip()
+    # R194: drain both pipes incrementally instead of `communicate()`, which
+    # buffers the command's COMPLETE output in memory before any caller-side
+    # truncation runs. Both pipes are watched together — draining only one is
+    # the deadlock R153 documents (the child blocks writing to the pipe nobody
+    # is reading, produces no more of the other, and the whole timeout burns
+    # for nothing). Past the cap the reads still HAPPEN, they just stop being
+    # accumulated: the point is to keep the pipe empty so the command runs to
+    # completion normally. It is deliberately not killed for being verbose —
+    # that would change its exit code and lose its side effects.
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    out_len = err_len = 0
+    truncated = False
+    timed_out = False
+    watch = [proc.stdout, proc.stderr]
+    deadline = _time.monotonic() + timeout
+    while watch:
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        ready, _, _ = select.select(watch, [], [], remaining)
+        for pipe in ready:
+            # raw `os.read`, never a buffered `.read(n)` — see the Popen call
+            chunk = os.read(pipe.fileno(), 65536)
+            if not chunk:
+                watch.remove(pipe)          # EOF on this pipe
+                continue
+            if pipe is proc.stdout:
+                if out_len < COMMAND_OUTPUT_CAP:
+                    out_chunks.append(chunk)
+                    out_len += len(chunk)
+                else:
+                    truncated = True
+            elif err_len < COMMAND_OUTPUT_CAP:
+                err_chunks.append(chunk)
+                err_len += len(chunk)
+            else:
+                truncated = True
+
+    def _decoded() -> str:
+        s = (b"".join(out_chunks).decode("utf-8", errors="replace")
+             + b"".join(err_chunks).decode("utf-8", errors="replace"))
+        if truncated:
+            s += (f"\n[output truncated at {COMMAND_OUTPUT_CAP} bytes — "
+                  "the command kept running; redirect to a file if you need "
+                  "all of it]")
+        return s
+
+    if not timed_out:
+        # Both pipes are at EOF, which is not the same as "the process has
+        # exited" — a double-forked grandchild can close them and leave the
+        # shell alive. Bound the reap by whatever is left of the deadline so
+        # that case can still time out rather than block the worker thread.
         try:
-            # R171: the direct child already got SIGKILL above, so reaping
-            # it is normally instant — this wait only exists to avoid a
-            # zombie, not to give an escaped grandchild time to die. A 5s
-            # bound blocked the WORKER THREAD (no Esc polling happens here)
-            # up to 5s past the command's own timeout on exactly the R170e
-            # escaped-grandchild case, which the warning below already
-            # reports either way; shortening the bound caps that extra
-            # stall without changing what gets reported.
-            proc.wait(timeout=1)
+            proc.wait(timeout=max(0.0, deadline - _time.monotonic()))
         except subprocess.TimeoutExpired:
-            # R170e: `_kill_group` only reaches processes still in `pgid` —
-            # a grandchild that double-forked into its own session (`setsid`,
-            # a daemonizing tool) escapes it, can keep holding the stdout
-            # pipe open, and this final wait() can itself time out. That used
-            # to be swallowed silently: the tool call "succeeded" with no
-            # sign anything was left running. Surface it instead — the
-            # process itself still can't be reached from here (that's the
-            # whole problem), but the model/user should know to go looking.
-            partial = (partial + "\n" if partial else "") + (
-                "[warning: a grandchild process may have escaped cleanup "
-                "and could still be running]")
-        return partial, None
-    return (stdout or "") + (stderr or ""), proc.returncode
+            timed_out = True
+    for pipe in (proc.stdout, proc.stderr):
+        try:
+            pipe.close()
+        except OSError:
+            pass
+    if not timed_out:
+        return _decoded(), proc.returncode
+
+    # Timed out: kill the group and report whatever was read before the
+    # deadline — a partial build log is far more useful than a bare timeout
+    # line.
+    _kill_group(proc, pgid)
+    partial = _decoded().strip()
+    try:
+        # R171: the direct child already got SIGKILL above, so reaping it is
+        # normally instant — this wait only exists to avoid a zombie, not to
+        # give an escaped grandchild time to die. A 5s bound blocked the
+        # WORKER THREAD (no Esc polling happens here) up to 5s past the
+        # command's own timeout on exactly the R170e escaped-grandchild case,
+        # which the warning below already reports either way; shortening the
+        # bound caps that extra stall without changing what gets reported.
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        # R170e: `_kill_group` only reaches processes still in `pgid` — a
+        # grandchild that double-forked into its own session (`setsid`, a
+        # daemonizing tool) escapes it, can keep holding the stdout pipe
+        # open, and this final wait() can itself time out. That used to be
+        # swallowed silently: the tool call "succeeded" with no sign anything
+        # was left running. Surface it instead — the process itself still
+        # can't be reached from here (that's the whole problem), but the
+        # model/user should know to go looking.
+        partial = (partial + "\n" if partial else "") + (
+            "[warning: a grandchild process may have escaped cleanup "
+            "and could still be running]")
+    return partial, None
 
 
 def run_command(command: str, cwd: str = "", **_) -> str:
@@ -651,14 +726,33 @@ def set_extensions(specs: list[dict], runners: dict) -> list[str]:
     _EXTENSION_SPECS. Returns human-readable warnings for the same
     `engine.extension_warnings` surface load/register failures already use."""
     global _EXTENSION_SPECS, _EXTENSION_RUNNERS
-    from . import context
-    builtin_names = set(RUNNERS) | set(context.RUNNERS)
+    builtin_names = set(RUNNERS)
     warnings: list[str] = []
     seen: set[str] = set()
     kept_specs: list[dict] = []
     kept_runners: dict = {}
     for spec in specs:
+        # R187d: shape-checked, because this runs UNGUARDED at engine.py's
+        # construction — extensions.discover() wraps import and register(),
+        # but not this merge. So `spec.get` on a non-dict (a bare `SPEC =
+        # ["oops"]`) raised AttributeError straight out of Engine.__init__ and
+        # Aurora would not start at all, with a raw traceback: one malformed
+        # file in ~/.aurora/extensions/ bricking the session, against
+        # extensions.py's stated "never lets one broken extension take the
+        # rest of the session down".
+        if not isinstance(spec, dict):
+            warnings.append(f"extension tool spec isn't an object — skipped: "
+                            f"{spec!r:.80}")
+            continue
         name = spec.get("name")
+        # A nameless spec used to be KEPT (None isn't in builtins or `seen`),
+        # so it reached the model as an unnamed tool while `None in runners`
+        # left it with no runner — a tool advertised and permanently
+        # uncallable.
+        if not isinstance(name, str) or not name.strip():
+            warnings.append(f"extension tool spec has no usable name — "
+                            f"skipped: {spec!r:.80}")
+            continue
         if name in builtin_names:
             warnings.append(f"extension tool '{name}' shadows a builtin "
                             f"tool — skipped")
@@ -681,10 +775,7 @@ def specs() -> list[dict]:
     `extensions_bundled/web_extension.py`, whose `register()` reads
     `runtime.web_search` itself — so the flag is honoured once, at load, and
     this layer no longer knows the web tools exist by name."""
-    from . import context
     s = list(SPEC)
-    if context.active():
-        s += context.SPEC
     s += _EXTENSION_SPECS
     return s
 
@@ -729,8 +820,7 @@ def result_status(out: str) -> str:
 
 
 def run_tool(name: str, args: dict) -> str:
-    from . import context
-    for table in (RUNNERS, context.RUNNERS, _EXTENSION_RUNNERS):
+    for table in (RUNNERS, _EXTENSION_RUNNERS):
         if name in table:
             try:
                 out = table[name](**args)

@@ -19,7 +19,6 @@ from . import (
     agent,
     compact,
     config,
-    context,
     extensions,
     keystore,
     rewind,
@@ -85,6 +84,10 @@ class ContextStats:
     # remote_context_limits.json) always has cost_usd == 0.0, which is
     # indistinguishable from "genuinely priced, $0 spent so far" without
     # this flag
+    local_model: str | None = None   # what the "local" sentinel is actually
+    # serving right now (live `/props` name, cached) — the status bar renders
+    # `local: <name>`, since "local" alone doesn't say which model is loaded.
+    # None whenever the answer isn't known yet or the model isn't "local".
 
     @property
     def pct(self) -> float:
@@ -123,7 +126,20 @@ class Engine:
         # spawn child server processes, which must not happen on every turn.
         self._mcp_manager = None
         ext_specs, ext_runners, ext_warnings = extensions.discover(self)
-        ext_warnings += tools.set_extensions(ext_specs, ext_runners)
+        # R187d: discover() guards import and register(), but this merge used
+        # to run bare — so anything it raised escaped Engine construction and
+        # Aurora refused to start over one bad extension file. set_extensions
+        # now shape-checks its input; this is the outer net for the same
+        # invariant (a broken extension costs its own tools, never the
+        # session), since a future edit there shouldn't be able to break
+        # startup either.
+        try:
+            ext_warnings += tools.set_extensions(ext_specs, ext_runners)
+        except Exception as e:
+            ext_warnings.append(
+                f"extension tools could not be installed "
+                f"({e.__class__.__name__}: {e}) — continuing without them")
+            tools.set_extensions([], {})
         if self._mcp_manager is not None:
             ext_warnings += [f"mcp: {e}" for e in self._mcp_manager.errors]
         self.extension_warnings = ext_warnings
@@ -141,10 +157,15 @@ class Engine:
         # ran on turns that didn't need it. A tool result the user never sees
         # accounted for is a worse surprise than a fold.
         self.auto_compact = bool(self.runtime.get("auto_compact", True))
-        self.auto_compact_threshold_pct = float(
-            self.runtime.get("auto_compact_threshold_pct", 80))
-        self.compact_keep_recent_tokens = int(
-            self.runtime.get("compact_keep_recent_tokens", 20_000))
+        # R202: same invariant R200 put on the SETTERS, applied to the LOAD
+        # path — which a hand edit reaches directly, and config.yaml is a file
+        # Aurora explicitly invites the user to edit.
+        self.auto_compact_threshold_pct = self._runtime_number(
+            "auto_compact_threshold_pct", 80.0, float,
+            lambda v: 0 < v <= 100, ">0 and <=100")
+        self.compact_keep_recent_tokens = self._runtime_number(
+            "compact_keep_recent_tokens", 20_000, int,
+            lambda v: v > 0, "a positive number of tokens")
         # R58: hashes of confirmed false positives (secrets.hash_value) —
         # never the raw values, so config.yaml stays safe to commit/share
         self.secret_allowlist: set[str] = set(self.runtime.get("secret_allowlist", []))
@@ -154,7 +175,7 @@ class Engine:
         # default, since silently switching models mid-session is a real
         # behavior change some setups don't want (e.g. a fixed-model CI job).
         self.model_fallback = bool(self.runtime.get("model_fallback", False))
-        self.system = _base_system()  # + context bootstrap when present
+        self.system = _base_system()
         self.messages: list[dict] = []
         self._used = 0
         self.compactions = 0   # R159
@@ -356,6 +377,37 @@ class Engine:
             return bool(e["cache"])
         return e.get("model") != "local"
 
+    def _runtime_number(self, key: str, default, cast, valid, hint: str):
+        """R202: read one numeric `runtime:` setting, falling back to the
+        default when it is unusable.
+
+        R200 range-checked the setters, so `/autocompact 0` is refused — but
+        `config.yaml` is hand-editable and its values are read straight into
+        attributes here, so a hand edit walked right past that check and
+        reinstated the same broken states (a 0 threshold auto-compacts every
+        turn; one above 100 disables it while the UI reports it ON).
+
+        Never raises. A non-numeric value used to crash `Engine.__init__`
+        through the bare `float()`/`int()`, i.e. a typo in an editable config
+        made Aurora unstartable — and an unstartable app is a worse answer to
+        a bad setting than a corrected one. Reports through
+        `extension_warnings`, the surface both frontends already print at
+        startup, rather than inventing a second one."""
+        raw = self.runtime.get(key, default)
+        try:
+            val = cast(raw)
+        except (TypeError, ValueError):
+            self.extension_warnings.append(
+                f"config runtime.{key}: {raw!r} is not a number — "
+                f"using {default}")
+            return default
+        if not valid(val):
+            self.extension_warnings.append(
+                f"config runtime.{key}: {val:g} must be {hint} — "
+                f"using {default}")
+            return default
+        return val
+
     def set_prompt_cache(self, on: bool) -> None:
         self.prompt_cache = on
         persist_runtime_value(self.cfg, "prompt_cache", on)
@@ -363,6 +415,38 @@ class Engine:
     def set_auto_compact(self, on: bool) -> None:
         self.auto_compact = on
         persist_runtime_value(self.cfg, "auto_compact", on)
+
+    def set_auto_compact_threshold_pct(self, pct: float) -> None:
+        """R200: range-checked. R189 made this settable from a running
+        session but accepted any float and PERSISTED it, so one typo broke
+        auto-compact until the user hand-edited config.yaml back:
+
+        - `0` or negative — the gate is `stats.pct < threshold`, so it never
+          returns early and auto-compact folds history on EVERY turn, even at
+          5% context, burning a summarization request each time.
+        - anything above 100 — `pct` can't reach it, so auto-compact never
+          fires again while the UI keeps reporting it ON. A safety mechanism
+          silently off is worse than one that's visibly off.
+
+        Raised as ValueError because `/autocompact`'s handler already catches
+        it for a non-numeric argument; this just gives it a real reason."""
+        if not 0 < pct <= 100:
+            raise ValueError(
+                f"threshold must be >0 and <=100 percent (got {pct:g})")
+        self.auto_compact_threshold_pct = pct
+        persist_runtime_value(self.cfg, "auto_compact_threshold_pct", pct)
+
+    def set_compact_keep_recent_tokens(self, n: int) -> None:
+        """R200: must be positive. `compact_history` treats
+        `keep_recent_tokens=0` as the MANUAL `/compact` sentinel meaning
+        "fold the entire history" — as a persisted AUTO value that means
+        every auto-compact throws away the current turn too, which is the
+        opposite of what the setting is for."""
+        if n <= 0:
+            raise ValueError(
+                f"keep must be a positive number of tokens (got {n})")
+        self.compact_keep_recent_tokens = n
+        persist_runtime_value(self.cfg, "compact_keep_recent_tokens", n)
 
     def set_model_fallback(self, on: bool) -> None:
         self.model_fallback = on
@@ -499,7 +583,7 @@ class Engine:
             # R154: routed through the engine so the context gauge tracks the
             # live number mid-turn, not just at the end; still forwards to
             # the frontend's own on_usage exactly as before
-            on_usage=lambda i, o: self._live_usage(fe, i, o),
+            on_usage=lambda i, o, c=0: self._live_usage(fe, i, o, c),
             maybe_compact=lambda: self._maybe_auto_compact_mid_turn(fe),
             # R133c: session.py has always claimed approvals were logged; they
             # never were. Every gate outcome now lands in the JSONL, including
@@ -620,7 +704,7 @@ class Engine:
         self._maybe_auto_compact(fe)
 
     def _live_usage(self, fe: Frontend, input_tokens: int,
-                    output_tokens: int) -> None:
+                    output_tokens: int, cached_tokens: int = 0) -> None:
         """R154 (task 1): move the context gauge to the REAL number as each
         round reports it, instead of once when the whole turn is over.
 
@@ -645,12 +729,20 @@ class Engine:
         sum_out)` — pricing is linear in tokens (`openai_compat.py`'s
         `cost()`) — so this is the exact same total the old end-of-turn line
         computed via `turn.billed_input`/`turn.output_tokens`, just visible
-        as it happens instead of only after."""
+        as it happens instead of only after.
+
+        R192 kept that invariant: cache reads add a THIRD linear term
+        (`turn.cached_input` sums the same per-round numbers passed here), so
+        per-round summing still equals the whole-turn figure. It matters that
+        the split is applied per round rather than to the turn total — the
+        first round of a turn is usually a cache MISS and later ones hits, and
+        only the per-round numbers know which was which."""
         if input_tokens or output_tokens:
             self._used = input_tokens + output_tokens
             if hasattr(self._provider, "cost"):
                 model = self.current.get("model", "")
-                self._cost += self._provider.cost(model, input_tokens, output_tokens)
+                self._cost += self._provider.cost(
+                    model, input_tokens, output_tokens, cached_tokens)
                 if (getattr(self._provider, "has_pricing", None)
                         and self._provider.has_pricing(model)):
                     self._cost_priced = True
@@ -756,9 +848,13 @@ class Engine:
         limit = self._context_limit_nonblocking(provider, model)
         known = (bool(getattr(provider, "has_pricing", None))
                 and provider.has_pricing(model)) or self._cost_priced
+        # nonblocking by construction (see `_live_model_name_nonblocking`) —
+        # this runs on the render path, once per status repaint
+        live = (self._live_model_name_nonblocking(provider)
+                if model == "local" else None)
         return ContextStats(model, self._used, limit, self._cost,
                             self.session.id, compactions=self.compactions,
-                            cost_known=known)
+                            cost_known=known, local_model=live)
 
     def _context_limit_nonblocking(self, provider, model: str) -> int:
         """The context limit for the gauge, WITHOUT ever blocking the caller
@@ -992,11 +1088,12 @@ class Engine:
         # R158: the system prompt counts. `_used` is otherwise set from the
         # provider's own input_tokens (`_live_usage`), which BILLS the system
         # prompt — so re-estimating from messages alone silently dropped it
-        # here, and on a bootstrapped `.agentic_context` session that is ~12k
-        # tokens of AGENTS.md + three INDEX.md + every [CORE] doc. The gauge
-        # then read low, `_maybe_auto_compact_mid_turn` saw headroom that did
-        # not exist, and the next request went out over the limit. Counting it
-        # keeps the two sources of `_used` measuring the same thing.
+        # here, and a long `/bootstrap` prompt plus its own tool-driven
+        # project orientation can easily run several thousand tokens. The
+        # gauge then read low, `_maybe_auto_compact_mid_turn` saw headroom
+        # that did not exist, and the next request went out over the limit.
+        # Counting it here keeps the two sources of `_used` measuring the
+        # same thing.
         self._used = (tokens.estimate_tokens(self.system or "")
                       + sum(tokens.estimate_tokens(str(m.get("content", "")))
                             for m in self.messages))
@@ -1038,6 +1135,25 @@ class Engine:
 
     def _provider_health_uncached(self) -> dict:
         provider = self._provider_for(self.current)
+        # R215: `_provider_for` returns None when no model is configured —
+        # reachable via `/model remove` of the last entry (R81), or a
+        # `models: []` config. `context_stats` already guards this exact
+        # case; this path did not, so the startup health probe died with an
+        # AttributeError on its own daemon thread and dumped a traceback to
+        # stderr before the banner. Nothing caught it because nothing was
+        # meant to: the probe is fire-and-forget.
+        if provider is None:
+            # R216: two DIFFERENT causes reach here, and R215 reported both as
+            # "no model configured" — which the banner rendered beside the
+            # model's own name as `model v/m  ✘ no model configured`, a line
+            # that contradicts itself. `make_provider` also returns None when a
+            # model names a `provider:` the config doesn't define.
+            if not self.current.get("model"):
+                return {"ok": False, "detail": "no model configured"}
+            missing = self.current.get("provider")
+            return {"ok": False,
+                    "detail": f"provider {missing!r} not in config.yaml"
+                              if missing else "model has no provider set"}
         # openai-compat providers may have several endpoints configured; make
         # sure we test the one we would actually use for a request.
         if callable(getattr(provider, "pick_endpoint", None)):
@@ -1107,18 +1223,7 @@ class Engine:
         self.multiline = on
         persist_runtime_value(self.cfg, "multiline", on)
 
-    # ── context bootstrap + resume ──────────────────────────────────────
-    def bootstrap_context(self, cwd: str = ".") -> bool:
-        """agentic_context injection (R12). NOT called automatically — the
-        agent knows nothing about .agentic_context unless the user's
-        /bootstrap prompt (or an explicit caller) introduces it. Returns True
-        when active; the system prompt is resent every turn (cached, R15)."""
-        prompt = context.bootstrap(cwd)
-        self.system = _base_system() + ("\n\n---\n\n" + prompt if prompt else "")
-        if prompt:
-            self.session.log("context_bootstrap", chars=len(prompt))
-        return bool(prompt)
-
+    # ── resume ────────────────────────────────────────────────────────────
     def resume_from(self, session_id: str) -> int:
         """Rebuild plain-text history from a past session's JSONL (R20).
         Rebuilt as flat text (tool blocks aren't replayed), shaped for the

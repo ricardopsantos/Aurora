@@ -25,7 +25,12 @@ def _expand(value):
 
 def load_config(path: str | Path) -> dict:
     path = Path(path)
-    with open(path) as f:
+    # R199: encoding pinned, never the locale's. Aurora WRITES this file as
+    # UTF-8 with `allow_unicode=True` (see persist_model_entry), so under
+    # LANG=C it could not read back a config it had written itself — and
+    # `/model add` puts OpenRouter's descriptions, which are full of em
+    # dashes, straight into it. Same defect R146b fixed in session.py.
+    with open(path, encoding="utf-8") as f:
         cfg = _expand(yaml.safe_load(f)) or {}
     cfg.setdefault("providers", {})
     cfg.setdefault("models", [])
@@ -48,7 +53,7 @@ def load_state() -> dict:
     if not p.exists():
         return {}
     try:
-        return yaml.safe_load(p.read_text()) or {}
+        return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     except Exception:
         return {}
 
@@ -65,7 +70,7 @@ def persist_runtime_value(cfg: dict, key: str, value) -> None:
     YAML comments do NOT survive the round-trip — anywhere in the file, not
     just the runtime block; acceptable for v1."""
     path = Path(cfg["_path"])
-    raw = yaml.safe_load(path.read_text()) or {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     raw.setdefault("runtime", {})[key] = value
     write_text_atomic(path, yaml.safe_dump(raw, sort_keys=False,
                                           allow_unicode=True))
@@ -78,7 +83,7 @@ def persist_model_entry(cfg: dict, entry: dict) -> None:
     survive, YAML comments do not. Also appends to the live cfg dict so the
     running engine sees it without a reload."""
     path = Path(cfg["_path"])
-    raw = yaml.safe_load(path.read_text()) or {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     raw.setdefault("models", []).append(dict(entry))
     write_text_atomic(path, yaml.safe_dump(raw, sort_keys=False,
                                           allow_unicode=True))
@@ -90,7 +95,7 @@ def remove_model_entries(cfg: dict, model_id: str) -> int:
     live cfg list (/model remove). The live list is mutated IN PLACE —
     Engine.models aliases it. Returns how many entries were removed."""
     path = Path(cfg["_path"])
-    raw = yaml.safe_load(path.read_text()) or {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     models = raw.get("models") or []
     kept = [m for m in models if m.get("model") != model_id]
     removed = len(models) - len(kept)

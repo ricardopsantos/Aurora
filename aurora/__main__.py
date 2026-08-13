@@ -1,6 +1,6 @@
 """Entry point: `aurora` | `python -m aurora`.
 
-  aurora                     start (auto-detects .agentic_context/ in the cwd)
+  aurora                     start
   aurora --continue          resume the most recent session
   aurora --resume ID         resume a specific session
   aurora --classic           inline REPL instead of the full-screen TUI
@@ -17,6 +17,8 @@
 
 import sys
 from pathlib import Path
+
+import yaml
 
 from . import session as sessions
 
@@ -96,7 +98,10 @@ def _key_set(argv: list[str]) -> None:
         val = getpass.getpass(f"{env} (input hidden): ").strip()
     if not val:
         sys.exit("nothing entered")
-    where = keystore.store_key(env, val)
+    try:                                   # R201: see ui._prompt_and_store_key
+        where = keystore.store_key(env, val)
+    except keystore.KeystoreError as e:
+        sys.exit(f"not stored — {e}")
     print(f"stored {env} in {where}")
 
 
@@ -195,8 +200,21 @@ def main() -> None:
                  "       aurora key set [ENV_VAR]")
 
     from .engine import Engine
+    from .paths import AuroraHomeError
 
-    engine = Engine(config)
+    # R216: config.yaml is hand-edited — R199 and R202 both turned on that
+    # fact — so a YAML typo is a normal event, not a corruption scenario. It
+    # used to surface as a raw `yaml.parser.ParserError` traceback. The
+    # allowlist has had `ApproveLoadError` for this since R170a; the config
+    # itself, which is the file users edit far more often, had nothing.
+    # The parser's own message already names the file, line and column, so it
+    # is worth keeping — it is the traceback around it that is noise.
+    try:
+        engine = Engine(config)
+    except yaml.YAMLError as e:
+        sys.exit(f"{config}: not valid YAML\n{e}")
+    except AuroraHomeError as e:      # R217: an environment mistake, not a bug
+        sys.exit(str(e))
     for warning in engine.extension_warnings:
         print(f"· {warning}")
     if resume_id:

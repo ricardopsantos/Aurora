@@ -11,3 +11,8 @@ build/
 sessions/
 .DS_Store
 config.yaml
+# private cross-session context tooling — excluded from the rsync
+# too (github-deploy.sh); listed here so a miss there cannot be
+# committed by accident. Renamed from .agentic_context/ in 5b260a2.
+.agentic_context/
+.context/

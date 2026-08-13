@@ -101,10 +101,56 @@ DANGEROUS_COMMANDS = frozenset({
     # fetch-to-shell — the classic `curl … | sh`, and a plain download that
     # overwrites a file is a write either way
     "curl", "wget",
+    # R190: plain writers/destroyers. The two-token rule stores the command
+    # plus its FIRST argument, which for all of these is the SOURCE — leaving
+    # the destination (the thing actually overwritten) free to vary:
+    #   "always allow" on `mv ./notes.md ./archive/`  stores `mv ./notes.md`
+    #       → thereafter auto-approves `mv ./notes.md ~/.bashrc`
+    # Same shape as the `rm -rf` / `dd if=…` cases R149 closed; these are the
+    # entries that list was missing rather than a new class of problem.
+    "mv", "cp", "ln", "install", "truncate", "tee",
+    # container runtimes: `docker run -v /:/mnt` is unrestricted host access,
+    # and `docker run <img>` two-token-stored leaves every flag free to vary
+    "docker", "podman",
+    # package managers execute arbitrary code from the fetched package
+    # (setup.py, npm install scripts, Makefiles), so the package NAME is the
+    # payload and must never be the free-to-vary half of a two-token rule
+    "pip", "pip3", "npm", "npx", "yarn", "pnpm", "gem", "cargo", "make",
+    "apt", "apt-get", "brew",
 })
 
 # families whose real binary name carries a suffix: mkfs.ext4, newfs_hfs
 _DANGEROUS_PREFIXES = ("mkfs.", "newfs_")
+
+# R190: a command that is read-only in its ordinary use but carries a
+# write/delete/exec primitive behind a FLAG. Membership in SAFE_COMMANDS is a
+# claim about the command NAME ("nothing here writes, deletes, or executes"),
+# and for `find` that claim is only true of how it is usually invoked — the
+# binary itself ships `-delete`, `-fprintf`, `-fls` and `-exec`.
+#
+# That matters because SAFE_COMMANDS generalizes in the widest possible way:
+# `_rule_for` stores the BARE name, and `_matches` lets a single-token rule
+# prefix-match any args. So one "always allow" on a routine `find . -name
+# '*.log'` stored the rule `find` — and from then on `find / -delete` was
+# auto-approved, unprompted, forever.
+#
+# This is R149's bug arriving through the opposite door. R149 stopped a
+# command KNOWN to be destructive from generalizing over its target; this
+# stops a command MIS-CLASSIFIED as safe from generalizing at all. The fix
+# keeps the useful behaviour (a plain `find` still generalizes across paths,
+# which is the whole point of the SAFE_COMMANDS list) and removes only the
+# invocations that can actually mutate something.
+#
+# `-exec`/`-execdir` are listed even though `_is_dangerous` already catches
+# `find . -exec rm {} +` via the `rm` token: it only catches it when the
+# EXECUTED program is itself a known-dangerous name, so `-exec truncate`,
+# `-exec tee` or `-exec ./script.sh` slipped through.
+_UNSAFE_FLAGS = {
+    "find": frozenset({
+        "-delete", "-exec", "-execdir", "-ok", "-okdir",
+        "-fprint", "-fprint0", "-fprintf", "-fls",
+    }),
+}
 
 # R141: shell syntax that turns one command string into several, or into a
 # write. Checked against the RAW command, never its tokens: `run_command`
@@ -137,9 +183,17 @@ def _is_dangerous(toks: tuple) -> bool:
     args change and nothing else, which is the right side to err on. Note it
     only fires on a token that IS the name: `git commit -m "remove dd stuff"`
     is a single token and does not match."""
+    names = set()
     for t in toks:
         base = os.path.basename(t)
         if base in DANGEROUS_COMMANDS or base.startswith(_DANGEROUS_PREFIXES):
+            return True
+        names.add(base)
+    # R190: an otherwise-safe command invoked with one of its own mutating
+    # flags (`find … -delete`). Both halves must be present, so a bare
+    # `-delete` token belonging to some other command doesn't trip this.
+    for cmd, flags in _UNSAFE_FLAGS.items():
+        if cmd in names and not flags.isdisjoint(toks):
             return True
     return False
 
@@ -189,7 +243,7 @@ def _load(path: Path, prepopulate: bool) -> dict:
     if not path.exists():
         return {k: [] for k in _TOOLS} if prepopulate else {}
     try:
-        data = yaml.safe_load(path.read_text()) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as e:
         raise ApproveLoadError(f"{path}: {e}") from e
     if not isinstance(data, dict):
@@ -224,8 +278,72 @@ def _norm_path(path: str) -> str:
     model passed, so `~/x.py` and `/home/me/x.py` were two different rules
     and "always allow" re-prompted on the other spelling. Expanded but NOT
     resolved — resolving would follow symlinks and collapse the `*` in a
-    glob rule, and a rule is allowed to be a glob."""
-    return os.path.expanduser(path) if path else path
+    glob rule, and a rule is allowed to be a glob.
+
+    R195: also `normpath`, which is what closes a real escape. `fnmatch`'s
+    `*` crosses `/` (it is not glob), so a stored rule of `~/project/*`
+    matched the signature `~/project/../../etc/passwd` — the traversal
+    segments were just more characters for `*` to swallow. A user who
+    approved "always allow writes under my project" was silently
+    auto-approving writes ANYWHERE on the filesystem, and `tools._resolve`
+    only expands `~`, so the write really did land outside. Verified
+    end-to-end before the fix: a rule for `/tmp/x/project/*` auto-approved
+    writing `/tmp/x/secret/keys.txt`.
+
+    `normpath` is purely LEXICAL — it collapses `..` without touching the
+    disk, so the "expanded but not resolved" property above is preserved and
+    a glob rule stays a glob. Applied to both sides (rule and signature),
+    since `_matches` runs every rule through here too.
+
+    R195 left a residual — a SYMLINK inside the approved directory pointing
+    outside it still matched — on the grounds that catching it needs a real
+    `resolve()` and a glob rule has no filesystem identity to resolve. R209
+    closes it; see `_resolved_rule`."""
+    return os.path.normpath(os.path.expanduser(path)) if path else path
+
+
+# R209: the characters that make a rule a GLOB rather than a literal path.
+_GLOB_CHARS = "*?["
+
+
+def _resolved_sig(path: str) -> str:
+    """The signature with symlinks followed. Non-strict, so a file that does
+    not exist yet — `write_file` creating one — still resolves through its
+    real parent instead of raising."""
+    try:
+        return str(Path(path).expanduser().resolve())
+    except OSError:
+        return _norm_path(path)
+
+
+def _resolved_rule(rule: str) -> str:
+    """R209: a rule with its LITERAL prefix resolved and its glob tail left
+    alone — `~/proj/*` becomes `/real/path/to/proj/*`.
+
+    This is what makes the symlink half checkable. R195 closed `..` purely
+    lexically and recorded the symlink case as open, because you cannot
+    `resolve()` a pattern. But you can resolve the part of it that is a real
+    path: split at the first glob character, back up to the last whole path
+    segment (so `/a/b*` resolves `/a`, never `/a/b`), resolve that, and
+    re-attach the rest verbatim.
+
+    Resolving BOTH sides is what keeps this from over-prompting. Matching a
+    resolved signature against an unresolved rule would break the ordinary
+    case on macOS, where `/tmp` is itself a symlink to `/private/tmp`: every
+    rule under it would stop matching and re-prompt forever."""
+    r = _norm_path(rule)
+    hits = [r.find(c) for c in _GLOB_CHARS if c in r]
+    if not hits:
+        head, tail = r, ""
+    else:
+        cut = r.rfind(os.sep, 0, min(hits))
+        if cut == -1:
+            return r                      # glob in the first segment
+        head, tail = r[:cut], r[cut:]
+    try:
+        return str(Path(head).resolve()) + tail
+    except OSError:
+        return r
 
 
 # R100: wait_until is a repeated shell command, same shape as run_command,
@@ -301,9 +419,23 @@ def _matches(tool: str, args: dict, data: dict, strict: bool = False) -> bool:
                 return True
         return False
     # rules are normalized on both sides, so a rule stored before R95g (raw
-    # `~/x.py`) still matches a normalized signature
+    # `~/x.py`) still matches a normalized signature.
+    #
+    # R209: the ALLOWlist additionally requires the RESOLVED pair to match,
+    # which is what closes R195's symlink residual — a link inside an approved
+    # directory pointing outside it satisfies the lexical test (the path really
+    # is under the rule) and fails the resolved one. The DENYlist keeps
+    # matching on either, because there "matches more" is the safe direction
+    # and R120's "deny always wins" must not be narrowed by a symlink either.
+    rules = [g for g in data.get(tool, []) if g]
+    if not strict:
+        return any(fnmatch.fnmatch(sig, _norm_path(g))
+                   or fnmatch.fnmatch(_resolved_sig(sig), _resolved_rule(g))
+                   for g in rules)
+    res_sig = _resolved_sig(sig)
     return any(fnmatch.fnmatch(sig, _norm_path(g))
-               for g in data.get(tool, []) if g)
+               and fnmatch.fnmatch(res_sig, _resolved_rule(g))
+               for g in rules)
 
 
 def is_allowed(tool: str, args: dict, data: dict | None = None) -> bool:

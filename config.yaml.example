@@ -62,6 +62,16 @@ runtime:
 # approval, no "trusted server" bypass. `env` maps a CHILD process env var
 # name to an AURORA keystore env var name (`aurora key set <name>`) — never
 # put a raw token here.
+#
+# `name` must be unique — it prefixes every tool as mcp_<name>_<tool>, so a
+# repeated name is refused (R187b).
+#
+# `timeout` (seconds, default 15) is the per-request ceiling. Raise it for a
+# server that shells out to real work: crossing it KILLS the child and there
+# is no reconnect, so that server is gone for the rest of the session. The
+# agentic-context example below sets 45 because its scripts allow themselves
+# 30s, and a client ceiling under the server's own would make a large
+# instance unusable rather than merely slow (R187c).
 # mcp_servers:
 #   - name: filesystem
 #     command: npx
@@ -70,6 +80,10 @@ runtime:
 #     command: npx
 #     args: ["-y", "@modelcontextprotocol/server-github"]
 #     env: {GITHUB_PERSONAL_ACCESS_TOKEN: GITHUB_TOKEN}
+#   - name: agentic-context
+#     command: /path/to/AgenticContext/mcp_server/.venv/bin/python
+#     args: ["-m", "agentic_context_mcp.server", "/path/to/.agentic_context"]
+#     timeout: 45
 
 # `aurora key set <VAR>` offers to run these (shown first, needs a "y") and
 # stores the printed value in the keystore. No secret lives in this file.

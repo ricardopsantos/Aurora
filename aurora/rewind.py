@@ -15,9 +15,12 @@ own failures (no git binary, unreadable tree, …) and returns None/[]/error
 text instead of raising.
 """
 
+import base64
 import hashlib
 import json
+import os
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -31,6 +34,14 @@ EXCLUDES = ["node_modules/", ".venv/", "venv/", "__pycache__/", ".build/",
             ".DS_Store"]
 
 MAX_LABEL = 72
+
+# R193: the per-file snapshot holds the target's WHOLE content in the marker
+# JSON, and `snapshot_before_write` sits directly on the approval path — so an
+# unbounded read here is a memory spike triggered by whatever file the model
+# decided to edit. Past this, no snapshot is taken (and any older one is
+# invalidated); `/undo` then falls back to the tree diff exactly as it already
+# does for a file outside the checkpointed tree.
+MAX_SNAPSHOT_BYTES = 20 * 1024 * 1024
 
 # R151: how many snapshots a project's shadow repo keeps. One commit per
 # APPROVED MUTATION, forever, was unbounded in two ways at once: the history
@@ -48,11 +59,36 @@ RETENTION = 200
 UNDO_TAG_RETENTION = 5
 
 # Pruning runs a `git gc`, so it must not happen on every approval. A
-# per-process counter fires it roughly once or twice a session, and always on
-# a background thread — `checkpoint()` sits directly on the approval path,
-# where R47's synchronous `git add -A` is already the acknowledged cost.
+# counter fires it roughly once or twice a session, and always on a background
+# thread — `checkpoint()` sits directly on the approval path, where R47's
+# synchronous `git add -A` is already the acknowledged cost.
 _PRUNE_EVERY = 50
-_since_prune = 0
+
+# R191: both of these are keyed PER SHADOW REPO, and both used to be a single
+# process-wide value.
+#
+# The counter being global meant the "every Nth checkpoint" cadence was shared
+# across every project Aurora had ever touched in one process: 49 checkpoints
+# in project A made project B's very first checkpoint trigger a gc of B.
+#
+# The lock is the load-bearing half. `prune()` runs `reflog expire` and
+# `gc --prune=now` on a DAEMON THREAD while `checkpoint()` may be running
+# `git add -A` + `git commit` on the same repo — and both swallow failures by
+# design ("a failed prune must leave checkpointing working"), so the collision
+# was silent. Measured: 1 in 6 runs of 30 back-to-back checkpoints lost one,
+# and one run left HEAD unreadable, reporting 0 commits. A lost checkpoint is
+# exactly the failure R47/R151 exist to prevent — the mutation is approved and
+# applied, but `/rewind` has nothing to restore.
+_locks_guard = threading.Lock()
+_repo_locks: dict[str, threading.Lock] = {}
+_since_prune: dict[str, int] = {}
+
+
+def _repo_lock(wt: Path) -> threading.Lock:
+    """The lock serialising checkpoint/prune for one shadow repo."""
+    key = str(_gitdir(wt))
+    with _locks_guard:
+        return _repo_locks.setdefault(key, threading.Lock())
 
 
 def _gitdir(cwd: Path) -> Path:
@@ -74,11 +110,57 @@ def _ensure(cwd: Path) -> None:
         gd.mkdir(parents=True, exist_ok=True)
         _git(cwd, "init", "--quiet")
         (gd / "info").mkdir(exist_ok=True)
-        (gd / "info" / "exclude").write_text("\n".join(EXCLUDES) + "\n")
+        (gd / "info" / "exclude").write_text("\n".join(EXCLUDES) + "\n",
+                                            encoding="utf-8")
 
 
 def _last_mutation_path(wt: Path) -> Path:
     return _gitdir(wt) / "last-mutation.json"
+
+
+def _atomic_write_bytes(target: Path, data: bytes) -> None:
+    """Write `data` to `target` without ever leaving it truncated.
+
+    R193: `Path.write_text` opens with "w" — it TRUNCATES first and encodes
+    after, so a failure part-way through destroys the original and leaves
+    nothing in its place. That was not theoretical: restoring a file with any
+    non-ASCII byte under `LANG=C` raised `UnicodeEncodeError` from inside the
+    write, `undo()` reported "undo failed", and the user's file was left
+    EMPTY — the one outcome an undo must never produce. Write a sibling temp
+    file and `os.replace` it in: the target is either the old content or the
+    new one, never a partial write."""
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent),
+                               prefix=f".{target.name}.", suffix=".aurora-tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        # `os.replace` takes the TEMP file's mode, and mkstemp creates 0600 —
+        # without this a restored file comes back private to the user and
+        # stripped of its executable bit.
+        try:
+            os.chmod(tmp, target.stat().st_mode & 0o7777)
+        except OSError:
+            pass   # target gone or unstatable — temp's own mode is the best left
+        os.replace(tmp, target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _snapshot_bytes(m: dict) -> bytes:
+    """The snapshotted content as the exact bytes to write back.
+
+    `content_b64` is the R193 format — byte-exact, so a file that is not
+    valid UTF-8 (a latin-1 source file, a binary asset) round-trips
+    unchanged. `content` is the legacy text field: markers written before
+    R193 are still sitting in users' checkpoint dirs, and they only ever hold
+    what a lossy `errors="replace"` decode produced, so re-encoding as UTF-8
+    is the closest recovery available — not byte-exact, but no worse than
+    what the old code would itself have written back."""
+    b64 = m.get("content_b64")
+    if b64 is not None:
+        return base64.b64decode(b64)
+    return (m.get("content") or "").encode("utf-8")
 
 
 def snapshot_before_write(path: str, cwd: str = ".") -> None:
@@ -97,17 +179,39 @@ def snapshot_before_write(path: str, cwd: str = ".") -> None:
 
     Never raises — same fail-open contract as the rest of this module; a
     failed snapshot just means `/undo` has nothing to offer for that call,
-    same as if this function didn't exist."""
+    same as if this function didn't exist.
+
+    R193: snapshots BYTES, not decoded text. The old `read_text(
+    errors="replace")` silently replaced every byte it couldn't decode with
+    U+FFFD, and `undo()` then wrote that back as the file's "original"
+    content — so undoing an edit to any file that wasn't valid UTF-8 (or,
+    under a non-UTF-8 locale, any file with non-ASCII at all) reported
+    success while corrupting it. Bytes have no encoding to get wrong."""
+    marker = None
     try:
         target = Path(path).expanduser().resolve()
         marker = _last_mutation_path(Path(cwd).resolve())
         marker.parent.mkdir(parents=True, exist_ok=True)
         existed = target.is_file()
-        content = target.read_text(errors="replace") if existed else None
-        marker.write_text(json.dumps({"path": str(target), "existed": existed,
-                                      "content": content, "at": time.time()}))
+        data = target.read_bytes() if existed else b""
+        if len(data) > MAX_SNAPSHOT_BYTES:
+            raise ValueError("file too large to snapshot")
+        marker.write_text(json.dumps(
+            {"path": str(target), "existed": existed,
+             "content_b64": base64.b64encode(data).decode("ascii") if existed
+                            else None,
+             "at": time.time()}), encoding="utf-8")
     except Exception:
-        pass
+        # R193: a stale marker from an EARLIER mutation must not survive a
+        # failed/skipped snapshot — `undo_preview` would report it as "the
+        # last mutation" and `/undo` would revert a different file than the
+        # one just written. Same invalidation `clear_last_mutation` performs
+        # for the tools that have no single target path.
+        if marker is not None:
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def clear_last_mutation(cwd: str = ".") -> None:
@@ -124,7 +228,7 @@ def clear_last_mutation(cwd: str = ".") -> None:
 
 def _read_last_mutation(wt: Path) -> dict | None:
     try:
-        return json.loads(_last_mutation_path(wt).read_text())
+        return json.loads(_last_mutation_path(wt).read_text(encoding="utf-8"))
     except Exception:
         return None
 
@@ -135,12 +239,17 @@ def checkpoint(label: str, cwd: str = ".") -> str | None:
     try:
         wt = Path(cwd).resolve()
         _ensure(wt)
-        _git(wt, "add", "-A")
-        msg = " ".join(label.split())[:MAX_LABEL] or "checkpoint"
-        r = _git(wt, "commit", "--quiet", "-m", msg, check=False)
-        if r.returncode:  # "nothing to commit" — tree unchanged
-            return None
-        short = _git(wt, "rev-parse", "--short", "HEAD").stdout.strip()
+        # R191: held across add/commit/rev-parse so a background prune's
+        # `gc --prune=now` cannot land in the middle of them.
+        with _repo_lock(wt):
+            _git(wt, "add", "-A")
+            msg = " ".join(label.split())[:MAX_LABEL] or "checkpoint"
+            r = _git(wt, "commit", "--quiet", "-m", msg, check=False)
+            if r.returncode:  # "nothing to commit" — tree unchanged
+                return None
+            short = _git(wt, "rev-parse", "--short", "HEAD").stdout.strip()
+        # Scheduled OUTSIDE the lock: the prune thread takes the same lock, so
+        # dispatching while still holding it would just make it wait on us.
         _prune_soon(str(wt))       # R151, background + rate-limited
         return short
     except Exception:
@@ -174,35 +283,45 @@ def prune(cwd: str = ".", keep: int = RETENTION) -> int:
         if not (gd / "HEAD").exists():
             return 0
 
-        tags = [t for t in _git(wt, "tag", "--list", "undo-*",
-                                "--sort=-creatordate",
-                                check=False).stdout.split() if t]
-        for stale in tags[UNDO_TAG_RETENTION:]:
-            _git(wt, "tag", "-d", stale, check=False)
+        # R191: the whole body runs under the repo lock. A concurrent
+        # checkpoint would otherwise be committing into the repo this is
+        # gc-ing, and both sides swallow their errors, so the loss was silent.
+        with _repo_lock(wt):
+            tags = [t for t in _git(wt, "tag", "--list", "undo-*",
+                                    "--sort=-creatordate",
+                                    check=False).stdout.split() if t]
+            for stale in tags[UNDO_TAG_RETENTION:]:
+                _git(wt, "tag", "-d", stale, check=False)
 
-        revs = _git(wt, "rev-list", "HEAD", check=False).stdout.split()
-        cut = 0
-        if len(revs) > keep:
-            # revs[keep - 1] keeps exactly `keep` commits reachable; marking it
-            # shallow makes git treat it as a root and stop walking past it
-            (gd / "shallow").write_text(revs[keep - 1] + "\n")
-            cut = len(revs) - keep
+            revs = _git(wt, "rev-list", "HEAD", check=False).stdout.split()
+            cut = 0
+            if len(revs) > keep:
+                # revs[keep - 1] keeps exactly `keep` commits reachable; marking
+                # it shallow makes git treat it as a root and stop walking past it
+                (gd / "shallow").write_text(revs[keep - 1] + "\n",
+                                            encoding="utf-8")
+                cut = len(revs) - keep
 
-        _git(wt, "reflog", "expire", "--expire=now", "--all", check=False)
-        _git(wt, "gc", "--prune=now", "--quiet", check=False)
+            _git(wt, "reflog", "expire", "--expire=now", "--all", check=False)
+            _git(wt, "gc", "--prune=now", "--quiet", check=False)
         return cut
     except Exception:
         return 0
 
 
 def _prune_soon(cwd: str) -> None:
-    """Fire `prune` on a daemon thread if enough checkpoints have accumulated.
-    Off the approval path deliberately — see `_PRUNE_EVERY`."""
-    global _since_prune
-    _since_prune += 1
-    if _since_prune < _PRUNE_EVERY:
+    """Fire `prune` on a daemon thread if enough checkpoints have accumulated
+    FOR THIS REPO. Off the approval path deliberately — see `_PRUNE_EVERY`."""
+    try:
+        key = str(_gitdir(Path(cwd).resolve()))
+    except Exception:
         return
-    _since_prune = 0
+    with _locks_guard:
+        n = _since_prune.get(key, 0) + 1
+        if n < _PRUNE_EVERY:
+            _since_prune[key] = n
+            return
+        _since_prune[key] = 0
     try:
         threading.Thread(target=prune, args=(cwd,), daemon=True).start()
     except Exception:
@@ -442,7 +561,11 @@ def undo_diff(cwd: str = ".") -> str:
                 current = target.read_text(errors="replace") if target.is_file() else ""
             except Exception:
                 current = ""
-            old = (m.get("content") or "") if m.get("existed") else ""
+            # R193: decode for DISPLAY only — lossily on purpose. The stored
+            # bytes are authoritative for the restore; this side just has to
+            # render something a human can read in the confirm prompt.
+            old = (_snapshot_bytes(m).decode("utf-8", errors="replace")
+                   if m.get("existed") else "")
             return "".join(difflib.unified_diff(
                 old.splitlines(keepends=True), current.splitlines(keepends=True),
                 fromfile=f"{m['path']} (before)", tofile=f"{m['path']} (now)"))
@@ -490,7 +613,8 @@ def undo(cwd: str = ".") -> str:
             target = Path(m["path"])
             try:
                 if m["existed"]:
-                    target.write_text(m["content"])
+                    # R193: byte-exact and atomic — see `_atomic_write_bytes`.
+                    _atomic_write_bytes(target, _snapshot_bytes(m))
                 else:
                     target.unlink(missing_ok=True)
             except Exception as e:

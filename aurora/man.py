@@ -17,8 +17,8 @@ COMMAND_ORDER = [
     "redact", "status", "cost", "context", "cache", "autocompact",
     "fallback", "thinking", "markdown", "multiline", "allowlist",
     "denylist", "rewind", "undo", "diff", "commit", "resume", "search",
-    "export", "skills", "extensions", "bootstrap", "remember",
-    "agentic_report", "nano", "help", "quit", "exit",
+    "export", "skills", "extensions", "bootstrap",
+    "nano", "help", "quit", "exit",
 ]
 
 
@@ -288,24 +288,6 @@ def _entries(B, C, D, G, Y, R):
     When a bootstrap prompt exists, Aurora offers to run it at startup —
     a plain yes/no for a local file or pasted prompt, or a choice of
     run-cached / re-download / skip for a URL-sourced one.""",
-
-"remember": f"""{C}/remember{R} [{G}all{R}{Y}|{R}{G}last{R} [{G}k{R}]]  Save
-    what's worth keeping from this session into MEMORY (a
-    {D}.agentic_context{R} project's own memory store, or
-    {G}~/AURORA_PFCS/MEMORY/{R} — machine-wide, not project-specific — when
-    no such folder is detected). The model drafts candidate findings from
-    the transcript; each one gets its own approval challenge before being
-    written, same gate as a file write. With no argument (or {C}last{R}),
-    covers just the last question/answer pair; {C}last{R} {G}k{R} covers
-    the last {G}k{R} pairs; {C}all{R} covers the whole session.""",
-
-"agentic_report": f"""Only shown/available once a context-protocol folder
-    (a {D}KNOWLEDGE/SKILL.md{R} + {D}MEMORY/SKILL.md{R} pair) is detected in
-    the project. Choose {C}Stats{R} (runs the folder's own
-    {G}scripts/stats.sh{R}) or {C}Index{R} (pretty-prints
-    {D}KNOWLEDGE/INDEX.md{R} and {D}MEMORY/INDEX.md{R}). Also reachable via
-    the TUI status bar's "agentic report" link, shown under the same
-    condition.""",
 
 "nano": f"""{C}/nano{R} {G}file{R}  Open a text file
     ({G}.txt .md .json .yml .yaml .xml .sh{R}, up to 1MB) in Aurora's own

@@ -2,7 +2,7 @@
 
 Reference doc for how the pieces fit together. `CHANGELOG_TECHNICAL.md`
 (formerly `AURORA.md`) is the numbered requirements/spec (the *what* and
-*why*, R1–R186+); this is the *how* — module
+*why*, R1–R217+); this is the *how* — module
 map, data flow, boundaries, and the mechanisms worth understanding before
 touching them. Update this file whenever a change alters one of these shapes,
 not just when adding a requirement.
@@ -565,7 +565,7 @@ not Esc) and a stale arm must never silently fire on an unrelated later Esc.
 
 ## Where to look next
 
-- **Requirements** (R1–R186+, the numbered spec with dates and rationale):
+- **Requirements** (R1–R217+, the numbered spec with dates and rationale):
   `CHANGELOG_TECHNICAL.md`.
 - **User-facing feature list**: `README.md` → "Daily use" and "Esc, the
   double-tap control key".

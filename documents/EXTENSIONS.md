@@ -158,6 +158,11 @@ model is skipped (no OpenRouter listing, no price); a configured model no
 longer on OpenRouter's catalog is reported as skipped, not an error. Model-
 callable, not automatic — same posture as `lint_check` below.
 
+Opening `/model` now does the same refresh on its own, in the background and
+at most once a day per model, so this tool is the way to force one *now* —
+past the daily TTL, or when you want the result reported in the chat rather
+than just reflected in the picker's rows.
+
 ### Lint checker
 
 `lint_check(path)` — `aurora/extensions_bundled/lint_extension.py`. A tool
