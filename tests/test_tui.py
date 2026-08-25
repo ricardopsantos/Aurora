@@ -1334,6 +1334,61 @@ def test_select_menu_roundtrip_returns_chosen_key(t):
     assert got["key"] == "n"
     assert t._menu_options is None      # torn down after the answer
 
+
+# ── R218: select_menu must accept everything ui.select accepts ─────────────
+def test_select_menu_accepts_the_eof_key_ui_select_takes(t):
+    """`run()` swaps `ui.select` for `select_menu`, so a parameter added to
+    one and not the other is a TypeError at the approval gate — which is what
+    R214's `eof_key` was until R218. Fails with `TypeError: select_menu() got
+    an unexpected keyword argument 'eof_key'` without the fix."""
+    got = {}
+
+    def worker():
+        got["key"] = t.select_menu("Approve?", _OPTS, eof_key="n")
+
+    th = threading.Thread(target=worker)
+    th.start()
+    while t._menu_options is None:
+        pass
+    t._resolve_menu(0)
+    th.join(timeout=2)
+    assert got["key"] == "y"       # a real pick still wins over eof_key
+
+
+def test_a_dismissed_menu_answers_eof_key_when_one_was_named(t):
+    """Dismissal is the TUI's "the answer never came", so an approval that
+    named a safe answer gets it instead of None — a None would fall through
+    the gate's key comparisons as neither approve nor deny."""
+    got = {}
+
+    def worker():
+        got["key"] = t.select_menu("Approve?", _OPTS, eof_key="n")
+
+    th = threading.Thread(target=worker)
+    th.start()
+    while t._menu_options is None:
+        pass
+    t._answers.put(None)           # as the dismiss-click path does
+    th.join(timeout=2)
+    assert got["key"] == "n"
+
+
+def test_a_dismissed_menu_without_an_eof_key_still_returns_none(t):
+    """`/model` and the other pickers rely on None meaning "no change"."""
+    got = {}
+
+    def worker():
+        got["key"] = t.select_menu("Select model", _OPTS)
+
+    th = threading.Thread(target=worker)
+    th.start()
+    while t._menu_options is None:
+        pass
+    t._answers.put(None)
+    th.join(timeout=2)
+    assert got["key"] is None
+
+
 # ── R188: menu rows are clickable, like the status bar's buttons ───────────
 def test_menu_rows_carry_a_mouse_handler(t):
     t._menu_prompt, t._menu_options = "Approve?", _OPTS

@@ -8047,3 +8047,30 @@ returns them), and `test_startup_with_an_unusable_home_exits_cleanly`
 Cross-references bumped in this commit (per `ChangeWorkflow.md`):
 `README.md`'s "currently through R__" line, R216 → R217, and
 `documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R218. `select_menu()` didn't accept `eof_key`, crashing any approval gate run under the TUI — `tui.py` (2026-08-25)
+
+`run()` aliases `ui.select` to `Tui.select_menu` (`ui.select = self.select_menu`,
+`tui.py:2956`), so the two must accept the same keywords — but R214 added
+`eof_key` only to `ui.select`'s call sites in `ui.py` (the classic REPL's
+approval gates: `git`/`shell`/`secret-write` confirmations), and `select_menu`
+was never updated to match. Any approval prompt reached in TUI mode hit
+`TypeError: select_menu() got an unexpected keyword argument 'eof_key'`
+instead of showing the menu at all.
+
+`select_menu` now takes `eof_key: str | None = None` and, when the menu
+resolves to `None` (dismissed rather than picked — e.g. a second click on the
+status bar's model name), returns `eof_key` if one was named, else `None` as
+before. A real pick from the menu still wins over `eof_key` regardless —
+`eof_key` only stands in for a dismissal, the same contract `ui.select`
+already had.
+
+Tests: `test_select_menu_accepts_the_eof_key_ui_select_takes` (the crash
+reproduction), `test_a_dismissed_menu_answers_eof_key_when_one_was_named`,
+`test_a_dismissed_menu_without_an_eof_key_still_returns_none` (unnamed
+`eof_key` must not change `/model`'s existing None-means-no-change contract).
+All three fail without the fix.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R217 → R218, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.

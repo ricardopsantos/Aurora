@@ -1221,7 +1221,8 @@ class Tui:
             self.app.invalidate()
 
     def select_menu(self, prompt: str, options: list[tuple[str, str]],
-                    default_index: int | None = None) -> str | None:
+                    default_index: int | None = None,
+                    eof_key: str | None = None) -> str | None:
         """Arrow-key menu, rendered in place of the input prompt (see `ask`
         for the same blocking-from-worker-thread contract). `default_index`
         only sets which row starts highlighted (e.g. the current model in
@@ -1231,7 +1232,12 @@ class Tui:
         explicitly dismissed instead of picked (e.g. a second click on the
         status bar's model name while the `/model` menu is open) — callers
         that care must treat `None` as "no change", same spirit as the
-        classic REPL's blank-Enter-keeps-current behavior."""
+        classic REPL's blank-Enter-keeps-current behavior. R218: `run()`
+        aliases `ui.select` to this method, so any keyword `ui.select`
+        accepts must be accepted here too — `eof_key` (R214) is what a
+        dismissal answers instead of `None` when the caller named a safe
+        default (an approval gate that can't tell None from deny/approve);
+        omit it and dismissal still returns `None`, unchanged."""
         if (self._ui_thread is not None
                 and threading.current_thread() is self._ui_thread):
             raise RuntimeError(
@@ -1255,7 +1261,8 @@ class Tui:
             self.input.buffer.reset()
         self.app.invalidate()
         try:
-            return self._answers.get()
+            answer = self._answers.get()
+            return eof_key if answer is None and eof_key is not None else answer
         finally:
             self._menu_prompt = self._menu_options = None
             if hasattr(self, "input"):    # restore the draft the user was typing

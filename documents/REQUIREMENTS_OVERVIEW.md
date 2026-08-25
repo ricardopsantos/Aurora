@@ -3,7 +3,7 @@
 Aurora is a micro terminal coding agent (macOS + Linux, synced via git).
 
 > **Canonical spec is [`CHANGELOG_TECHNICAL.md`](CHANGELOG_TECHNICAL.md)**
-> (formerly `AURORA.md`). It holds the full numbered requirements (R1–R217+),
+> (formerly `AURORA.md`). It holds the full numbered requirements (R1–R218+),
 > build plan, and test plan, written before the code and kept in sync with
 > behaviour. This file is a stable high-level index; when the two disagree,
 > `CHANGELOG_TECHNICAL.md` wins. Any behaviour change updates

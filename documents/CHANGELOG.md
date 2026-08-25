@@ -6,6 +6,14 @@ was published — check `aurora --man` or `python3 -c "import aurora;
 print(aurora.__version__)"` for what you're actually running. For the full
 numbered requirements record, see `CHANGELOG_TECHNICAL.md` (formerly
 `AURORA.md`).
+## 1.1.350 (2026-08-25)
+
+### Fixed
+- **The TUI's approval prompts (`git`/`shell`/secret-write confirmations)
+  could crash instead of showing up.** Dismissing one of these menus a
+  certain way threw an error rather than answering safely, which meant an
+  approval gate could stop responding right when it mattered.
+
 ## 1.1.348 (2026-08-13)
 
 Mostly a hardening release. A long review pass went through every module
