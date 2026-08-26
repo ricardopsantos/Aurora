@@ -32,7 +32,7 @@ import importlib.util
 import re
 from pathlib import Path
 
-from .paths import aurora_home
+from .paths import aurora_home, write_text_atomic
 
 _BUNDLED_DIR = Path(__file__).parent / "extensions_bundled"
 
@@ -81,8 +81,13 @@ def scaffold(name: str) -> Path:
     # the user's raw text, so `/extensions new café` hit the locale encoding —
     # and write_text truncates first, leaving a 0-byte .py that the next
     # startup then tries to load as an extension.
-    path.write_text(_TEMPLATE.format(name=name.strip(), tool_name=slug),
-                    encoding="utf-8")
+    #
+    # R238: that comment named the truncation but R207 only fixed the
+    # encoding half. `write_text_atomic` (UTF-8 by construction) closes the
+    # other half: an interrupted scaffold leaves NO file rather than a
+    # half-written .py that the next startup imports and warns about.
+    write_text_atomic(path, _TEMPLATE.format(name=name.strip(),
+                                             tool_name=slug))
     return path
 
 
@@ -126,12 +131,26 @@ def discover(engine=None) -> tuple[list[dict], dict, list[str]]:
                 continue
             try:
                 specs.extend(getattr(module, "SPEC", None) or [])
-                runners.update(getattr(module, "RUNNERS", None) or {})
+                # R227: `.update()` here let the LAST-loaded extension's
+                # runner win a name collision, while tools.set_extensions()
+                # (which dedupes `specs`) keeps the FIRST spec for that same
+                # name — so a colliding name silently paired the first
+                # extension's advertised description/parameters with the
+                # SECOND extension's actual code. The approval gate and the
+                # model's own tool-call decision are both based on the spec
+                # a name is shown with; running different code under that
+                # name breaks that invariant with no visible sign beyond
+                # set_extensions()'s generic "duplicate skipped" warning.
+                # `setdefault` makes this first-wins too, matching specs'
+                # append order and set_extensions()'s own dedup direction.
+                for rname, rfn in (getattr(module, "RUNNERS", None) or {}).items():
+                    runners.setdefault(rname, rfn)
                 register = getattr(module, "register", None)
                 if register is not None and engine is not None:
                     extra_specs, extra_runners = register(engine)
                     specs.extend(extra_specs or [])
-                    runners.update(extra_runners or {})
+                    for rname, rfn in (extra_runners or {}).items():
+                        runners.setdefault(rname, rfn)
             except Exception as e:
                 warnings.append(f"extension {path.name} failed to register: "
                                f"{e.__class__.__name__}: {e}")

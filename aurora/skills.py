@@ -64,7 +64,18 @@ def discover(config_base: str | None = None) -> dict[str, Path]:
     """name -> path; earlier dirs shadow later ones."""
     found: dict[str, Path] = {}
     for d in _dirs(config_base):
-        for p in sorted(d.iterdir()):
+        # a dir that passed `_dirs()`'s `is_dir()` check can still fail to
+        # list (permission changed, removed) by the time we get here — the
+        # same TOCTOU race `dir_stamp()` above already guards against.
+        # This runs behind the `/command` completer, once per keystroke
+        # (R96a) — an unguarded OSError here didn't just skip one skill, it
+        # crashed the whole listing on every keystroke until the directory
+        # was fixed.
+        try:
+            entries = sorted(d.iterdir())
+        except OSError:
+            continue
+        for p in entries:
             if p.is_file() and (os.access(p, os.X_OK) or p.suffix == ".py"):
                 found.setdefault(p.stem, p)
     return found

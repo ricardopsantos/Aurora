@@ -18,10 +18,19 @@ a local llama.cpp server.
   streams it live/expanded as it's generated; `/copy-last` includes it.
   Reasoning never enters the history, `/copy`, or exports.
 - Not sure the server is up? `/status` asks llama-server directly and shows
-  the actually-loaded gguf + its real context size.
-- This repo's committed `config.yaml` points its `openrouter:` provider at a
-  gateway (not `https://openrouter.ai/api/v1` directly) that fronts both the
-  local server and real OpenRouter, routing per-request on the `model`
-  field — one `base_url` list, one key (`LLAMA_API_KEY`). If your local
-  server has no such gateway, split it back into two provider entries and
-  set `OPENROUTER_API_KEY` too.
+  the actually-loaded gguf + its real context size. For an Ollama provider
+  (`type: ollama`) it reports reachability and the configured model's context
+  window from `/api/show`, but not a "currently resident model" — Ollama can
+  hold several at once, so there is no single answer to report (R223).
+- This repo's committed `config.yaml` keeps **two separate providers**:
+  `openrouter:` pointing straight at `https://openrouter.ai/api/v1` with
+  `OPENROUTER_API_KEY`, and `local:` with `LLAMA_API_KEY`. So both keys are
+  in play — see [KEYS.md](KEYS.md). `local:`'s `base_url` is a **list**
+  (Tailscale name first, LAN IP second); Aurora tries each in order and uses
+  the first that answers, which is what makes the same config work on and
+  off the home network.
+- A single gateway fronting both the local server and OpenRouter — one
+  `base_url`, one key, routed per-request on the `model` field — also works,
+  and Aurora needs no change for it: point `openrouter:`'s `base_url` at the
+  gateway and drop the second key. Just don't assume the committed config is
+  already set up that way.

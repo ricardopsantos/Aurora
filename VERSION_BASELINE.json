@@ -1,0 +1,5 @@
+{
+  "major_minor": "1.2",
+  "baseline_commit_count": 393,
+  "note": "baseline_commit_count is GitTea's `git rev-list --count HEAD` at the LAST PUBLISHED release (the count actually pushed to GitHub, not just synced locally). Live version = major_minor.(current_count - baseline_commit_count). scripts/github-deploy.sh only bumps baseline_commit_count when run with --publish, never on a plain sync or --dry-run, so repeated local previews before an actual push don't desync it. Bump major_minor by hand for a deliberate scheme/major bump; reset baseline_commit_count to the published commit count when you do. Corrected 2026-08-26: an earlier version of this file was bumped by plain (non-publish) local runs that were never actually pushed to GitHub, drifting it from 351 to 390 with nothing published in between; reset to 351, the true last-published (1.1.351) commit count."
+}

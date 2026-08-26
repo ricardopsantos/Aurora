@@ -163,10 +163,22 @@ def key_status(env_var: str) -> str:
             try:
                 if env_var in _encfile_load(pw.decode()):
                     return "set (encrypted file)"
+                # decrypted fine, key just isn't in there — a real "not
+                # set" answer, distinct from the exception case below
+                return "not set"
             except Exception:
-                pass
-        else:
-            return "possibly set (encrypted file — enter passphrase to confirm)"
+                # R228: a cached passphrase that fails to decrypt the
+                # CURRENT store (stale from an external re-encryption, a
+                # different session sharing AURORA_HOME) used to fall
+                # through silently to a flat "not set" — indistinguishable
+                # from "no key store exists at all" and confidently wrong:
+                # the store is right there, it just couldn't be checked
+                # with this passphrase. Report the same "can't confirm"
+                # answer as the no-cached-passphrase case, not a false
+                # negative.
+                return ("possibly set (encrypted file — enter passphrase "
+                       "to confirm)")
+        return "possibly set (encrypted file — enter passphrase to confirm)"
     return "not set"
 
 

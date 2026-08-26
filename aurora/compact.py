@@ -8,6 +8,15 @@ from . import tokens
 
 
 def _stringify(content) -> str:
+    """R222: `content` is None for a tool-calls-only assistant message (the
+    ordinary OpenAI-format shape — text and tool_calls are independent
+    fields, and a pure tool call carries no text). `str(None)` used to turn
+    that into the literal 4 characters "None" — `flatten_history` then
+    printed a visible "Assistant: None" line for a turn where the assistant
+    said nothing at all, and `_msg_tokens` overcounted every such message by
+    a few tokens it never actually spent."""
+    if content is None:
+        return ""
     return content if isinstance(content, str) else str(content)
 
 
@@ -87,7 +96,10 @@ def flatten_history(messages: list[dict]) -> str:
     for m in messages:
         role = m.get("role", "?")
         if role == "tool":  # openai tool result
-            lines.append(f"[tool result: {m.get('content', '')}]")
+            # R222 applies here too: a null `content` must render as empty,
+            # not as the literal "None". This branch kept using the raw
+            # `.get` when the rest of the function moved to `_stringify`.
+            lines.append(f"[tool result: {_stringify(m.get('content'))}]")
             continue
         text = _stringify(m.get("content"))
         if role == "assistant" and m.get("tool_calls"):
@@ -98,6 +110,13 @@ def flatten_history(messages: list[dict]) -> str:
         if text.strip():
             lines.append(f"{prefix}: {text}")
     return "\n\n".join(lines)
+
+
+def _clip_marker(dropped: int) -> str:
+    """The elision notice `clip_transcript` splices between head and tail.
+    Named so its LENGTH can be reserved out of the budget (R229)."""
+    return (f"\n\n[... {dropped} characters dropped to fit the context "
+            "window — middle of the folded region ...]\n\n")
 
 
 def clip_transcript(text: str, max_tokens: int) -> str:
@@ -121,13 +140,28 @@ def clip_transcript(text: str, max_tokens: int) -> str:
     limit = max_tokens * tokens.CHARS_PER_TOKEN
     if len(text) <= limit:
         return text
-    head = int(limit * 0.6)
-    tail = limit - head
+    # R229: the marker counts against the budget. It used to be added ON TOP
+    # of `limit`, so the result overran the bound this function exists to
+    # enforce — by ~90 characters always, which at a small remaining budget
+    # is most of it (max_tokens=10 returned ~32 tokens' worth). Both callers
+    # pass a budget computed from what is left of the context window, so an
+    # overrun here is the very rejection being avoided.
+    #
+    # Sizing the reservation off `len(text)` (an upper bound on `dropped`,
+    # hence on the marker's digit count) keeps this a single pass: the real
+    # marker can only be shorter, never longer, so the total stays inside
+    # `limit`.
+    reserve = len(_clip_marker(len(text)))
+    budget = limit - reserve
+    if budget < 2:
+        # The budget cannot hold head, tail and an explanation. Honour the
+        # bound rather than the shape — a caller this starved needs the
+        # request to fit far more than it needs the marker.
+        return text[:limit]
+    head = int(budget * 0.6)
+    tail = budget - head
     dropped = len(text) - head - tail
-    return (text[:head]
-            + f"\n\n[... {dropped} characters dropped to fit the context "
-              "window — middle of the folded region ...]\n\n"
-            + text[-tail:])
+    return text[:head] + _clip_marker(dropped) + text[-tail:]
 
 
 def flattened_as_user_message(messages: list[dict]) -> dict:

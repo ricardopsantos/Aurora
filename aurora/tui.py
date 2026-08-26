@@ -1551,6 +1551,7 @@ class Tui:
         def handler(mouse_event):
             if mouse_event.event_type == MouseEventType.MOUSE_UP and self._click_guard():
                 self.append(f"\n{CYAN}{BOLD}> {RESET}/undo\n")
+                self._note_if_busy()
                 self.scroll_end()
                 self._inbox.put("/undo")
         return handler
@@ -1565,6 +1566,7 @@ class Tui:
         def handler(mouse_event):
             if mouse_event.event_type == MouseEventType.MOUSE_UP and self._click_guard():
                 self.append(f"\n{CYAN}{BOLD}> {RESET}/context\n")
+                self._note_if_busy()
                 self.scroll_end()
                 self._inbox.put("/context")
         return handler
@@ -1578,9 +1580,20 @@ class Tui:
         def handler(mouse_event):
             if mouse_event.event_type == MouseEventType.MOUSE_UP and self._click_guard():
                 self.append(f"\n{CYAN}{BOLD}> {RESET}/cost\n")
+                self._note_if_busy()
                 self.scroll_end()
                 self._inbox.put("/cost")
         return handler
+
+    def _note_if_busy(self) -> None:
+        """A line just got echoed and pushed onto `self._inbox` — if the
+        worker is still busy on a prior turn (a `wait_until` poll, a slow
+        tool call), that echo is misleading on its own: it looks submitted
+        and answered, but `_worker()` (the sole inbox consumer) won't even
+        look at it until the current turn finishes. Surfaces the wait so a
+        queued `/context` etc. doesn't read as "silently did nothing"."""
+        if self._busy:
+            self.append(dim("  (queued — still running previous command)\n"))
 
     def _click_guard(self) -> bool:
         """Shared eligibility check for the line-2 hint buttons (/ commands,
@@ -2384,12 +2397,14 @@ class Tui:
             if self._bash_mode:                   # run locally, stay in bash mode
                 if line.strip():
                     self.append(f"\n{GREEN}{BOLD}$ {RESET}{line}\n")
+                    self._note_if_busy()
                     self.scroll_end()
                     self._inbox.put("!" + line)   # worker's `!` path runs bash
                 return
             if not line.strip():
                 return
             self.append(f"\n{CYAN}{BOLD}> {RESET}{line}\n")
+            self._note_if_busy()
             self.scroll_end()
             self._inbox.put(line)
 

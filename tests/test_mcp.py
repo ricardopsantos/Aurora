@@ -1036,3 +1036,45 @@ def test_extensions_new_command_requires_a_name(tmp_path, monkeypatch, capsys):
         if e._mcp_manager:
             e._mcp_manager.close_all()
         tools.set_extensions([], {})
+
+
+# ── R239: interpreter code-injection vars must all be stripped ───────────
+
+@pytest.mark.parametrize("var", [
+    "PYTHONPATH", "PYTHONHOME", "PYTHONEXECUTABLE",
+    "PERL5LIB", "PERL5OPT", "PERLLIB", "RUBYOPT", "RUBYLIB",
+    "CLASSPATH", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+    "NODE_OPTIONS", "LD_PRELOAD", "GCONV_PATH",
+])
+def test_child_env_strips_every_interpreter_injection_var(var):
+    """R239: the original list covered Perl's PATH var and Ruby's OPTION
+    var but only one of each pair per language, and for Python listed only
+    PYTHONSTARTUP — which is read in INTERACTIVE mode only, so it does
+    nothing to a spawned server. PYTHONPATH, the one that does, was absent,
+    and a stdio MCP server is very often a Python process."""
+    assert var not in mcp._child_env({var: "/tmp/attacker"})
+
+
+def test_pythonpath_injection_would_execute_code_in_a_python_child(tmp_path):
+    """Shows what the gap was worth: a module dropped on PYTHONPATH shadows
+    a stdlib import and runs before the server's own first line."""
+    import subprocess
+    (tmp_path / "json.py").write_text(
+        "import sys; print('INJECTED', file=sys.stderr)\n")
+
+    hostile = {"PYTHONPATH": str(tmp_path)}
+    # unfiltered: the injection lands
+    raw = {**mcp._child_env(None), **hostile}
+    r = subprocess.run([sys.executable, "-c", "import json"],
+                       env=raw, capture_output=True, text=True)
+    assert "INJECTED" in r.stderr
+
+    # through _child_env: stripped, so the real json module is imported
+    r2 = subprocess.run([sys.executable, "-c", "import json"],
+                        env=mcp._child_env(hostile), capture_output=True,
+                        text=True)
+    assert "INJECTED" not in r2.stderr
+
+
+def test_child_env_still_passes_an_ordinary_configured_var():
+    assert mcp._child_env({"GITHUB_TOKEN": "abc"})["GITHUB_TOKEN"] == "abc"

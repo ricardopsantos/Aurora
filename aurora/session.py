@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 try:
-    import fcntl   # POSIX only — R170f, see log()'s docstring
+    import fcntl  # POSIX only — R170f, see log()'s docstring
 except ImportError:
     fcntl = None
 
@@ -130,18 +130,29 @@ class Session:
         # silently skipped) only if someone edits both sides inconsistently,
         # not from a stdlib default drifting out from under an unstated
         # assumption.
+        # R232: `f.write()` fills Python's buffer; the actual write() syscall
+        # happens at flush. Unlocking before flushing therefore released the
+        # lock with the record still in userspace, and R170f's serialization
+        # covered nothing that touched the file. For a record larger than the
+        # 8KB buffer — a tool result, i.e. most of a session's bytes — the
+        # writer flushes full chunks under the lock and leaves the REMAINDER
+        # to flush after it, so a second process resumed onto the same id
+        # could take the lock and append between our chunks: a physically
+        # interleaved, unparseable line, the exact corruption R170f exists to
+        # prevent. The flush must be inside the locked region.
+        line = json.dumps(rec, ensure_ascii=False,
+                          separators=(", ", ": ")) + "\n"
         target = self._write_target()
         with open(target, "a", encoding="utf-8") as f:
             if fcntl is not None:
                 fcntl.flock(f, fcntl.LOCK_EX)
                 try:
-                    f.write(json.dumps(rec, ensure_ascii=False,
-                                       separators=(", ", ": ")) + "\n")
+                    f.write(line)
+                    f.flush()
                 finally:
                     fcntl.flock(f, fcntl.LOCK_UN)
             else:
-                f.write(json.dumps(rec, ensure_ascii=False,
-                                   separators=(", ", ": ")) + "\n")
+                f.write(line)
 
     def iter_records(self, events: "set[str] | None" = None):
         """Stream the log line by line, across every rotated PART in order —

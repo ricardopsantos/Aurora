@@ -30,6 +30,13 @@ class Hunk:
     old: str      # context + removed lines, joined — the anchor to find
     new: str      # context + added lines, joined — what replaces it
     header: str   # the raw "@@ ... @@" line, for error messages only
+    # R220: whether old_lines != new_lines at parse time — NOT the same as
+    # `old == new` (the joined strings). A removal-only hunk consisting of a
+    # single blank line has old_lines=[""] (len 1) and new_lines=[] (len 0):
+    # different lists, but "\n".join(...) collapses BOTH to "" and the joined
+    # strings collide. apply() used to skip on that string equality and
+    # silently no-op the deletion of an isolated blank line.
+    changed: bool = True
 
 
 class PatchError(Exception):
@@ -37,6 +44,35 @@ class PatchError(Exception):
 
 
 _HUNK_HEADER = re.compile(r"^@@ .* @@")
+
+
+def _is_file_header(lines: list[str], i: int) -> bool:
+    """R236: does `lines[i]` begin a new FILE section, ending the hunk body?
+
+    This used to be `lines[i].startswith(("---", "+++"))`, which cannot tell
+    a file header from ordinary hunk CONTENT: removing a line whose text is
+    `---` (a markdown horizontal rule, a YAML front-matter delimiter — both
+    everywhere, this repo's own documents included) renders as `----`, and
+    `"----".startswith("---")` is True. The hunk body was then cut off at
+    that line and the REST of the hunk silently discarded, so the patch
+    applied partially while reporting success — the exact opposite of the
+    all-or-nothing contract this module exists to provide. Same trap for a
+    removed `--`, and for an added `++` (`+++`).
+
+    A real header is a PAIR: `--- <path>` immediately followed by
+    `+++ <path>` (both `git diff` and `diff -u` emit them that way, marker
+    then a space). Requiring the successor line makes a content collision
+    take a removed `-- ...` line followed by an added `++ ...` line, which a
+    diff cannot produce in that order within one hunk. `diff --git` /
+    `diff -u` section lines are recognised directly."""
+    line = lines[i]
+    if line.startswith("diff "):
+        return True
+    if line.startswith("--- "):
+        return i + 1 < len(lines) and lines[i + 1].startswith("+++ ")
+    if line.startswith("+++ "):
+        return i > 0 and lines[i - 1].startswith("--- ")
+    return False
 
 
 def parse(diff_text: str) -> list[Hunk]:
@@ -58,7 +94,7 @@ def parse(diff_text: str) -> list[Hunk]:
         old_lines: list[str] = []
         new_lines: list[str] = []
         while i < len(lines) and not _HUNK_HEADER.match(lines[i]) \
-                and not lines[i].startswith(("---", "+++")):
+                and not _is_file_header(lines, i):
             raw = lines[i]
             if raw.startswith("\\"):        # "\ No newline at end of file"
                 i += 1
@@ -93,7 +129,8 @@ def parse(diff_text: str) -> list[Hunk]:
                 f"hunk {header!r}: pure insertion with no surrounding "
                 f"context — include at least one unchanged line before or "
                 f"after the insertion point")
-        hunks.append(Hunk("\n".join(old_lines), "\n".join(new_lines), header))
+        hunks.append(Hunk("\n".join(old_lines), "\n".join(new_lines), header,
+                         changed=(old_lines != new_lines)))
     if not hunks:
         raise PatchError("no hunks found — expected a unified diff "
                          "(\"@@ ... @@\" hunk headers)")
@@ -106,7 +143,7 @@ def apply(text: str, hunks: list[Hunk]) -> str:
     match exactly once, and the caller must not have written anything to
     disk yet (this function never touches the filesystem)."""
     for h in hunks:
-        if h.old == h.new:
+        if not h.changed:
             continue   # a hunk with no real change (every line was
             # context) — nothing to do, not an error
         n = text.count(h.old)

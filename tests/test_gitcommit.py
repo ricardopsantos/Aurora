@@ -129,3 +129,27 @@ def test_draft_message_caps_a_huge_diff_before_sending_to_the_model():
     gitcommit.draft_message(_FakeEngine(), huge_diff, "")
     assert len(seen["prompt"]) < len(huge_diff)
     assert "truncated" in seen["prompt"]
+
+
+# ── R230: stage_all reports failure instead of leaking git's exception ────
+
+def test_stage_all_raises_giterror_when_git_add_fails(tmp_path):
+    """R230: not a repo at all — `git add` exits non-zero. This used to
+    escape as CalledProcessError through an unguarded /commit call site."""
+    with pytest.raises(gitcommit.GitError) as e:
+        gitcommit.stage_all(str(tmp_path))
+    assert "git add failed" in str(e.value)
+
+
+def test_stage_all_raises_giterror_when_git_cannot_run(monkeypatch, repo):
+    def boom(*a, **k):
+        raise OSError("no git binary")
+    monkeypatch.setattr(gitcommit.subprocess, "run", boom)
+    with pytest.raises(gitcommit.GitError):
+        gitcommit.stage_all(str(repo))
+
+
+def test_stage_all_succeeds_quietly_in_a_real_repo(repo):
+    (repo / "new.txt").write_text("x")
+    gitcommit.stage_all(str(repo))          # must not raise
+    assert "new.txt" in gitcommit.staged_diff(str(repo))

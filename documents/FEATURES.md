@@ -45,9 +45,10 @@ immediately recognize:
 ![The model's plain-English explanation of a pending run_command call, then the same approval prompt again](../images/Features/aurora.prompt-mode.command-explanation.png)
 
 **Any model, zero friction**
-- `/model` switches between OpenRouter (paid) and your local llama.cpp
-  server (free) from the same arrow-key menu — current model marked, no
-  key stored yet? it asks once and remembers.
+- `/model` switches between OpenRouter (paid) and your local server —
+  llama.cpp, or Ollama via a `type: ollama` provider entry — free, from the
+  same arrow-key menu. Current model marked; no key stored yet? it asks once
+  and remembers (a local server usually needs none at all).
 - Adding one is as simple as pasting its OpenRouter URL:
   `/model add https://openrouter.ai/kwaipilot/kat-coder-air-v2.5` (or just
   the bare `org/model` id) validates it against the OpenRouter catalog,
@@ -103,20 +104,28 @@ every tool call, approval, and cache hit rate for one session:
 - **[Extensions](EXTENSIONS.md)**: drop a `.py` file into
   `~/.aurora/extensions/` and its tools become callable by the model — no
   new API, just the same `SPEC`/`RUNNERS` shape Aurora's own built-in tools
-  use. Ships with three bundled by default: `web_search`/`web_fetch` (a
+  use. Ships with four bundled by default: `web_search`/`web_fetch` (a
   search API + page fetch, so the model can look things up instead of
   guessing), an MCP (Model Context Protocol) client — point `config.yaml`'s
   `mcp_servers:` at any stdio MCP server and its tools show up alongside
   Aurora's own, gated by the same approval prompt as every write/command —
-  and `lint_check`, which runs `ruff` (Python) against a file the model just
-  wrote or edited.
+  `lint_check`, which runs `ruff` (Python) against a file the model just
+  wrote or edited, and `refresh_model_prices`, which re-pulls every
+  configured OpenRouter model's price and context size from the catalog on
+  demand.
 - Approval policy has a third option beyond allow/ask: pick "Always DENY
   this" from any approval prompt (or hand-edit `denylist.yaml`) to block a
   pattern permanently, no question asked again — `/denylist` reviews it.
 - **"Always allow" generalizes by how risky the command is, not uniformly.**
   A read-only command (`find`, `ls`, `grep`, …) generalizes across any
-  arguments, so approving `find /a` also covers `find /b` next session. A
-  destructive one — `dd`, `rm`, `mkfs`, `shred`, `sudo`, `sh`/`bash`/
+  arguments, so approving `find /a` also covers `find /b` next session —
+  *except* when the invocation uses one of that command's own mutating
+  flags. "Read-only" is a claim about the command NAME, and for `find` it
+  only holds for how `find` is normally called: the binary also ships
+  `-delete`, `-exec`, `-fprintf` and friends. Such a call is treated as
+  destructive and generalizes across nothing, so an "always allow" on a
+  routine `find . -name '*.log'` cannot later wave through `find / -delete`.
+  A destructive one — `dd`, `rm`, `mkfs`, `shred`, `sudo`, `sh`/`bash`/
   `python`, `curl`/`wget` and friends — generalizes across **none**: the
   rule matches that exact command string and nothing else, so approving
   `rm -rf ./build` never lets `rm -rf /` through unasked. Anything with a

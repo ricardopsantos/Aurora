@@ -107,6 +107,52 @@ def test_redact_overlapping_or_unsorted_matches_stay_correct():
     assert secrets.redact(text, m) == "<secret> middle <secret>"
 
 
+# R221: redact() used to let `pos` jump BACKWARD when a later-processed
+# match was fully or partially nested inside an earlier, larger one — the
+# next untouched-slice append then re-emitted part of the secret text that
+# was supposed to be hidden.
+def test_redact_fully_nested_match_does_not_leak_the_outer_secret():
+    text = "ABCDEFGHIJ"
+    outer = secrets.Match("outer", 0, 10, text[0:10])
+    inner = secrets.Match("inner", 2, 5, text[2:5])
+    out = secrets.redact(text, [outer, inner])
+    assert "FGHIJ" not in out
+    assert "ABCDE" not in out
+    assert out == "<secret>"
+
+
+def test_redact_nested_match_order_independent():
+    text = "ABCDEFGHIJ"
+    outer = secrets.Match("outer", 0, 10, text[0:10])
+    inner = secrets.Match("inner", 2, 5, text[2:5])
+    assert secrets.redact(text, [outer, inner]) == secrets.redact(text, [inner, outer])
+
+
+def test_redact_partially_overlapping_matches_do_not_leak_between_them():
+    text = "ABCDEFGHIJ"
+    m1 = secrets.Match("a", 0, 5, text[0:5])   # ABCDE
+    m2 = secrets.Match("b", 3, 8, text[3:8])   # DEFGH
+    out = secrets.redact(text, [m1, m2])
+    # every char from the union of the two spans (0-8) must be gone —
+    # no fragment of either secret may survive between the two markers
+    assert "ABCDE" not in out
+    assert "DEFGH" not in out
+    assert "FGH" not in out
+    assert out.endswith("IJ")
+
+
+def test_redact_three_way_nested_and_overlapping_matches():
+    text = "0123456789"
+    outer = secrets.Match("outer", 0, 10, text)
+    mid = secrets.Match("mid", 2, 8, text[2:8])
+    inner = secrets.Match("inner", 4, 6, text[4:6])
+    for order in ([outer, mid, inner], [inner, mid, outer], [mid, outer, inner]):
+        out = secrets.redact(text, order)
+        assert text not in out
+        for leaked_fragment in ("234567", "45", "0123456789"):
+            assert leaked_fragment not in out
+
+
 def test_redact_is_linear_not_quadratic():
     """R96d: the old right-to-left `text[:m.start] + ... + text[m.end:]` loop
     rebuilt and copied the ENTIRE string on every substitution — O(matches x
@@ -378,3 +424,32 @@ def test_a_secret_glued_onto_a_pattern_match_is_still_reported():
     assert any(m.kind == "High-entropy token" and tail in m.text
               for m in matches), \
         f"the glued-on tail {tail!r} was never reported: {matches}"
+
+
+# ── R231: the timestamp exemption must actually check a date ─────────────
+
+def test_date_guard_rejects_an_impossible_month_and_day():
+    """R231: `_is_date_or_timestamp` used to ask only "does this start with
+    eight digits", so a numerically-prefixed token was written off as a
+    timestamp and never reached the entropy pass — a silent false negative,
+    the one direction that matters in a secret detector."""
+    assert secrets._is_date_or_timestamp("99999999aB3xY7qLmZ2pQ8") is False
+    assert secrets._is_date_or_timestamp("20261332aB3xY7qLmZ2pQ8") is False
+    assert secrets._is_date_or_timestamp("12345678abcdEFGHijkl9") is False
+
+
+def test_date_guard_still_accepts_real_dated_filenames():
+    for token in ("20260710_211200_notes", "2026-07-10_report_v2",
+                  "2026_07_10_dump", "19991231_archive"):
+        assert secrets._is_date_or_timestamp(token) is True, token
+
+
+def test_a_token_with_a_non_date_numeric_prefix_is_scanned():
+    """The point of the fix: such a token is now judged on entropy like any
+    other instead of being exempted outright."""
+    kinds = [m.kind for m in secrets.scan("12345678abcdEFGHijkl9")]
+    assert kinds == ["High-entropy token"]
+
+
+def test_a_real_timestamped_filename_is_still_not_flagged():
+    assert secrets.scan("20260710_211200_session_notes") == []

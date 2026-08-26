@@ -91,3 +91,42 @@ def test_lint_check_is_registered_as_a_bundled_extension(tmp_path, monkeypatch):
         assert "lint_check" in names
     finally:
         tools.set_extensions([], {})   # don't leak into later tests
+
+
+# ── R243: the ungated fallback must not write to the user's tree ─────────
+
+def test_syntax_fallback_creates_no_pycache(tmp_path, monkeypatch):
+    """R243: the fallback shelled out to `python -m py_compile`, which
+    WRITES __pycache__/<name>.pyc beside the source. lint_check is not in
+    tools.NEEDS_APPROVAL and is not an mcp_* name, so it runs with no
+    approval prompt — an unapproved tool must not create files in the
+    user's tree (it dirties a clean repo and fails on a read-only dir)."""
+    monkeypatch.setattr(lint.shutil, "which", lambda n: None)
+    target = tmp_path / "ok.py"
+    target.write_text("x = 1\n")
+    out = lint.lint_check(str(target))
+    assert "no syntax errors" in out
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ok.py"]
+
+
+def test_syntax_fallback_reports_a_real_syntax_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(lint.shutil, "which", lambda n: None)
+    target = tmp_path / "bad.py"
+    target.write_text("def f(:\n")
+    out = lint.lint_check(str(target))
+    assert "syntax error" in out
+    assert "line 1" in out
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bad.py"]
+
+
+def test_syntax_fallback_runs_no_subprocess(tmp_path, monkeypatch):
+    """The check is in-process now — no interpreter spawn per lint call."""
+    monkeypatch.setattr(lint.shutil, "which", lambda n: None)
+
+    def boom(*a, **k):
+        raise AssertionError("the fallback must not shell out")
+
+    monkeypatch.setattr(lint.subprocess, "run", boom)
+    target = tmp_path / "ok.py"
+    target.write_text("x = 1\n")
+    assert "no syntax errors" in lint.lint_check(str(target))

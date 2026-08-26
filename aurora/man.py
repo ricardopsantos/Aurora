@@ -110,8 +110,10 @@ def _entries(B, C, D, G, Y, R):
 
 "status": f"""Backend health check for the CURRENT model. A local (llama.cpp)
     backend reports the real loaded model and its live context size (via
-    {D}/props{R}); a remote (OpenRouter) backend reports whether a key is
-    present, since there's no equivalent live probe for it.""",
+    {D}/props{R}); an Ollama backend ({D}type: ollama{R} in config.yaml)
+    reports the same via its own {D}/api/show{R}; a remote (OpenRouter)
+    backend reports whether a key is present, since there's no equivalent
+    live probe for it.""",
 
 "cost": f"""Per-model token + $ breakdown across EVERY session ever logged on
     this machine — not just this one. Reads straight from the session

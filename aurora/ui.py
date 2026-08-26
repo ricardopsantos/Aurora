@@ -1069,7 +1069,14 @@ def _commit_cmd(engine: Engine, fe: TerminalFrontend, arg: str) -> None:
         if not confirm("Stage all changes and commit?", default_yes=False):
             print("· cancelled — stage what you want with `git add` first")
             return
-        gitcommit.stage_all(cwd)
+        try:
+            gitcommit.stage_all(cwd)
+        except gitcommit.GitError as e:
+            # R230: staging is the only mutating step here, and it can fail
+            # for ordinary reasons (a stale index.lock from a crashed git).
+            # It used to raise `CalledProcessError` out of the slash command.
+            print(f"· {e}")
+            return
         diff = gitcommit.staged_diff(cwd)
         if not diff.strip():
             print("· nothing to commit")

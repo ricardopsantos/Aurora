@@ -106,7 +106,18 @@ _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 # Timestamps / dated filenames like 20260710_211200_* or 2026-07-10_* look
 # random but are not secrets. Anchor at the start of the token so a random
 # key that merely contains a year in the middle is still allowed.
-_DATE_RE = re.compile(r"^\d{4}(?:[-_])?\d{2}(?:[-_])?\d{2}(?:_\d{6})?")
+#
+# R231: the field ranges are part of the check, not decoration. This was
+# `^\d{4}[-_]?\d{2}[-_]?\d{2}`, which asks only "does this token START with
+# eight digits" — so `99999999aB3xY7qLmZ2pQ8` (month 99, day 99) and any
+# other numerically-prefixed token was written off as a timestamp and
+# skipped by the entropy pass entirely. That is a silent false NEGATIVE in
+# a detector, the one direction that matters: a missed secret is sent to the
+# provider with no challenge, while a false positive only costs a prompt.
+# Constraining month, day and century keeps every real dated filename
+# matching while making the exemption mean what its name says.
+_DATE_RE = re.compile(r"^(?:19|20)\d{2}[-_]?(?:0[1-9]|1[0-2])[-_]?"
+                      r"(?:0[1-9]|[12]\d|3[01])(?:_\d{6})?")
 # bits/char; random mixed-case+digit text sits ~4.5-5.5, English prose/plain
 # hex/identifiers sit lower — tuned against the false positives below
 _ENTROPY_THRESHOLD = 3.6
@@ -232,13 +243,25 @@ def redact(text: str, matches: list[Match]) -> str:
     R58 case) was O(matches × len(text)). A single left-to-right pass that
     accumulates the untouched-between-matches slices and `"".join()`s once at
     the end has the same "earlier spans stay valid" property (each slice is
-    read before any substitution happens) and is linear."""
+    read before any substitution happens) and is linear.
+
+    R221: `matches` from `scan()` never overlap (its own claim-bitmap
+    guarantees that), but this is a PUBLIC function a caller can feed
+    anything — a match fully or partially nested inside an earlier one used
+    to make `pos` jump BACKWARD to the inner match's end, and the next slice
+    (`text[pos:start]`) then re-emitted the tail of the outer secret verbatim
+    around the inner `<secret>` marker: exactly the leak this function
+    exists to prevent. A match already entirely covered by `pos` is skipped;
+    a partially-overlapping one is clamped to start no earlier than `pos`."""
     if not matches:
         return text
     out: list[str] = []
     pos = 0
     for m in sorted(matches, key=lambda mm: mm.start):
-        out.append(text[pos:m.start])
+        if m.end <= pos:
+            continue   # fully covered by an earlier, larger match already redacted
+        start = max(m.start, pos)
+        out.append(text[pos:start])
         out.append("<secret>")
         pos = m.end
     out.append(text[pos:])

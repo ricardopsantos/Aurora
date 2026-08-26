@@ -35,6 +35,29 @@ def _ensure_dir(path: "Path", what: str) -> "Path":
     return path
 
 
+def _fsync_dir(directory: "Path") -> None:
+    """R171/I6: fsyncing a temp file makes ITS contents durable, but the
+    rename that makes it visible under the final name is a separate metadata
+    write to the DIRECTORY entry — on a power loss before that directory write
+    reaches disk, the rename can be lost even though the temp file's data was
+    safely flushed, leaving the OLD contents as the surviving file (the new
+    inode unlinked). Windows has no directory fd to fsync; best effort there,
+    same fallback shape as the POSIX-only `flock` in session.py.
+
+    R234: shared by both atomic writers. It used to live inline in
+    `write_text_atomic` only, which left `write_bytes_atomic` — the writer the
+    encrypted key store uses, i.e. the one file whose loss is unrecoverable —
+    without the very durability step R171 was added to guarantee."""
+    try:
+        dirfd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+    except (OSError, AttributeError):
+        pass
+
+
 def write_bytes_atomic(path: "Path | str", data: bytes,
                        mode: int | None = None) -> None:
     """Byte counterpart to `write_text_atomic` below, with an optional
@@ -60,6 +83,7 @@ def write_bytes_atomic(path: "Path | str", data: bytes,
         if mode is not None:
             os.chmod(tmp, mode)
         os.replace(tmp, path)
+        _fsync_dir(path.parent)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
@@ -90,28 +114,70 @@ def write_text_atomic(path: "Path | str", text: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-        # R171/I6: fsyncing the temp file makes ITS contents durable, but
-        # the rename that makes it visible AS `path` is a separate metadata
-        # write to the DIRECTORY entry — on a power loss before that
-        # directory write itself reaches disk, the rename can be lost even
-        # though the temp file's data was safely flushed, leaving the OLD
-        # contents as the surviving file (the new inode unlinked). Windows
-        # has no directory fd to fsync; best effort there, same fallback
-        # shape as the POSIX-only `flock` in session.py.
-        try:
-            dirfd = os.open(str(path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dirfd)
-            finally:
-                os.close(dirfd)
-        except (OSError, AttributeError):
-            pass
+        _fsync_dir(path.parent)
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise
+
+def write_text_preserving(path: "Path | str", text: str) -> None:
+    """R241: atomic write for a file that BELONGS TO THE USER — the model's
+    `write_file`/`edit_file`/`apply_patch` targets, not Aurora's own state.
+
+    Same crash-safety as `write_text_atomic`, plus the two things that
+    matter when the file is someone's source tree rather than a config
+    Aurora owns:
+
+    * **Mode is preserved.** `mkstemp` creates 0600 and `os.replace` carries
+      the temp file's mode across, so a plain atomic write turns an
+      executable script into a private, non-executable file. The existing
+      mode is copied onto the temp file before the rename.
+    * **Symlinks are followed.** `os.replace` would swap the LINK for a
+      regular file, silently orphaning the file the user actually meant to
+      edit. Resolving first writes through the link, which is what
+      `write_text` did.
+
+    The forward path needed this because it did not have it: `write_file`,
+    `edit_file` and `apply_patch` used `Path.write_text`, which truncates
+    and then writes. A crash, ENOSPC or a kill in that window leaves the
+    user's source file truncated or empty — the very outcome `rewind`'s
+    `_atomic_write_bytes` exists to prevent when UNDOING a change, while
+    making one was unprotected."""
+    p = Path(path)
+    if p.is_symlink():
+        p = p.resolve()
+    try:
+        mode = p.stat().st_mode & 0o7777
+    except OSError:
+        mode = None          # new file — let the umask decide, as before
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent),
+                               prefix=f".{p.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is None:
+            os.chmod(tmp, 0o666 & ~_umask())
+        else:
+            os.chmod(tmp, mode)
+        os.replace(tmp, p)
+        _fsync_dir(p.parent)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _umask() -> int:
+    """Read the process umask without leaving it changed — there is no
+    read-only accessor before Python 3.13's `os.umask` semantics change."""
+    current = os.umask(0o022)
+    os.umask(current)
+    return current
+
 
 _MARKER = Path.home() / ".aurora-path"
 

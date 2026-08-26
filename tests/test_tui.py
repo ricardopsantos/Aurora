@@ -3059,6 +3059,32 @@ def test_cost_tree_click_queues_the_command_instead_of_working_inline(t, monkeyp
     assert any("/context" in e for e in t._chat if isinstance(e, str))
 
 
+def test_cost_tree_click_notes_the_queue_while_worker_busy(t, monkeypatch):
+    # R219: a click (or typed line) while `self._busy` is True still echoes
+    # into the transcript, but `_worker()` won't touch the inbox until its
+    # current turn finishes — a `wait_until` poll can run up to 300s. With
+    # no note, the echoed "/context" reads as submitted-and-answered, so a
+    # slow-running turn made /context look silently broken (user report).
+    from aurora import ctxtree
+    monkeypatch.setattr(ctxtree, "render", lambda *a, **k: "")
+
+    t._busy = True
+    t._cost_tree_click()(_mouse_up())
+
+    assert t._inbox.get_nowait() == "/context"
+    assert any("queued" in e for e in t._chat if isinstance(e, str))
+
+
+def test_cost_tree_click_no_queue_note_when_worker_idle(t, monkeypatch):
+    from aurora import ctxtree
+    monkeypatch.setattr(ctxtree, "render", lambda *a, **k: "")
+
+    assert t._busy is False
+    t._cost_tree_click()(_mouse_up())
+
+    assert not any("queued" in e for e in t._chat if isinstance(e, str))
+
+
 def test_cost_report_click_queues_the_command_instead_of_working_inline(
         t, monkeypatch):
     """R168: same shape as `_cost_tree_click` — `/cost` reads every session

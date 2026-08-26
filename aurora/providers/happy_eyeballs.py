@@ -41,6 +41,32 @@ def _ordered(infos: list) -> list[tuple[int, tuple]]:
     return out
 
 
+def _connect_one(fam: int, sa: tuple, timeout: float | None,
+                 source_address: tuple | None) -> socket.socket:
+    """Connect one already-resolved address. Shared by the single-address
+    fast path and each racing attempt so the two cannot diverge.
+
+    R233: the fast path used to call `socket.create_connection(sa[:2], …)`.
+    `getaddrinfo` returns an IPv6 sockaddr as
+    `(addr, port, flowinfo, scope_id)` with the scope in `sa[3]` and NO
+    `%iface` suffix on `sa[0]`, so slicing to two elements discards the
+    scope id and hands the kernel an address it rejects with EINVAL — a
+    link-local IPv6 destination was unreachable whenever it resolved to
+    exactly ONE address, while the racing path (which passes the full
+    sockaddr) connected to it fine. It also re-resolved the host a second
+    time and ignored the family already selected."""
+    s = socket.socket(fam, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        if source_address is not None:
+            s.bind(source_address)
+        s.connect(sa)
+    except BaseException:
+        s.close()
+        raise
+    return s
+
+
 def happy_eyeballs_connect(host: str, port: int, timeout: float | None,
                            source_address: tuple | None) -> socket.socket:
     """Return the first socket to connect, racing address families with a
@@ -50,8 +76,7 @@ def happy_eyeballs_connect(host: str, port: int, timeout: float | None,
         raise OSError(f"no addresses for {host}:{port}")
     if len(addrs) == 1:                       # nothing to race
         fam, sa = addrs[0]
-        return socket.create_connection(
-            sa[:2], timeout, source_address=source_address)
+        return _connect_one(fam, sa, timeout, source_address)
 
     # ONE queue for every outcome, so the first ("ok", sock) is picked up the
     # instant it lands — we never block waiting on a slower/stalled family.
@@ -65,14 +90,9 @@ def happy_eyeballs_connect(host: str, port: int, timeout: float | None,
         if stop.wait(delay):                  # someone already won during stagger
             results.put(("skip", None))
             return
-        s = socket.socket(fam, socket.SOCK_STREAM)
         try:
-            s.settimeout(timeout)
-            if source_address is not None:
-                s.bind(source_address)
-            s.connect(sa)
+            s = _connect_one(fam, sa, timeout, source_address)
         except Exception as e:
-            s.close()
             results.put(("err", e))
             return
         with win_lock:

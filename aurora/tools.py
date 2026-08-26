@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from . import patch as patchmod
+from .paths import write_text_preserving
 
 MAX_READ_BYTES = 200_000
 
@@ -297,9 +298,11 @@ def grep(pattern: str, path: str = ".", **_) -> str:
 
 
 def write_file(path: str, content: str, **_) -> str:
+    # R241: atomic + mode/symlink preserving. `Path.write_text` truncates
+    # first, so a crash, ENOSPC or a kill mid-write leaves the user's file
+    # truncated or empty.
     p = _resolve(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content, encoding="utf-8")
+    write_text_preserving(p, content)
     return f"[wrote {len(content)} bytes to {path}]"
 
 
@@ -318,7 +321,7 @@ def edit_file(path: str, old: str, new: str, replace_all: bool = False,
     if n > 1 and not replace_all:
         return (f"[error: `old` text appears {n} times — make it unique, "
                 f"or pass replace_all=true to change all {n}]")
-    p.write_text(text.replace(old, new), encoding="utf-8")
+    write_text_preserving(p, text.replace(old, new))   # R241
     return f"[edited {path}]" if n == 1 else f"[edited {path} — {n} occurrences]"
 
 
@@ -342,7 +345,7 @@ def apply_patch(path: str, diff: str, **_) -> str:
         return f"[error: {e}]"
     if new_text == text:
         return "[no changes — patch was a no-op]"
-    p.write_text(new_text, encoding="utf-8")
+    write_text_preserving(p, new_text)   # R241
     return f"[applied {len(hunks)} hunk(s) to {path}]"
 
 
@@ -761,10 +764,29 @@ def set_extensions(specs: list[dict], runners: dict) -> list[str]:
             warnings.append(f"extension tool '{name}' defined by more than "
                             f"one extension — skipped duplicate")
             continue
+        # R238: a spec with no runner is the SAME defect the nameless-spec
+        # branch above exists to stop — "advertised to the model and
+        # permanently uncallable" — reached through a different door, and it
+        # was kept silently. `run_tool` answers every such call with
+        # `[error: unknown tool '<name>']`, so the model sees a tool it is
+        # invited to use, calls it, fails, and can burn its whole iteration
+        # budget retrying, with no warning anywhere to explain why.
+        #
+        # Entirely ordinary in a hand-written extension, which is the point
+        # of the feature: a tool renamed in SPEC but not in RUNNERS, or a
+        # typo in a RUNNERS key. `discover()` merges a module's static
+        # SPEC/RUNNERS with whatever `register()` returns before calling
+        # this, so a spec declared statically and its runner supplied by
+        # `register()` still arrive here together — requiring the pair costs
+        # no legitimate arrangement.
+        if name not in runners:
+            warnings.append(f"extension tool '{name}' has a spec but no "
+                            f"runner — skipped (it would be advertised to "
+                            f"the model and fail every call)")
+            continue
         seen.add(name)
         kept_specs.append(spec)
-        if name in runners:
-            kept_runners[name] = runners[name]
+        kept_runners[name] = runners[name]
     _EXTENSION_SPECS = kept_specs
     _EXTENSION_RUNNERS = kept_runners
     return warnings

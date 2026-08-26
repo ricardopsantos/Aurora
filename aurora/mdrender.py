@@ -10,7 +10,7 @@ exactly what the model wrote."""
 
 import re
 
-from .colors import DIM, BOLD, CYAN, GREEN, MAGENTA, RESET, YELLOW, linkify
+from .colors import BOLD, CYAN, DIM, GREEN, MAGENTA, RESET, YELLOW, linkify
 
 _CODE = re.compile(r"`([^`]+)`")
 _BOLD = re.compile(r"\*\*([^*]+)\*\*")
@@ -118,7 +118,16 @@ class LineRenderer:
             return _highlight_code_line(line, self.fence_lang)
         m = _HEADER.match(line)
         if m:
-            return f"{BOLD}{CYAN}{m.group(2)}{RESET}"
+            # `(.*)$` doesn't consume a trailing "\n" (`.` isn't DOTALL, `$`
+            # matches right before it) — every other branch here preserves
+            # whatever trailing content was in `line` (bold/code/bullet via
+            # .sub, the fence branches via plain concatenation); this one
+            # silently dropped it. Currently invisible only because ui.py's
+            # caller always strips the newline before calling render() and
+            # re-appends it after — an unstated assumption this function
+            # itself shouldn't require of every caller.
+            suffix = "\n" if line.endswith("\n") else ""
+            return f"{BOLD}{CYAN}{m.group(2)}{RESET}{suffix}"
         line = _BOLD.sub(f"{BOLD}\\1{RESET}", line)
         line = _CODE.sub(f"{CYAN}\\1{RESET}", line)
         line = _BULLET.sub(r"\1• ", line)

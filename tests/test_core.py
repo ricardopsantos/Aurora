@@ -467,11 +467,19 @@ def test_session_log_serializes_concurrent_writes_no_interleaving(
         tmp_path, monkeypatch):
     """R170f: O_APPEND makes one write() call atomic, but two Aurora
     processes resumed onto the SAME session id had no coordination beyond
-    that — nothing stopped one writer's json.dumps()+write() from
-    interleaving with another's at the OS scheduler's whim. Proven here by
-    forcing the race: json.dumps is patched to sleep WHILE the flock (if any)
-    is held, so without the lock two threads' critical sections are almost
-    guaranteed to overlap; with it they can't."""
+    that — nothing stopped one writer's write() from interleaving with
+    another's at the OS scheduler's whim. Proven here by forcing the race:
+    the flush is patched to sleep WHILE the flock (if any) is held, so
+    without the lock two threads' critical sections are almost guaranteed to
+    overlap; with it they can't.
+
+    R232: the sleep used to hang off `json.dumps`, which was then inside the
+    locked region. It no longer is — serializing serialization is pure
+    contention, and the record is now built before the file is even opened —
+    so timing `json.dumps` stopped measuring the critical section at all.
+    The instrumentation follows the lock instead: the interval recorded is
+    LOCK_EX to LOCK_UN, which is the section that actually matters, and the
+    slow step inside it is the flush, i.e. the write() syscall itself."""
     import json as _json
     import threading
     import time as _time
@@ -481,19 +489,27 @@ def test_session_log_serializes_concurrent_writes_no_interleaving(
     monkeypatch.setenv("AURORA_HOME", str(tmp_path))
     s = Session("locktest0001")
 
+    import fcntl as _fcntl
+
     intervals: list[tuple[float, float]] = []
     lock = threading.Lock()
-    real_dumps = _json.dumps
+    starts: dict[int, float] = {}
+    real_flock = _fcntl.flock
 
-    def slow_dumps(*a, **k):
-        start = _time.monotonic()
+    def timing_flock(f, op):
+        if op == _fcntl.LOCK_EX:
+            out = real_flock(f, op)
+            starts[threading.get_ident()] = _time.monotonic()
+            return out
+        # unlock: the sleep sits INSIDE the held lock, so an unserialized
+        # implementation's sections would overlap
         _time.sleep(0.03)
-        out = real_dumps(*a, **k)
         with lock:
-            intervals.append((start, _time.monotonic()))
-        return out
+            intervals.append((starts.pop(threading.get_ident()),
+                              _time.monotonic()))
+        return real_flock(f, op)
 
-    monkeypatch.setattr("aurora.session.json.dumps", slow_dumps)
+    monkeypatch.setattr("aurora.session.fcntl.flock", timing_flock)
 
     threads = [threading.Thread(target=s.log, kwargs={"event": "user",
                                                        "text": f"msg {i}"})
@@ -502,6 +518,12 @@ def test_session_log_serializes_concurrent_writes_no_interleaving(
         t.start()
     for t in threads:
         t.join(timeout=5)
+
+    # R232: assert the lock was actually taken once per write. Without this
+    # the test passes vacuously if `log()` stops locking at all — `intervals`
+    # would simply be empty and the disjointness loop would have nothing to
+    # check.
+    assert len(intervals) == 6
 
     # every critical section must be fully disjoint from every other — any
     # overlap means two writes could have interleaved on disk
@@ -1074,6 +1096,214 @@ def test_remote_provider_skips_props_probe():
 class _Boom:
     def get(self, *a, **k):
         raise AssertionError("remote provider must not probe /props")
+
+
+# ── R223: Ollama support ────────────────────────────────────────────────
+
+def _mk_ollama_provider():
+    from aurora.providers.openai_compat import OpenAICompatProvider
+    prov = OpenAICompatProvider(
+        "ollama", {"base_url": "http://localhost:11434/v1", "type": "ollama"}, 300)
+    return prov
+
+
+def test_ollama_probe_hits_root_not_props(monkeypatch):
+    prov = _mk_ollama_provider()
+    used = []
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        def get(self, url, **kw):
+            used.append(url)
+            return _Resp()
+
+    monkeypatch.setattr(prov, "_client_for", lambda base: _Client())
+    assert prov._probe("http://localhost:11434/v1") is True
+    assert used == ["http://localhost:11434/"]
+
+
+def test_llamacpp_probe_unaffected_by_ollama_change(monkeypatch):
+    """Regression: a provider with no `type:` (or type != "ollama") must
+    still hit /props exactly as before."""
+    from aurora.providers.openai_compat import OpenAICompatProvider
+    prov = OpenAICompatProvider("local", {"base_url": "http://10.0.0.5:8080/v1"}, 300)
+    used = []
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        def get(self, url, **kw):
+            used.append(url)
+            return _Resp()
+
+    monkeypatch.setattr(prov, "_client_for", lambda base: _Client())
+    assert prov._probe("http://10.0.0.5:8080/v1") is True
+    assert used == ["http://10.0.0.5:8080/props"]
+
+
+def _ollama_show_client(model_info):
+    class _Resp:
+        def json(self):
+            return {"model_info": model_info}
+
+    class _Client:
+        def post(self, url, **kw):
+            return _Resp()
+
+    return _Client()
+
+
+def test_ollama_live_context_limit_reads_family_keyed_field(monkeypatch):
+    prov = _mk_ollama_provider()
+    monkeypatch.setattr(prov, "pick_endpoint", lambda cache_ok=True: prov.base_url)
+    monkeypatch.setattr(type(prov), "_client",
+                        property(lambda self: _ollama_show_client(
+                            {"general.architecture": "llama",
+                             "llama.context_length": 131072})))
+    assert prov.live_context_limit("llama3.1:8b") == 131072
+
+
+def test_ollama_live_context_limit_different_family_prefix(monkeypatch):
+    """The context-length key is family-prefixed, not one fixed name —
+    verify a second family (qwen2) is read correctly too."""
+    prov = _mk_ollama_provider()
+    monkeypatch.setattr(prov, "pick_endpoint", lambda cache_ok=True: prov.base_url)
+    monkeypatch.setattr(type(prov), "_client",
+                        property(lambda self: _ollama_show_client(
+                            {"general.architecture": "qwen2",
+                             "qwen2.context_length": 32768})))
+    assert prov.live_context_limit("qwen2.5-coder:7b") == 32768
+
+
+def test_ollama_live_context_limit_works_for_any_model_name_not_just_local():
+    """Unlike llama.cpp's /props (gated on model == "local"), Ollama's
+    /api/show is keyed by the real model name — no sentinel required."""
+    from aurora.providers.openai_compat import OpenAICompatProvider
+    prov = OpenAICompatProvider(
+        "ollama", {"base_url": "http://localhost:11434/v1", "type": "ollama"}, 300)
+    prov.pick_endpoint = lambda cache_ok=True: prov.base_url
+    prov._client_for = lambda base: object()
+    called = {}
+
+    def fake_ollama_limit(model):
+        called["model"] = model
+        return 8192
+
+    prov._ollama_live_context_limit = fake_ollama_limit
+    assert prov.live_context_limit("mistral-nemo:12b") == 8192
+    assert called["model"] == "mistral-nemo:12b"
+
+
+def test_ollama_live_context_limit_missing_architecture_key_returns_none(monkeypatch):
+    prov = _mk_ollama_provider()
+    monkeypatch.setattr(prov, "pick_endpoint", lambda cache_ok=True: prov.base_url)
+    monkeypatch.setattr(type(prov), "_client",
+                        property(lambda self: _ollama_show_client({})))
+    assert prov.live_context_limit("some-model") is None
+
+
+def test_ollama_live_context_limit_errored_show_call_returns_none(monkeypatch):
+    prov = _mk_ollama_provider()
+    monkeypatch.setattr(prov, "pick_endpoint", lambda cache_ok=True: prov.base_url)
+
+    class _RaisingClient:
+        def post(self, *a, **k):
+            raise ConnectionError("down")
+
+    monkeypatch.setattr(type(prov), "_client", property(lambda self: _RaisingClient()))
+    assert prov.live_context_limit("whatever") is None
+
+
+def test_ollama_live_model_name_returns_none_not_props():
+    """R223: left unimplemented for v1 (multiple resident models don't map
+    onto a single "the loaded model" concept) — must return None cleanly,
+    never attempt /props (which Ollama doesn't have)."""
+    prov = _mk_ollama_provider()
+    prov.__dict__["_http"] = _Boom()
+    assert prov.live_model_name() is None
+
+
+def test_ollama_context_limit_falls_back_to_config_default_when_show_fails(monkeypatch):
+    prov = _mk_ollama_provider()
+    monkeypatch.setattr(prov, "live_context_limit", lambda model="local": None)
+    assert prov.context_limit("some-model") == 128_000
+
+
+def test_ollama_provider_kind_round_trips_through_config():
+    from aurora import engine as enginemod
+    cfg = {
+        "providers": {"ollama": {"type": "ollama",
+                                 "base_url": "http://localhost:11434/v1"}},
+        "models": [{"provider": "ollama", "model": "llama3.1:8b", "tools": True}],
+    }
+    eng = object.__new__(enginemod.Engine)
+    eng.cfg = cfg
+    assert eng.provider_kind({"provider": "ollama"}) == "ollama"
+
+
+def test_ollama_no_authorization_header_when_key_unset():
+    prov = _mk_ollama_provider()
+    assert "Authorization" not in prov._auth_headers()
+
+
+def test_ollama_turn_streams_text_and_tool_call(monkeypatch):
+    """Ollama's OpenAI-compat streaming shape needs no provider-specific
+    branch in turn() — the generic OpenAI delta parsing (text + tool_calls)
+    already handles it."""
+    from aurora.providers import openai_compat as oc
+
+    def fake_sse(open_stream, cancel, poll=0.15):
+        yield ("status", 200, None, {})
+        yield ("line", 'data: {"choices":[{"delta":{"content":"looking it up"}}]}',
+              None, None)
+        yield ("line", 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+              '"id":"call_1","function":{"name":"read_file","arguments":""}}]}}]}',
+              None, None)
+        yield ("line", 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+              '"function":{"arguments":"{\\"path\\": \\"x.py\\"}"}}]},'
+              '"finish_reason":"tool_calls"}]}', None, None)
+        yield ("line", "data: [DONE]", None, None)
+
+    monkeypatch.setattr(oc, "cancellable_sse", fake_sse)
+    prov = _mk_ollama_provider()
+    prov._client_for = lambda base: object()
+    got = []
+    res = prov.turn("llama3.1:8b", [{"role": "user", "content": "read x.py"}],
+                    "", [{"name": "read_file", "description": "d",
+                         "parameters": {}}],
+                    lambda t: got.append(t), lambda: False)
+    assert res.text == "looking it up"
+    assert "".join(got) == "looking it up"
+    assert len(res.tool_calls) == 1
+    assert res.tool_calls[0].name == "read_file"
+    assert res.tool_calls[0].arguments == {"path": "x.py"}
+    assert res.stop_reason == "tool_calls"
+
+
+def test_config_yaml_example_has_a_well_formed_ollama_entry():
+    """Guards config.yaml.example against silent drift — a provider block
+    or model entry a user is meant to copy-paste must actually be correct."""
+    from pathlib import Path
+
+    import yaml as yamlmod
+    example_path = Path(__file__).resolve().parent.parent / "config.yaml.example"
+    cfg = yamlmod.safe_load(example_path.read_text(encoding="utf-8"))
+    assert "ollama" in cfg["providers"]
+    ollama_provider = cfg["providers"]["ollama"]
+    assert ollama_provider["type"] == "ollama"
+    assert ollama_provider["base_url"].startswith("http://localhost:11434")
+    ollama_models = [m for m in cfg["models"] if m["provider"] == "ollama"]
+    assert len(ollama_models) == 1
+    # R223: qwen2.5-coder:3b was verified live NOT to emit real tool calls
+    # through Ollama despite being marked tools-capable — the example must
+    # not regress back to recommending it or anything from that family.
+    assert ollama_models[0]["model"].startswith("qwen3")
+    assert ollama_models[0]["tools"] is True
 
 
 def test_allowlist_tilde_matches_absolute():
@@ -5721,6 +5951,28 @@ def test_cache_enabled_defaults_off_for_local_on_for_remote(tmp_path, monkeypatc
     assert e.cache_enabled({"model": "remote", "cache": True}) is False
 
 
+def test_cache_enabled_defaults_off_for_ollama_too(tmp_path, monkeypatch):
+    """R223 fix: an Ollama model entry is never named "local" (it's always
+    the real model name, e.g. "qwen3:1.7b"), so before this fix it fell
+    through to the remote-model default (cache ON) and got a needless
+    cache_control content-block system message — Ollama keeps its own local
+    KV-cache prefix too, same reasoning as the llama.cpp `local` sentinel."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("""
+providers:
+  ollama: {type: ollama, base_url: "http://localhost:11434/v1"}
+models:
+  - {model: "qwen3:1.7b", provider: ollama}
+""")
+    from aurora.engine import Engine
+    e = Engine(str(cfg))
+    assert e.cache_enabled({"model": "qwen3:1.7b", "provider": "ollama"}) is False
+    # a per-model flag still overrides, same as every other provider
+    assert e.cache_enabled({"model": "qwen3:1.7b", "provider": "ollama",
+                            "cache": True}) is True
+
+
 def test_turn_sums_cached_tokens_across_iterations(tmp_path):
     approve.save({"run_command": [], "write_file": ["*"], "edit_file": []})
     f = tmp_path / "o.txt"
@@ -5911,6 +6163,107 @@ def test_parallel_batch_runs_read_only_calls_concurrently(monkeypatch):
     elapsed = time.monotonic() - t0
     assert got == {i: f"out-/nope/{i}" for i in range(4)}
     assert elapsed < 0.6, f"ran serially ({elapsed:.2f}s for 4×0.2s)"
+
+
+def test_run_tools_parallel_empty_list_returns_empty_dict():
+    from aurora import tools as t
+    assert t.run_tools_parallel([]) == {}
+
+
+def test_run_tools_parallel_single_call_runs_sequential_path(monkeypatch):
+    """len(calls) < 2 skips the ThreadPoolExecutor entirely — assert that
+    branch is actually taken (a thread pool would still get the right
+    answer, so a return-value check alone can't distinguish the two)."""
+    from aurora import tools as t
+    called = {}
+
+    def fake_pool(*a, **k):
+        called["used_pool"] = True
+        raise AssertionError("should not construct a ThreadPoolExecutor for 1 call")
+
+    monkeypatch.setattr(t, "run_tool", lambda name, args: f"{name}:{args}")
+    monkeypatch.setattr("concurrent.futures.ThreadPoolExecutor", fake_pool)
+    got = t.run_tools_parallel([(0, "read_file", {"path": "/x"})])
+    assert got == {0: "read_file:{'path': '/x'}"}
+    assert "used_pool" not in called
+
+
+def test_run_tools_parallel_preserves_index_to_result_mapping_out_of_order(monkeypatch):
+    """Workers can finish in any order — the returned dict must map each
+    ORIGINAL index to its own result regardless of completion order."""
+    import time
+
+    from aurora import tools as t
+
+    def variable_delay(name, args):
+        time.sleep(args["delay"])
+        return name
+
+    monkeypatch.setattr(t, "run_tool", variable_delay)
+    calls = [(0, "slow", {"delay": 0.15}), (1, "fast", {"delay": 0.0}),
+             (2, "mid", {"delay": 0.05})]
+    got = t.run_tools_parallel(calls)
+    assert got == {0: "slow", 1: "fast", 2: "mid"}
+
+
+def test_run_tools_parallel_caps_workers_at_max_parallel(monkeypatch):
+    from aurora import tools as t
+    seen_max_workers = {}
+    real_executor = __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor
+
+    class SpyExecutor(real_executor):
+        def __init__(self, max_workers=None, **k):
+            seen_max_workers["n"] = max_workers
+            super().__init__(max_workers=max_workers, **k)
+
+    monkeypatch.setattr(t, "run_tool", lambda name, args: "ok")
+    monkeypatch.setattr("concurrent.futures.ThreadPoolExecutor", SpyExecutor)
+    calls = [(i, "read_file", {"path": str(i)}) for i in range(t.MAX_PARALLEL + 5)]
+    t.run_tools_parallel(calls)
+    assert seen_max_workers["n"] == t.MAX_PARALLEL
+
+
+def test_run_tool_unknown_name_returns_error_string_not_exception():
+    from aurora import tools as t
+    out = t.run_tool("definitely_not_a_real_tool", {})
+    assert out == "[error: unknown tool 'definitely_not_a_real_tool']"
+
+
+def test_run_tool_swallows_runner_exception_into_error_string(monkeypatch):
+    from aurora import tools as t
+    monkeypatch.setitem(t.RUNNERS, "boom_tool",
+                        lambda **kw: (_ for _ in ()).throw(ValueError("kaboom")))
+    out = t.run_tool("boom_tool", {})
+    assert "[tool error: boom_tool: ValueError: kaboom]" == out
+
+
+def test_run_tool_coerces_non_string_runner_output(monkeypatch):
+    """R144b: a runner (extension) returning None/int/dict must not raise
+    TypeError from `len(out)` — it's coerced to a string first."""
+    from aurora import tools as t
+    monkeypatch.setitem(t.RUNNERS, "none_tool", lambda **kw: None)
+    monkeypatch.setitem(t.RUNNERS, "int_tool", lambda **kw: 42)
+    assert t.run_tool("none_tool", {}) == ""
+    assert t.run_tool("int_tool", {}) == "42"
+
+
+def test_run_tool_truncates_output_over_the_limit(monkeypatch):
+    from aurora import tools as t
+    monkeypatch.setitem(t.RUNNERS, "big_tool", lambda **kw: "z" * (t.TOOL_OUTPUT_LIMIT + 500))
+    out = t.run_tool("big_tool", {})
+    assert len(out) > t.TOOL_OUTPUT_LIMIT   # truncation notice appended
+    assert out.startswith("z" * t.TOOL_OUTPUT_LIMIT)
+    assert "truncated" in out
+    assert str(t.TOOL_OUTPUT_LIMIT) in out
+
+
+def test_run_tool_output_exactly_at_limit_is_not_truncated(monkeypatch):
+    from aurora import tools as t
+    exact = "y" * t.TOOL_OUTPUT_LIMIT
+    monkeypatch.setitem(t.RUNNERS, "exact_tool", lambda **kw: exact)
+    out = t.run_tool("exact_tool", {})
+    assert out == exact
+    assert "truncated" not in out
 
 
 def test_agent_parallelizes_reads_but_keeps_order_and_gates(tmp_path):
@@ -8047,6 +8400,83 @@ def test_health_distinguishes_no_model_from_no_provider(tmp_path, monkeypatch):
     assert e3._provider_health_uncached()["ok"] is False
 
 
+def test_ollama_health_check_reports_ok_not_false_remote_api(tmp_path, monkeypatch):
+    """R223 fix: `_provider_health_uncached` had its OWN duplicate
+    llama.cpp-only probe (separate from OpenAICompatProvider's, which R223
+    already fixed) — anything not literally named "local" fell into the
+    "remote API" branch and was reported `ok: bool(provider.api_key)`.
+    Ollama needs no key, so every Ollama model showed a false
+    "✘ remote API" at startup even when the server was actually reachable.
+    Caught live against a real Ollama server, not just here — this pins it.
+
+    Fails without the fix: ok is False and detail is "remote API"."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("""
+providers:
+  ollama: {type: ollama, base_url: "http://localhost:11434/v1"}
+models:
+  - {model: "qwen3:1.7b", provider: ollama}
+""")
+    from aurora.engine import Engine
+    e = Engine(str(cfg))
+
+    class _FakeOllamaProvider:
+        api_key = ""
+        base_url = "http://localhost:11434/v1"
+
+        def _is_ollama(self):
+            return True
+
+        def pick_endpoint(self, cache_ok=True):
+            return self.base_url
+
+        def _probe(self, url):
+            return True
+
+        def live_context_limit(self, model):
+            return 40960
+
+    monkeypatch.setattr(e, "_provider_for", lambda entry: _FakeOllamaProvider())
+    h = e._provider_health_uncached()
+    assert h["ok"] is True
+    assert h["detail"] == "qwen3:1.7b ready, ctx 40960"
+
+
+def test_ollama_health_check_reports_unreachable_when_actually_down(tmp_path, monkeypatch):
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("""
+providers:
+  ollama: {type: ollama, base_url: "http://localhost:11434/v1"}
+models:
+  - {model: "qwen3:1.7b", provider: ollama}
+""")
+    from aurora.engine import Engine
+    e = Engine(str(cfg))
+
+    class _DownOllamaProvider:
+        api_key = ""
+        base_url = "http://localhost:11434/v1"
+
+        def _is_ollama(self):
+            return True
+
+        def pick_endpoint(self, cache_ok=True):
+            return self.base_url
+
+        def _probe(self, url):
+            return False   # server actually down
+
+        def live_context_limit(self, model):
+            raise AssertionError("must not be called when the probe fails")
+
+    monkeypatch.setattr(e, "_provider_for", lambda entry: _DownOllamaProvider())
+    h = e._provider_health_uncached()
+    assert h["ok"] is False
+    assert h["detail"] == "unreachable"
+
+
 def test_an_unusable_aurora_home_is_explained_not_tracebacked(tmp_path):
     """R217: everything persistent goes through `aurora_home()` — sessions,
     allowlist, key store, checkpoints — and both it and `sessions_dir()` did a
@@ -8110,3 +8540,90 @@ def test_startup_with_an_unusable_home_exits_cleanly(tmp_path):
     assert r.returncode == 1
     assert "Traceback" not in out
     assert "AURORA_HOME" in out
+
+
+# ── R241: the model's mutation tools write atomically ────────────────────
+
+def test_write_file_preserves_mode_and_is_atomic(tmp_path):
+    """R241: write_file/edit_file/apply_patch used Path.write_text, which
+    truncates first — a crash, ENOSPC or a kill mid-write leaves the user's
+    source file truncated. rewind's restore path has been atomic since R193;
+    the forward path was not."""
+    from aurora import tools as toolsmod
+    script = tmp_path / "s.sh"
+    script.write_text("#!/bin/sh\necho old\n")
+    script.chmod(0o755)
+    toolsmod.write_file(str(script), "#!/bin/sh\necho new\n")
+    assert oct(script.stat().st_mode & 0o777) == oct(0o755)
+    assert script.read_text() == "#!/bin/sh\necho new\n"
+
+
+def test_edit_file_preserves_mode(tmp_path):
+    from aurora import tools as toolsmod
+    script = tmp_path / "s.sh"
+    script.write_text("echo old\n")
+    script.chmod(0o750)
+    toolsmod.edit_file(str(script), "old", "new")
+    assert oct(script.stat().st_mode & 0o777) == oct(0o750)
+    assert script.read_text() == "echo new\n"
+
+
+def test_apply_patch_preserves_mode(tmp_path):
+    from aurora import tools as toolsmod
+    script = tmp_path / "s.sh"
+    script.write_text("a\nold\nb\n")
+    script.chmod(0o755)
+    toolsmod.apply_patch(str(script), "@@ -1,3 +1,3 @@\n a\n-old\n+new\n b\n")
+    assert oct(script.stat().st_mode & 0o777) == oct(0o755)
+    assert script.read_text() == "a\nnew\nb\n"
+
+
+def test_write_file_through_a_symlink_does_not_orphan_the_target(tmp_path):
+    from aurora import tools as toolsmod
+    real = tmp_path / "real.txt"
+    real.write_text("old")
+    link = tmp_path / "link.txt"
+    link.symlink_to(real)
+    toolsmod.write_file(str(link), "new")
+    assert link.is_symlink()
+    assert real.read_text() == "new"
+
+
+# ── R242: a versioned interpreter is the same interpreter ────────────────
+
+@pytest.mark.parametrize("cmd", [
+    "python3.11 -c x", "python3.13 -c x", "/usr/bin/python3.12 -c x",
+    "python2.7 -c x", "perl5.36 -e x", "node20 -e x", "pip3.11 install x",
+    "ruby3.2 -e x",
+])
+def test_versioned_dangerous_commands_are_recognised(cmd):
+    """R242: DANGEROUS_COMMANDS matched by exact basename, so `python3` was
+    caught and `python3.11` — the standard binary name on most distros —
+    was not."""
+    from aurora import approve as approvemod
+    assert approvemod._is_dangerous(approvemod._norm_command(cmd)) is True
+
+
+@pytest.mark.parametrize("cmd", [
+    "ls -la", "grep -r foo .", "git status", "gcc-13 a.c",
+    "sha256sum f", "base64 f", "cat f",
+])
+def test_ordinary_commands_are_not_caught_by_the_version_strip(cmd):
+    from aurora import approve as approvemod
+    assert approvemod._is_dangerous(approvemod._norm_command(cmd)) is False
+
+
+def test_allowing_a_versioned_interpreter_does_not_generalize(tmp_path,
+                                                              monkeypatch):
+    """R242 end-to-end: approving a harmless `python3.11 -c "print(1)"` used
+    to store the two-token rule `python3.11 -c`, which then auto-approved
+    `python3.11 -c "<anything>"` — arbitrary code execution, no prompt,
+    forever. This is R149's bug on the entry R149 itself calls worst."""
+    from aurora import approve as approvemod
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path))
+    approvemod.add_rule("run_command", {"command": 'python3.11 -c "print(1)"'})
+    evil = 'python3.11 -c "__import__(\'shutil\').rmtree(\'/\')"'
+    assert approvemod.is_allowed("run_command", {"command": evil}) is False
+    # the exact command the user did approve still passes without re-asking
+    assert approvemod.is_allowed(
+        "run_command", {"command": 'python3.11 -c "print(1)"'}) is True

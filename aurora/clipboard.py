@@ -11,6 +11,16 @@ import shutil
 import subprocess
 import sys
 
+# Terminals cap an OSC52 payload at roughly this many base64 bytes. Divisible
+# by 4 on purpose — base64 decodes in 4-char groups, so a cut anywhere else
+# would hand the terminal a partial group.
+OSC52_MAX_B64 = 100_000
+
+
+def _osc52_would_truncate(text: str) -> bool:
+    """R235: whether `_osc52` will silently drop the tail of `text`."""
+    return len(base64.b64encode(text.encode())) > OSC52_MAX_B64
+
 
 def _local_tool(text: str) -> str | None:
     for tool, cmd in (("pbcopy", ["pbcopy"]),
@@ -43,6 +53,15 @@ def copy(text: str) -> str:
         if tool:
             return tool
     if _osc52(text):
+        # R235: OSC52 is the ONE path that silently drops data — it caps the
+        # payload, and being fire-and-forget it can't report that back. The
+        # docstring above names "a full session export" as a normal large
+        # copy, and such an export sails past the cap, so reporting a bare
+        # success handed the user a truncated paste with nothing to notice.
+        if _osc52_would_truncate(text):
+            return ("OSC52 (terminal) — TRUNCATED, only the first ~75KB was "
+                    "sent (terminals cap OSC52); use a local clipboard tool "
+                    "or write to a file for the whole thing")
         return "OSC52 (terminal)"
     if over_ssh:
         tool = _local_tool(text)   # remote-side tool: last resort
@@ -56,7 +75,7 @@ def _osc52(text: str) -> bool:
     # render the escape sequence as visible garbage. Write straight to the
     # controlling terminal; fall back to the REAL process stdout when there
     # is no /dev/tty (and only if it's an actual terminal).
-    payload = base64.b64encode(text.encode())[:100_000]  # terminals cap ~100KB
+    payload = base64.b64encode(text.encode())[:OSC52_MAX_B64]
     seq = f"\x1b]52;c;{payload.decode()}\x07"
     try:
         with open("/dev/tty", "w") as tty:

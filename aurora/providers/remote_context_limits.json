@@ -8,18 +8,20 @@
     "price_out_per_mtok": 15.0,
     "pricing_url": "https://openrouter.ai/moonshotai/kimi-k3#pricing",
     "description": "Kimi K3 is a 2.8T parameter open-weight multimodal reasoning model from Moonshot AI. It is suited for complex coding, knowledge work, and long-horizon agentic workflows, and is particularly strong at...",
-    "refreshed_at": 1786309779.826
+    "price_cache_read_per_mtok": 0.3,
+    "refreshed_at": 1787736150.348
   },
   {
     "model": "moonshotai/kimi-k2.7-code",
     "provider": "openrouter",
     "code": "kimi-k2.7-code",
     "context_size": 262144,
-    "price_in_per_mtok": 0.7,
-    "price_out_per_mtok": 3.5,
+    "price_in_per_mtok": 0.67,
+    "price_out_per_mtok": 3.4,
     "pricing_url": "https://openrouter.ai/moonshotai/kimi-k2.7-code#pricing",
     "description": "MoonshotAI: Kimi K2.7 Code is a coding-focused model in Moonshot AI's Kimi K2 family, built to complete end-to-end programming tasks reliably over long contexts. It uses a native multimodal mixture-of-experts...",
-    "refreshed_at": 1786309779.826
+    "price_cache_read_per_mtok": 0.19,
+    "refreshed_at": 1787736150.348
   },
   {
     "model": "z-ai/glm-5.2",
@@ -70,7 +72,8 @@
     "price_out_per_mtok": 15.0,
     "pricing_url": "https://openrouter.ai/anthropic/claude-sonnet-4.6",
     "description": "Sonnet 4.6 is Anthropic's most capable Sonnet-class model yet, with frontier performance across coding, agents, and professional work. It excels at iterative development, complex codebase navigation, end-to-end project management with...",
-    "refreshed_at": 1786309779.826
+    "price_cache_read_per_mtok": 0.3,
+    "refreshed_at": 1787736150.348
   },
   {
     "model": "openai/gpt-5.6-luna",

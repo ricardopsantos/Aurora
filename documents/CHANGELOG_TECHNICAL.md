@@ -8074,3 +8074,343 @@ All three fail without the fix.
 Cross-references bumped in this commit (per `ChangeWorkflow.md`):
 `README.md`'s "currently through R__" line, R217 → R218, and
 `documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R219. Queued input while the worker is busy echoed with no feedback, looking silently broken — `tui.py` (2026-08-25)
+
+Real incident: a `wait_until` tool call ran to its full timeout (up to 300s,
+`tools.py:527`), and typing `/context` twice during that wait appeared to do
+nothing — no error, no output. `_worker()` (`tui.py:2849`) is the sole
+consumer of `self._inbox`, one line at a time; every submit path (`_submit`'s
+Enter handler, the `!bash` line, and the status-bar's `/undo`/`/context`/`/cost`
+click handlers) echoes the line into the transcript and pushes it onto the
+inbox immediately, regardless of whether the worker is still busy on a prior
+turn. The echo looks identical whether the worker is free or wedged for
+minutes, so a slow turn made every queued command look dropped.
+
+Added `Tui._note_if_busy()`: checked right after each echo, right before each
+`self._inbox.put(...)`, at all five call sites above. When `self._busy` is
+True it appends a dim `"  (queued — still running previous command)\n"` note
+so a queued line reads as queued, not lost.
+
+Tests: `test_cost_tree_click_notes_the_queue_while_worker_busy`,
+`test_cost_tree_click_no_queue_note_when_worker_idle`.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R218 → R219, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+### R220. `apply_patch` silently no-opped the deletion of an isolated blank line — `patch.py` (2026-08-26)
+
+`apply()` skipped a hunk when `h.old == h.new`, comparing the JOINED strings.
+A removal-only hunk consisting of a single blank line has `old_lines == [""]`
+and `new_lines == []` — different lists, but `"\n".join(...)` collapses both
+to `""`, so the strings matched and the deletion was skipped while the tool
+reported success. `Hunk` now carries `changed`, computed at parse time from
+`old_lines != new_lines` (the lists, before joining), and `apply()` keys off
+that instead.
+
+### R221. `secrets.redact()` leaked part of a secret on overlapping matches — `secrets.py` (2026-08-26)
+
+Matches from `scan()` never overlap — its claim bitmap guarantees that — but
+`redact()` is a public function a caller can hand anything. A match nested
+inside an earlier one made `pos` jump BACKWARD to the inner match's end, and
+the next slice `text[pos:start]` then re-emitted the tail of the outer secret
+verbatim around the inner `<secret>` marker: exactly the leak the function
+exists to prevent. A match already covered by `pos` is now skipped, and a
+partially-overlapping one is clamped to start no earlier than `pos`.
+
+### R222. `compact.flatten_history` rendered a null `content` as the string "None" — `compact.py` (2026-08-26)
+
+`content` is `None` for a tool-calls-only assistant message — the ordinary
+OpenAI shape, where text and `tool_calls` are independent fields. `str(None)`
+turned that into the literal four characters "None", so the flattened
+transcript carried a visible `Assistant: None` line for a turn where the
+assistant said nothing, and `_msg_tokens` overcounted every such message.
+Added `_stringify`, which maps `None` to `""`.
+
+### R223. Ollama as a configured provider (`type: ollama`) — `providers/openai_compat.py` (2026-08-26)
+
+A `config.yaml` provider entry with `type: ollama` talks to a local/LAN
+Ollama server: `_probe` checks Ollama's own root route rather than
+llama.cpp's `/props` (which Ollama does not implement and would always 404);
+`live_context_limit(model)` reads the real trained window from `/api/show`
+for any installed model instead of being gated on llama.cpp's `model ==
+"local"` sentinel; `live_model_name()` returns `None` (Ollama can hold
+several models resident, so "which one" needs `GET /api/ps` and a real
+concept behind it); no API key is required or sent when the config has none;
+and chat turns need no Ollama-specific branch in `turn()`, since its
+OpenAI-compatible endpoint is handled by the existing streaming/delta
+parsing. A provider with no `type:` uses `/props` exactly as before.
+
+Verified live against a real Ollama server on m7 rather than mocked HTTP —
+see the full entry, including the "capabilities says tools but the model
+never emits one" caveat, in the repo-root `REQUIREMENTS.md`.
+
+### R224. Ollama models showed a false ✘ remote-API status and paid needless `cache_control` overhead — `engine.py`, `man.py` (2026-08-26)
+
+An Ollama provider is local, so the remote-API reachability indicator did not
+apply to it and rendered a misleading ✘, and prompt-cache `cache_control`
+blocks were attached to requests that no local backend consumes.
+
+### R225. `mdrender` header lines dropped a trailing newline — `mdrender.py` (2026-08-26)
+
+`_HEADER`'s `(.*)$` does not consume a trailing `"\n"` (`.` is not DOTALL and
+`$` matches right before it), so the header branch — unlike every other
+branch, which preserves whatever trailing content `line` carried — silently
+dropped it. Invisible only because `ui.py`'s caller strips the newline before
+calling and re-appends it after, an unstated assumption the function should
+not impose on every caller. Also added direct tests for previously untested
+modules.
+
+### R226. `skills.discover()` crashed on an unreadable skills directory — `skills.py` (2026-08-26)
+
+`discover()` runs behind the `/command` completer, once per keystroke (R96a).
+A directory that passed `_dirs()`'s `is_dir()` check can still fail to list
+by the time `iterdir()` runs (permissions changed, removed) — the same TOCTOU
+race `dir_stamp()` already guarded against. An unguarded `OSError` there did
+not merely skip one skill, it crashed the whole listing on every keystroke
+until the directory was fixed. Now caught per directory.
+
+### R227. An extension name collision paired one extension's spec with another's runner — `extensions.py` (2026-08-26)
+
+`load()` built the name→runner map with `.update()`, letting the LAST-loaded
+extension win a name collision, while `tools.set_extensions()` (which dedupes
+`specs`) keeps the FIRST spec for that name. A colliding name therefore
+advertised the first extension's description and parameters while running the
+second extension's code. The approval gate and the model's own tool-call
+decision are both based on the spec a name is shown with, so this broke that
+invariant with no visible sign beyond a generic "duplicate skipped" warning.
+`setdefault` makes the runner map first-wins too, matching `specs`' append
+order and `set_extensions()`'s own dedup direction.
+
+### R228. `key_status()` falsely reported "not set" on a stale cached passphrase — `keystore.py` (2026-08-26)
+
+With an encrypted key store present and a cached passphrase that fails to
+decrypt it (stale after an external re-encryption, or another session sharing
+AURORA_HOME), `key_status` swallowed the decrypt failure and fell through to
+a flat "not set" — indistinguishable from no store existing at all, and
+confidently wrong with the file right there. It now returns the same
+"possibly set (encrypted file — enter passphrase to confirm)" answer the
+no-cached-passphrase case gets.
+
+### R229–R236. Deep-dive pass: durability, silent data loss, and a false-negative in the secret scanner — `paths.py`, `clipboard.py`, `patch.py`, `compact.py`, `gitcommit.py`, `ui.py`, `secrets.py`, `session.py`, `providers/happy_eyeballs.py` (2026-08-26)
+
+One file-by-file review pass. Each item is a separate requirement; they share
+a heading because they came from the same pass, per the R-number conventions
+above. Full statements in the repo-root `REQUIREMENTS.md`.
+
+**R229 — `compact.clip_transcript` overran its own budget.** The elision
+marker was spliced in AFTER head and tail had already consumed the whole
+limit, so the one function whose job is making an over-sized request fit
+returned ~90 characters more than asked, every time. At a nearly-exhausted
+budget that is most of it — and a nearly-exhausted budget is exactly when it
+is called. The marker now counts against the budget (`_clip_marker`, sized
+off `len(text)` as an upper bound on the digit count); when head, tail and
+marker cannot fit together the bound wins and the text is hard-truncated.
+Also: `flatten_history`'s `tool` branch still used the raw `.get` and printed
+the literal "None" — R222's own rule, missed in R222's own file.
+Tests: `test_clip_transcript_never_exceeds_the_requested_budget`
+(parametrized), `test_clip_transcript_hard_truncates_when_the_marker_cannot_fit`,
+`test_flatten_history_renders_a_null_tool_result_as_empty`.
+
+**R230 — `/commit`'s staging step raised a traceback.** `gitcommit.stage_all`
+ran with `check=True` and `_commit_cmd` caught nothing, so an ordinary git
+failure — a stale `index.lock` from a crashed git, an unreadable path, a
+timeout on a large tree — raised `CalledProcessError` out of the slash
+command, and nothing stopped the flow from drafting a message for an index
+that was never staged. It now raises `gitcommit.GitError` (declared in the
+module since R101 but raised nowhere) carrying git's stderr, and `/commit`
+aborts with a printed reason. Tests:
+`test_stage_all_raises_giterror_when_git_add_fails`,
+`test_stage_all_raises_giterror_when_git_cannot_run`,
+`test_stage_all_succeeds_quietly_in_a_real_repo`.
+
+**R231 — the secret scanner's timestamp exemption did not check a date.**
+`_is_date_or_timestamp` was `^\d{4}[-_]?\d{2}[-_]?\d{2}`, which asks only
+whether a token STARTS with eight digits, so any numerically-prefixed token
+(`99999999aB3xY7q…` — month 99, day 99) was written off as a dated filename
+and skipped by the entropy pass entirely. That is a false NEGATIVE in a
+detector, the one direction that matters: the value goes to the provider with
+no challenge, whereas a false positive only costs a prompt. Month, day and
+century are now constrained; every real dated filename still matches. Tests:
+`test_date_guard_rejects_an_impossible_month_and_day`,
+`test_date_guard_still_accepts_real_dated_filenames`,
+`test_a_token_with_a_non_date_numeric_prefix_is_scanned`,
+`test_a_real_timestamped_filename_is_still_not_flagged`.
+
+**R232 — the session record reached the file outside the flock.**
+`Session.log` took `LOCK_EX`, called `f.write()`, then unlocked — but
+`f.write()` only fills Python's buffer; the `write()` syscall happens at
+flush, which the `with` block performed AFTER `LOCK_UN`. R170f's lock
+therefore serialized nothing that actually touched the file. For a record
+larger than the 8KB buffer — a tool result, i.e. most of a session log's
+bytes — the writer flushed whole chunks under the lock and left the remainder
+to flush after it, so a second process resumed onto the same session id could
+append between those chunks and produce a physically interleaved, unparseable
+line: the exact corruption the lock was added to prevent. The flush is now
+inside the locked region. Test:
+`test_log_flushes_before_releasing_the_lock` (verified to fail without the
+fix — the recorded order is `['lock', 'unlock']`, no flush at all).
+
+**R233 — Happy Eyeballs truncated the sockaddr on its single-address path.**
+`happy_eyeballs_connect`'s `len(addrs) == 1` shortcut called
+`socket.create_connection(sa[:2], …)`. `getaddrinfo` returns an IPv6 sockaddr
+as `(addr, port, flowinfo, scope_id)` with the scope in `sa[3]` and no
+`%iface` suffix on `sa[0]`, so the slice discards the scope id and the kernel
+rejects the result with EINVAL — a link-local IPv6 host was unreachable
+whenever it resolved to exactly one address, while the racing path (which
+passes the full sockaddr) reached it. It also re-resolved the hostname a
+second time and ignored the family already selected. Both paths now share
+`_connect_one`. Tests:
+`test_single_address_shortcut_preserves_the_full_ipv6_sockaddr`,
+`test_single_address_shortcut_does_not_re_resolve_the_host`.
+
+**R234 — `write_bytes_atomic` never fsynced its parent directory.** R171/I6
+established that the rename publishing a temp file is a separate
+directory-metadata write, and that losing it on a power failure resurrects
+the OLD contents. That step lived inline in `write_text_atomic` only, leaving
+`write_bytes_atomic` — the writer the encrypted key store uses, i.e. the one
+file whose loss is unrecoverable, since nothing else holds the plaintext —
+without the guarantee. The step is now shared as `paths._fsync_dir` so the
+two writers cannot drift apart again. The pre-existing test asserted
+`len(synced) == 1` with the comment "unlike write_text_atomic, no directory
+fsync here", pinning the missing durability in place rather than flagging it;
+it now asserts both fsyncs. Tests:
+`test_write_bytes_atomic_fsyncs_the_file_contents` (updated),
+`test_write_bytes_atomic_fsyncs_the_parent_directory` (ordering:
+fsync-file → replace → fsync-dir).
+
+**R235 — a truncated clipboard copy reported success.** `clipboard.copy`
+returns the human description the caller shows as its confirmation. OSC52
+caps its payload at `OSC52_MAX_B64` base64 bytes (~75KB of text) and, being
+fire-and-forget, cannot report the drop itself — so a copy that overran the
+cap returned a clean `"OSC52 (terminal)"` while silently discarding
+everything past it. Reachable in normal use: over SSH, OSC52 is the FIRST
+choice, and a `/copy-all` session export routinely exceeds the cap, so the
+user pasted a cut-off file with nothing to notice. `copy` now detects the
+overflow up front and names it in the description. The base64 cut stays
+4-byte aligned so what does arrive decodes cleanly. Tests:
+`test_copy_reports_truncation_when_osc52_drops_the_tail`,
+`test_copy_does_not_claim_truncation_for_a_small_payload`,
+`test_osc52_would_truncate_*`.
+
+**R236 — `patch.parse` ended a hunk body at ordinary content.** The body loop
+stopped at any line starting with `---`/`+++`, which cannot distinguish a
+file header from hunk CONTENT: removing a line whose text is `---` renders as
+`----`, and `"----".startswith("---")` is True. The hunk was cut off there
+and the rest of it discarded, breaking the module's central all-or-nothing
+guarantee two ways, both reporting success — a deletion-only hunk collapsed
+to pure context and applied nothing, and a mixed hunk applied its earlier
+edits while silently dropping everything after the `---`. Since `---`/`+++`
+are markdown horizontal rules and YAML front-matter delimiters, this is
+reachable on ordinary documents, this repo's own included. A file header is
+now recognised as the PAIR `--- <path>` followed by `+++ <path>` (marker then
+a space), or a `diff …` section line. As a side effect, `git diff` output
+carrying `diff --git`/`index` lines now parses too — the old prefix check
+rejected it outright with "bad line". Tests:
+`test_removing_a_yaml_front_matter_delimiter_is_not_dropped`,
+`test_a_hunk_is_not_truncated_at_a_removed_rule_leaving_a_partial_apply`,
+`test_adding_a_line_of_plus_signs_is_not_treated_as_a_file_header`,
+`test_removing_a_double_dash_line_is_not_treated_as_a_file_header`,
+`test_real_file_headers_still_end_a_hunk_body`,
+`test_a_git_diff_section_line_ends_a_hunk_body`.
+
+Cross-references bumped in this commit (per `ChangeWorkflow.md`):
+`README.md`'s "currently through R__" line, R219 → R236, and
+`documents/ARCHITECTURE.md`'s two `R1–R__+` spans.
+
+Process note: R220–R228 were allocated by commits on 2026-08-26 without
+CHANGELOG_TECHNICAL entries, so this file — the canonical spec, which
+`README.md` says wins when any doc disagrees — was nine requirements behind
+while `README.md` still advertised "through R219". Those entries are
+back-filled above. Neither this file nor a code grep was a safe place to read
+the next free number from (R224 and R225 left no `R<n>` string in any `.py`);
+`git log --format=%s | grep -oE 'R[0-9]+' | sort -t R -k2 -n | tail -1` is
+the reliable high-water mark, and `REQUIREMENTS.md` now says so.
+
+### R237–R243. Bootstrap fetch cap, extension/env/durability hardening — `bootstrap.py`, `extensions.py`, `providers/mcp.py`, `rewind.py`, `patch.py`, `commands.py`, `tools.py`, `lint.py` (2026-08-26)
+
+Another single-pass review; each item is a separate requirement sharing a
+heading per the R-number conventions above. Full statements in the
+repo-root `REQUIREMENTS.md`.
+
+**R237 — the bootstrap prompt fetch was unbounded and non-atomic.**
+`fetch_url` read the whole response body into memory with no cap, and it
+runs every session against a URL that is re-fetched at startup — an
+oversized or hijacked body recurs on every run. Now streamed with the same
+512KB cap `web_extension.web_fetch` already uses. `save()` and
+`refresh_from_source()` also wrote `bootstrap.md` and its `.source` sidecar
+with plain `write_text`, so a crash mid-write left a truncated prompt that
+the next session runs with tools; both now go through `write_text_atomic`.
+
+**R238 — a named extension tool with no runner was silently advertised
+and permanently uncallable.** `set_extensions` already guarded a nameless
+spec for exactly this reason, but a named spec missing its `RUNNERS` entry
+— a tool renamed in `SPEC` but not `RUNNERS`, or a typo in a `RUNNERS` key
+— reached the model anyway; every call then got `[error: unknown tool]`
+with no explanation, and the model could burn its whole iteration budget
+retrying. Only the unpaired spec is now dropped, so one typo doesn't
+disable the extension's other tools. Also: `extensions.scaffold` now
+writes atomically (R207 fixed only the encoding half of the truncated
+0-byte `.py` it names).
+
+**R239 — the MCP child-env denylist missed half of each interpreter's
+injection variables.** `_ENV_DENYLIST` covered the loader vars but, per
+interpreter, only one of each path/option pair — `PERL5LIB` but not
+`PERL5OPT`, `RUBYOPT` but not `RUBYLIB`, and for Python only
+`PYTHONSTARTUP` (interactive-mode only, so it never applied to a spawned
+server) while `PYTHONPATH` — which prepends to `sys.path` and can shadow a
+stdlib import — was absent entirely. A stdio MCP server is very often
+Python; this repo's own `agentic_context_mcp` entry runs one. Verified end
+to end: a `json.py` on `PYTHONPATH` executed in a child running
+`python3 -c "import json"`, and does not after the fix. Also adds
+`PYTHONHOME`, `PYTHONEXECUTABLE`, `PERLLIB` and the Java entries.
+
+**R240 — the pre-write snapshot read the whole file before checking the
+size cap.** `snapshot_before_write` did `read_bytes()` and only THEN
+compared `len(data)` to `MAX_SNAPSHOT_BYTES`, so the cap bounded what was
+stored but not the allocation — on a function that sits on the approval
+path with the model choosing the target file. Measured: a 63MB file peaked
+at 63MB before a 21MB cap rejected it; now 0 (checked from `stat()` first,
+`len()` kept as a fallback for a file that grows in between). The undo
+marker was also written with `write_text`, which truncates first — the
+same hazard R193's `_atomic_write_bytes` exists to prevent; a crash
+mid-write now can't leave a half-written marker while the mutation it
+records goes ahead.
+
+**R241 — the model's own file mutations were not written atomically.**
+`write_file`, `edit_file` and `apply_patch` used `Path.write_text`, which
+truncates before writing, so a crash, `ENOSPC` or a kill mid-write left the
+user's source file truncated or empty — the forward (editing) path had none
+of the protection `rewind._atomic_write_bytes` (R193) already gives the
+reverse (undo) path. A naive swap to `write_text_atomic` would have
+regressed two things, both verified first: `os.replace` adopts `mkstemp`'s
+0600 (turning an executable script into a private non-executable file) and
+swaps a symlink for a regular file (orphaning the real target). Now uses
+`paths.write_text_preserving`, which keeps the existing mode, resolves
+symlinks before replacing, and leaves a brand-new file at the umask rather
+than 0600.
+
+**R242 — a versioned interpreter binary bypassed the dangerous-command
+check.** `_is_dangerous` matched `DANGEROUS_COMMANDS` by exact basename, so
+`python3` was caught but `python3.11` — the standard binary name on most
+Linux distros and Homebrew — was not, reopening R149's own worst case:
+approving a harmless `python3.11 -c "print(1)"` stored the two-token rule
+`python3.11 -c`, after which `python3.11 -c "<anything>"` was
+auto-approved forever with no prompt. Verified end to end before the fix
+(the evil payload came back `is_allowed=True`) and after (`False`, approved
+command still passes). A trailing version suffix is now stripped before the
+membership test, covering `python2.7`/`python3.13`/`perl5.36`/`node20`/
+`pip3.11` without enumerating releases; `gcc-13`, `sha256sum` and `base64`
+are unaffected since the strip only matters when the stem itself is in the
+set.
+
+**R243 — the ungated lint fallback wrote files with no approval.**
+`lint_check` runs with no approval prompt (not in `NEEDS_APPROVAL`, not an
+`mcp_*` name), and its no-ruff fallback shelled out to
+`python -m py_compile`, which writes `__pycache__/<name>.cpython-XY.pyc`
+next to the source — an unapproved tool creating files in the user's tree,
+dirtying a clean repo and failing on a read-only directory. Verified:
+linting a one-line file left a `__pycache__` directory behind. Replaced
+with the built-in `compile()` on the source text: same syntax check, in
+process, no write and no interpreter spawn per call.

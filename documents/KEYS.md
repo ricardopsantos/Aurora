@@ -8,6 +8,7 @@ encrypted file — never plaintext on disk):
 | Key | What it unlocks | Where to get it |
 |---|---|---|
 | `LLAMA_API_KEY` | your local llama.cpp server, if it requires one | wherever you configured it (leave unset if your server needs no key) |
+| — | Ollama (`type: ollama` in `config.yaml`) | no key needed at all — omit `api_key_env` entirely |
 | `OPENROUTER_API_KEY` | OpenRouter models (paid) | [openrouter.ai/keys](https://openrouter.ai/keys) |
 
 ```bash

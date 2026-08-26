@@ -1,11 +1,53 @@
 # Changelog
 
-Aurora's version is `1.1.<commit-count>` (the `1.0.` prefix was used through
-release 1.0.185; R114 bumped it to `1.1.`), pinned at the point each release
-was published — check `aurora --man` or `python3 -c "import aurora;
+Aurora's version is `1.2.<commits since the last deploy>` (the `1.0.` prefix
+was used through release 1.0.185, R114 bumped it to `1.1.<total commit
+count>`, and the patch number switched from a running total to a per-release
+counter — reset at deploy time — as of 1.2.0), pinned at the point each
+release was published — check `aurora --man` or `python3 -c "import aurora;
 print(aurora.__version__)"` for what you're actually running. For the full
 numbered requirements record, see `CHANGELOG_TECHNICAL.md` (formerly
 `AURORA.md`).
+## 1.2.42 (2026-08-26)
+
+A hardening release — two review passes went through the codebase looking
+for the same class of mistake in more than one place: data written without
+protection against a crash mid-write, and safety checks that could be
+stepped around by a name they didn't expect.
+
+### Changed
+- **Version numbering.** The patch number is now commits *since the last
+  deploy*, not a running total since the project began. `1.1.351` was the
+  last release under the old scheme; this release is `1.2.42` — 42 commits
+  landed since then.
+
+### Fixed
+- **Several places could lose or corrupt data on a crash, kill, or full
+  disk mid-write.** The bootstrap prompt, the undo snapshot marker, and —
+  most importantly — the model's own file edits (`write_file`, `edit_file`,
+  `apply_patch`) were written in a way that could leave a truncated or
+  empty file behind if the write was interrupted. All of these now write
+  atomically, matching the protection `/undo` already had.
+- **A dangerous-command check could be bypassed by a versioned interpreter
+  name.** Approving a harmless `python3.11 -c "print(1)"` could silently
+  auto-approve any future `python3.11 -c "<anything>"` — `python3` alone was
+  checked, not `python3.11`. Versioned interpreter names are now recognized
+  the same as the bare name.
+- **A linting fallback could write files into your project with no approval
+  prompt.** Linting without `ruff` installed left `__pycache__` files behind
+  as a side effect of a supposedly read-only check; it now does the same
+  check without spawning a process or touching disk.
+- **A named extension tool with a missing handler was silently unusable.**
+  The model could burn its whole reply retrying a tool that always answered
+  "unknown tool" — now that tool is dropped instead of advertised.
+- **MCP servers could have modules injected via environment variables**
+  Aurora didn't strip (`PYTHONPATH` and several interpreter-specific
+  variants) — closing a gap next to the checks already in place for other
+  loader variables.
+- An unbounded background prompt fetch and an oversized undo-snapshot read
+  were also fixed; see `CHANGELOG_TECHNICAL.md` (R220–R243) for the full
+  list.
+
 ## 1.1.350 (2026-08-25)
 
 ### Fixed

@@ -32,6 +32,10 @@ Full command reference behind the [README](../README.md)'s quick-start list.
 | `/copy-last` | copy last turn's RAW record — prompt, thinking, and response — to clipboard, SSH-safe — also `copy last` in the status bar's `copy` picker |
 | `/copy-all` | copy the whole session transcript (questions + answers, no thinking) to clipboard, SSH-safe — also `copy whole session transcript` in the status bar's `copy` picker |
 | `/rewind [id]` | list checkpoints taken before every approved write/edit/command and restore one — restoring is itself checkpointed, so it can be undone |
+| `/undo` | revert just the LAST mutation rather than the whole tree (`/rewind`'s narrower sibling). Always previews the diff and NAMES the affected paths before asking, so "that's not the file I meant" is catchable before confirming, not after |
+| `/diff` | show what the last turn actually changed, against its pre-mutation checkpoint |
+| `/commit [message]` | stage, draft a commit message from the staged diff with the current model, show it, and commit on approval. With nothing staged it lists the unstaged/untracked changes and asks before `git add -A`; the confirm menu offers Yes / Edit the message / Cancel (cancel leaves changes staged). Pass a message to skip the drafting step. Operates on the REAL project `.git`, never `/rewind`'s shadow repo |
+| `/nano <file>` | open a text file in the built-in editor — `.txt`/`.md`/`.json`/`.yml`/`.yaml`/`.xml`/`.sh`, up to 1MB. TUI only |
 | `/allowlist` | review the persistent approval allowlist |
 | `/denylist` | review tool calls always denied by policy (set via the approval prompt's "Always DENY") — never asked again, no allowlist bypass |
 | `/resume` · `/export` | pick a past session · dump conversation as markdown |

@@ -58,11 +58,25 @@ _ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "SHELL",
 # return. No legitimate MCP server config needs to SET one of these on its
 # own child — always stripped, never just filtered by allowlist membership,
 # so a user typo can't reintroduce it the way it could for HOME/USER above.
+# R239: the interpreter entries were incomplete, and lopsidedly so — Perl's
+# PATH variable (PERL5LIB) and Ruby's OPTION variable (RUBYOPT) were listed,
+# but for each language only one of that pair was. The gaps below are all
+# code execution in the child, and the Python ones matter most: a stdio MCP
+# server is very often a Python process (this repo's own `agentic_context_mcp`
+# entry runs one), and `PYTHONSTARTUP` — the only Python name previously
+# listed — is read ONLY in interactive mode, so it does nothing to a spawned
+# server. `PYTHONPATH` prepends a directory to `sys.path`, so a module placed
+# there shadows a stdlib or third-party one and runs at import, before the
+# server's own first line. Verified end to end: a `json.py` on PYTHONPATH
+# executed in a child running `python3 -c "import json"`.
 _ENV_DENYLIST = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
                  "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
                  "DYLD_FRAMEWORK_PATH", "DYLD_FALLBACK_LIBRARY_PATH",
                  "DYLD_FALLBACK_FRAMEWORK_PATH", "BASH_ENV", "ENV",
-                 "PYTHONSTARTUP", "NODE_OPTIONS", "PERL5LIB", "RUBYOPT",
+                 "PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME",
+                 "PYTHONEXECUTABLE", "NODE_OPTIONS", "PERL5LIB", "PERL5OPT",
+                 "PERLLIB", "RUBYOPT", "RUBYLIB", "CLASSPATH",
+                 "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
                  "GCONV_PATH")
 
 

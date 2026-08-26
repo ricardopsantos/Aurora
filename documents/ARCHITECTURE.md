@@ -2,7 +2,7 @@
 
 Reference doc for how the pieces fit together. `CHANGELOG_TECHNICAL.md`
 (formerly `AURORA.md`) is the numbered requirements/spec (the *what* and
-*why*, R1–R218+); this is the *how* — module
+*why*, R1–R243+); this is the *how* — module
 map, data flow, boundaries, and the mechanisms worth understanding before
 touching them. Update this file whenever a change alters one of these shapes,
 not just when adding a requirement.
@@ -26,8 +26,9 @@ UI (tui.py / ui.py)  ──drives──>  Engine (engine.py)  ──drives──
   human goes through a `Frontend`.
 - **`frontend.py`** defines the `Frontend` Protocol — the ONLY vocabulary
   shared between the two halves: `on_text`, `on_think`, `on_tool_start`,
-  `on_tool_result`, `notify`, `approve`, `ask_continue`, `ask_secret`,
-  `secret_challenge`, `cancelled`. If the engine ever needs a new kind of
+  `on_tool_result`, `on_usage`, `notify`, `invalidate_status`, `approve`,
+  `ask_continue`, `ask_secret`, `secret_challenge`, `cancelled`. If the
+  engine ever needs a new kind of
   human interaction, it is added here first, then every front end
   implements it.
 - **Two front ends today**, both implementing `Frontend`: `tui.py` (full-screen
@@ -313,20 +314,29 @@ window after switching away) raises, and any handler exception kills
 library handler we don't own: check the precondition, swallow if absent.
 Any future float/control built on a library class needs the same scrutiny.
 
-## 5. Persistence — three DIFFERENT files, on purpose
+## 5. Persistence — several DIFFERENT stores, on purpose
 
 | File | Lives in | What | Written by |
 |---|---|---|---|
 | `config.yaml` | repo (committed, synced) | providers, models, `runtime.*` defaults incl. `secret_allowlist` (SHA-256 hashes only — see §7) | `persist_runtime_value()` — `/redact`, `/redact allowlist [clear]`, `/multiline` (`/max` was removed, see §8) |
 | `AURORA_HOME/state.yaml` | per-machine | `last_model`/`last_provider` (R51) | `config.save_state_values()` |
 | `AURORA_HOME/allowlist.yaml` | per-machine | tool-approval "always" rules (unrelated to the secret allowlist above — same word, two different features) | `approve.add_rule()` |
-| `AURORA_HOME/sessions/<id>.jsonl` | per-machine | every turn/tool/approval, append-only | `Session.log()` |
+| `AURORA_HOME/denylist.yaml` | per-machine | tool-approval "always DENY" rules — never asked again, and no allowlist rule can bypass one | the approval prompt's *Always DENY* |
+| `AURORA_HOME/sessions/<id>.jsonl` | per-machine | every turn/tool/approval, append-only. Past `session.SESSION_LOG_MAX_BYTES` (5MB) a session CONTINUES in `<id>.2.jsonl`, `<id>.3.jsonl`, … — one session id maps to a *sequence* of parts, oldest first, and every reader in `session.py` walks that sequence via `_parts_for()`. Nothing is ever deleted; only which file a record lands in changes | `Session.log()` |
+| `AURORA_HOME/keys.enc` + `keys.salt` | per-machine | the opt-in Fernet-encrypted key store and its PBKDF2 salt — see the keyring note at the end of this section | `keystore._encfile_save()` via `paths.write_bytes_atomic` (mode `0600`) |
+| `AURORA_HOME/bootstrap.md` | per-machine | the saved global bootstrap prompt; a project's `.aurora/bootstrap.md` overrides it | `/bootstrap set` |
 | `AURORA_HOME/checkpoints/<hash>/` | per-machine | shadow git repo, pre-mutation snapshots (R47), capped at `rewind.RETENTION` (R151) | `rewind.checkpoint()` |
 
-**Every one of these YAML files is written atomically** (R146a —
-`paths.write_text_atomic`: sibling temp file, `fsync`, `os.replace`). A plain
-`write_text()` over the live file truncates it first, so a crash mid-write
-left `config.yaml` empty and `load_config` failing at the next start. Any new
+**Every one of these files is written atomically** — `paths.write_text_atomic`
+for the YAML (R146a), `paths.write_bytes_atomic` for the key store (R201) —
+both being: sibling temp file, `fsync`, `os.replace`, then `_fsync_dir` on the
+parent directory (R171/I6, R234). A plain `write_text()` over the live file
+truncates it first, so a crash mid-write left `config.yaml` empty and
+`load_config` failing at the next start; and without the directory fsync a
+power loss can drop the *rename* itself and resurrect the previous contents,
+which for `keys.enc` means every stored key. The two writers share
+`_fsync_dir` precisely so they cannot drift apart — they had, and
+`write_bytes_atomic` (the key store's writer) was the half missing it. Any new
 persisted file gets the same treatment.
 
 **Only the checkpoints directory has a retention policy** (R151 — `RETENTION`
@@ -365,10 +375,13 @@ allowlist doesn't persist across sessions" even though the file itself was
 fine. For a `SAFE_COMMANDS` entry, `add_rule()` stores just the bare command
 name and `is_allowed()` prefix-matches it regardless of args.
 
-**Stored API keys live OUTSIDE `AURORA_HOME` entirely** (R60) — the OS
-keyring (macOS Keychain/SecretService via `keyring.{get,set,delete}_password`)
-is a SEPARATE store, keyed by service name `"aurora-agent"`, not a file under
-`AURORA_HOME`. This is why `aurora wipe` clears keyring entries FIRST
+**The OS keyring lives OUTSIDE `AURORA_HOME` entirely** (R60) — macOS
+Keychain / SecretService via `keyring.{get,set,delete}_password`, a SEPARATE
+store keyed by service name `"aurora-agent"`, not a file under `AURORA_HOME`.
+Note the qualifier: this is true of the KEYRING backend, not of key storage
+in general. The opt-in fallback — `keys.enc` in the table above — *is* a file
+under `AURORA_HOME`, which is why `aurora wipe` destroys it along with
+everything else. This is why `aurora wipe` clears keyring entries FIRST
 (`keystore.clear_key` for every `api_key_env`/`token_env` this config.yaml
 uses — `_known_key_names()`, not a hardcoded list) and only THEN deletes the
 `AURORA_HOME` directory: `rm -rf`ing the directory alone would leave stored
@@ -565,7 +578,7 @@ not Esc) and a stale arm must never silently fire on an unrelated later Esc.
 
 ## Where to look next
 
-- **Requirements** (R1–R218+, the numbered spec with dates and rationale):
+- **Requirements** (R1–R243+, the numbered spec with dates and rationale):
   `CHANGELOG_TECHNICAL.md`.
 - **User-facing feature list**: `README.md` → "Daily use" and "Esc, the
   double-tap control key".

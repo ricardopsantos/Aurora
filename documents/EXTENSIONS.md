@@ -95,7 +95,8 @@ partly inspired by).
 
 ## Bundled extensions
 
-Aurora ships two extensions by default, in `aurora/extensions_bundled/`.
+Aurora ships four extensions by default, in `aurora/extensions_bundled/`:
+the MCP client, web search/fetch, price refresh, and the lint checker.
 
 ### MCP client
 
@@ -162,6 +163,29 @@ Opening `/model` now does the same refresh on its own, in the background and
 at most once a day per model, so this tool is the way to force one *now* —
 past the daily TTL, or when you want the result reported in the chat rather
 than just reflected in the picker's rows.
+
+### Web search & fetch
+
+`web_search(query, max_results=5)` and `web_fetch(url)` —
+`aurora/extensions_bundled/web_extension.py`. Search goes through
+[`ddgs`](https://pypi.org/project/ddgs/) (DuckDuckGo, no API key); fetch is
+`httpx` plus a crude HTML→text pass. Both are **read-only, so neither is
+approval-gated** (R6) — unlike every `mcp_*` tool above.
+
+Two caps keep a hostile or merely enormous page bounded: the body is
+streamed and cut at 2MB (a plain `.get()` would pull an arbitrarily large
+response into memory before anything could truncate it), and the extracted
+text is trimmed to 20 000 characters with an explicit `[truncated]` marker.
+A missing `ddgs` degrades to `[web_search unavailable: ddgs not installed]`
+rather than failing the turn.
+
+Dynamic `register(engine)` rather than a static `SPEC`/`RUNNERS` pair,
+because it honours `runtime.web_search`: with the flag off it contributes
+nothing at all, so the model never sees a tool it isn't allowed to call. A
+static extension loads unconditionally, which would have turned
+`web_search: false` into a no-op. This was `aurora/websearch.py`, wired into
+the engine by name, until R157 moved it out — living in
+`extensions_bundled/` is now the only thing that makes it "built in."
 
 ### Lint checker
 

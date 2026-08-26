@@ -1,7 +1,7 @@
 [project]
 name = "aurora-agent"
 version = "0.1.0"
-description = "Aurora — micro terminal coding agent (Anthropic / OpenRouter / local llama.cpp)"
+description = "Aurora — micro terminal coding agent (Anthropic / OpenRouter / local llama.cpp / local Ollama)"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",

@@ -30,7 +30,16 @@ Diff:
 
 
 class GitError(Exception):
-    pass
+    """R230: a git operation this module could not complete.
+
+    Every other function here is deliberately non-raising (`check=False`,
+    or a blanket `except` returning a text result) so a slash command can
+    never die on a git hiccup. `stage_all` is the exception — it MUTATES the
+    index, so silently swallowing a failure would leave `/commit` reporting
+    success on an empty stage — and it used to leak `git`'s own
+    `CalledProcessError`/`TimeoutExpired` straight through an unguarded call
+    site. This class existed but was never raised anywhere; it is what
+    `stage_all` raises now, so callers have one thing to catch."""
 
 
 # R125d: cap what actually goes to the model, independent of ui.py's
@@ -69,7 +78,18 @@ def unstaged_summary(cwd: str = ".") -> str:
 
 
 def stage_all(cwd: str = ".") -> None:
-    _git(cwd, "add", "-A")
+    """`git add -A`. Raises GitError if the index could not be updated —
+    a stale `index.lock` from a crashed git, an unreadable path, or a
+    timeout on a very large tree are all ordinary, and the caller must not
+    then go on to draft and commit as though staging had worked."""
+    try:
+        r = _git(cwd, "add", "-A", check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise GitError(f"git add failed: {e.__class__.__name__}: {e}") from e
+    if r.returncode != 0:
+        raise GitError("git add failed: "
+                       + ((r.stderr or r.stdout).strip()[:300] or
+                          f"exit {r.returncode}"))
 
 
 def recent_log(cwd: str = ".", n: int = 5) -> str:

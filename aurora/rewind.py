@@ -193,14 +193,32 @@ def snapshot_before_write(path: str, cwd: str = ".") -> None:
         marker = _last_mutation_path(Path(cwd).resolve())
         marker.parent.mkdir(parents=True, exist_ok=True)
         existed = target.is_file()
+        # R240: size-check BEFORE reading. This was `data = read_bytes()`
+        # followed by `len(data) > MAX_SNAPSHOT_BYTES`, which caps what gets
+        # STORED while doing nothing about the read itself — so the memory
+        # spike `MAX_SNAPSHOT_BYTES` was introduced to prevent (see its
+        # comment: "an unbounded read here is a memory spike triggered by
+        # whatever file the model decided to edit") happened in full, and
+        # only then was the result thrown away. Measured: a 63MB file peaked
+        # at 63MB of allocation before being rejected by a 21MB cap. `stat`
+        # answers the question without reading a byte.
+        if existed and target.stat().st_size > MAX_SNAPSHOT_BYTES:
+            raise ValueError("file too large to snapshot")
         data = target.read_bytes() if existed else b""
         if len(data) > MAX_SNAPSHOT_BYTES:
+            # the file grew between the stat and the read
             raise ValueError("file too large to snapshot")
-        marker.write_text(json.dumps(
+        # R240: atomic, for the same reason `_atomic_write_bytes` exists just
+        # above — `write_text` truncates first. A crash mid-write leaves a
+        # half-written marker, and while invalid JSON does fail safe (it
+        # reads back as "no last mutation"), the mutation it was recording
+        # goes ahead regardless, so `/undo` silently has nothing to offer for
+        # a write that did happen.
+        _atomic_write_bytes(marker, json.dumps(
             {"path": str(target), "existed": existed,
              "content_b64": base64.b64encode(data).decode("ascii") if existed
                             else None,
-             "at": time.time()}), encoding="utf-8")
+             "at": time.time()}).encode("utf-8"))
     except Exception:
         # R193: a stale marker from an EARLIER mutation must not survive a
         # failed/skipped snapshot — `undo_preview` would report it as "the

@@ -3,6 +3,7 @@
 import os
 import subprocess
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -572,3 +573,59 @@ def test_the_prune_cadence_is_per_repo_not_process_wide(proj, tmp_path,
     rewind.checkpoint("b0", cwd=str(other))
 
     assert calls == [], "B's first checkpoint must not inherit A's count"
+
+
+# ── R240: the snapshot cap must bound the READ, not just the store ───────
+
+def test_oversized_file_is_not_read_into_memory(tmp_path, monkeypatch):
+    """R240: the cap was applied to `len(data)` AFTER `read_bytes()`, so the
+    memory spike MAX_SNAPSHOT_BYTES exists to prevent happened in full and
+    the result was then discarded. `stat` answers it without a read."""
+    monkeypatch.setattr(rewind, "MAX_SNAPSHOT_BYTES", 1024)
+    target = tmp_path / "big.bin"
+    target.write_bytes(b"x" * 8192)
+
+    reads = []
+    real_read_bytes = Path.read_bytes
+
+    def spy(self):
+        reads.append(str(self))
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", spy)
+    rewind.snapshot_before_write(str(target), cwd=str(tmp_path))
+    assert str(target.resolve()) not in reads      # never read at all
+    assert rewind._read_last_mutation(tmp_path) is None
+
+
+def test_a_file_within_the_cap_is_still_snapshotted(tmp_path):
+    monkeypatch_free = tmp_path / "small.txt"
+    monkeypatch_free.write_bytes(b"original bytes")
+    rewind.snapshot_before_write(str(monkeypatch_free), cwd=str(tmp_path))
+    m = rewind._read_last_mutation(tmp_path)
+    assert m is not None and m["existed"] is True
+    assert rewind._snapshot_bytes(m) == b"original bytes"
+
+
+def test_the_marker_is_written_atomically(tmp_path, monkeypatch):
+    """R240: `write_text` truncates first; a crash mid-write leaves a
+    half-written marker while the mutation it records goes ahead anyway."""
+    calls = []
+    real = rewind._atomic_write_bytes
+
+    def spy(target, data):
+        calls.append(target.name)
+        return real(target, data)
+
+    monkeypatch.setattr(rewind, "_atomic_write_bytes", spy)
+    target = tmp_path / "f.txt"
+    target.write_bytes(b"before")
+    rewind.snapshot_before_write(str(target), cwd=str(tmp_path))
+    assert "last-mutation.json" in calls
+
+
+def test_a_nonexistent_target_still_records_a_creation_snapshot(tmp_path):
+    """The `existed=False` path must not be broken by the new stat guard."""
+    rewind.snapshot_before_write(str(tmp_path / "new.txt"), cwd=str(tmp_path))
+    m = rewind._read_last_mutation(tmp_path)
+    assert m is not None and m["existed"] is False

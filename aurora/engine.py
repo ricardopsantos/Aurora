@@ -32,7 +32,6 @@ from .providers import make_provider
 from .providers.base import ProviderError
 from .session import Session
 
-
 # R156: how much of the window a compaction's INPUT may occupy. The fold has
 # to leave room for the ask's own wrapper, the summary coming back, and the
 # recent tail being kept — half the window is the conservative split that
@@ -366,16 +365,23 @@ class Engine:
         opt out (or in) with its own `cache:` flag, exactly like `tools:`.
 
         Default per model: ON for a remote model, OFF for the `local`
-        sentinel — llama.cpp keeps its own KV-cache prefix locally, there is
-        nothing to bill and nothing to mark, and a structured (list-of-blocks)
-        system message is a needless compatibility risk against whatever
-        server happens to be loaded."""
+        sentinel and for an Ollama provider (R223 fix) — both keep their own
+        KV-cache prefix locally, there is nothing to bill and nothing to
+        mark, and a structured (list-of-blocks) system message is a needless
+        compatibility risk against whatever server happens to be loaded. The
+        `local` sentinel used to be the only case checked here; an Ollama
+        model entry (never named "local", always its own real name) fell
+        through to the remote default and got the cache_control block for
+        zero benefit."""
         e = model_entry or self.current
         if not self.prompt_cache:
             return False
         if "cache" in e:
             return bool(e["cache"])
-        return e.get("model") != "local"
+        if e.get("model") == "local":
+            return False
+        ptype = self.cfg.get("providers", {}).get(e.get("provider"), {}).get("type")
+        return ptype != "ollama"
 
     def _runtime_number(self, key: str, default, cast, valid, hint: str):
         """R202: read one numeric `runtime:` setting, falling back to the
@@ -1158,6 +1164,28 @@ class Engine:
         # sure we test the one we would actually use for a request.
         if callable(getattr(provider, "pick_endpoint", None)):
             provider.pick_endpoint(cache_ok=False)
+        # R223 fix: Ollama has its own reachability/context probe (see
+        # OpenAICompatProvider._is_ollama/_probe/live_context_limit) and
+        # never needs the "local" sentinel below — its provider config's
+        # `type: ollama` already says unambiguously "this is a real local
+        # backend", the same way llama.cpp's /props does. Before this fix
+        # any Ollama model fell straight into the "remote API" branch next
+        # (api_key-gated), and Ollama needs no key — every Ollama model
+        # showed a false "✘ remote API" at startup regardless of whether it
+        # was actually reachable.
+        is_ollama = callable(getattr(provider, "_is_ollama", None)) \
+            and provider._is_ollama()
+        if is_ollama:
+            try:
+                if not provider._probe(provider.base_url):
+                    return {"ok": False, "detail": "unreachable"}
+                model = self.current.get("model", "?")
+                n_ctx = provider.live_context_limit(model)
+                detail = f"{model} ready, ctx {n_ctx}" if n_ctx \
+                    else f"{model} ready, ctx unknown"
+                return {"ok": True, "detail": detail}
+            except Exception as e:
+                return {"ok": False, "detail": f"unreachable: {e}"}
         # /props is llama.cpp-only and reports whatever's actually loaded on
         # the LOCAL backend — meaningless for a real remote model. A gateway
         # that unifies local + remote behind one LAN base_url (aurora-

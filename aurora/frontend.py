@@ -74,4 +74,10 @@ class Frontend(Protocol):
 
     # ── control ─────────────────────────────────────────────────────────
     def cancelled(self) -> bool:
-        """Polled during work — True once the human hit interrupt (Ctrl+C)."""
+        """Polled during work — True once the human asked to cancel.
+
+        Which key that is belongs to the front end, not to this contract:
+        the TUI cancels a busy turn on Esc (Ctrl+C there only clears the
+        input line), the classic REPL on Ctrl+C. Naming one of them here
+        made the shared contract read as if the TUI's Ctrl+C cancelled,
+        which it has not since Esc became the single control key."""

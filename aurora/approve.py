@@ -25,6 +25,7 @@ import difflib
 import fnmatch
 import functools
 import os
+import re
 import shlex
 from pathlib import Path
 
@@ -122,6 +123,27 @@ DANGEROUS_COMMANDS = frozenset({
 # families whose real binary name carries a suffix: mkfs.ext4, newfs_hfs
 _DANGEROUS_PREFIXES = ("mkfs.", "newfs_")
 
+# R242: a VERSIONED spelling of a dangerous command is the same command.
+# `DANGEROUS_COMMANDS` is matched by exact basename, so `python3` was caught
+# and `python3.11` — the standard binary name on most Linux distros and
+# Homebrew — was not. The consequence is R149's bug reopened on the entry
+# R149 calls out as worst ("interpreters: the ARGS are the program, so no
+# prefix of them is safe"): approving a harmless `python3.11 -c "print(1)"`
+# stores the two-token rule `python3.11 -c`, which thereafter auto-approves
+# `python3.11 -c "<anything>"` with no prompt, forever. Verified end to end
+# before the fix.
+#
+# Stripping a trailing version suffix (`python3.11`→`python`, `pip3`→`pip`,
+# `perl5.36`→`perl`, `node20`→`node`) and re-testing membership covers the
+# whole family without enumerating releases. Over-triggering is harmless
+# here — it only means a command matches exact-only and the user is asked
+# again — while under-triggering is what just cost a silent approval.
+_VERSION_SUFFIX = re.compile(r"[-_]?[0-9][0-9._-]*$")
+
+
+def _unversioned(base: str) -> str:
+    return _VERSION_SUFFIX.sub("", base)
+
 # R190: a command that is read-only in its ordinary use but carries a
 # write/delete/exec primitive behind a FLAG. Membership in SAFE_COMMANDS is a
 # claim about the command NAME ("nothing here writes, deletes, or executes"),
@@ -186,7 +208,11 @@ def _is_dangerous(toks: tuple) -> bool:
     names = set()
     for t in toks:
         base = os.path.basename(t)
-        if base in DANGEROUS_COMMANDS or base.startswith(_DANGEROUS_PREFIXES):
+        # R242: `python3.11` is `python`. Both spellings are tested so an
+        # exact entry still wins without depending on the strip.
+        if (base in DANGEROUS_COMMANDS
+                or _unversioned(base) in DANGEROUS_COMMANDS
+                or base.startswith(_DANGEROUS_PREFIXES)):
             return True
         names.add(base)
     # R190: an otherwise-safe command invoked with one of its own mutating

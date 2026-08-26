@@ -1,5 +1,5 @@
 """The agent loop: model ⇄ tools until a final answer (R6/R9). Handles the
-iteration cap (ask-to-continue at max_iterations), Ctrl+C cancellation (R17),
+iteration cap (ask-to-continue at max_iterations), user cancellation (R17),
 the approval gate (R7/R8), and malformed-local-tool-call degrade (R5).
 
 UI-agnostic: the caller passes callbacks so this works under any front end.
@@ -108,7 +108,7 @@ class AgentCallbacks:
     approve: Callable[[str, dict, str], object]    # -> 'y'|'n'|'a'|'s'|'c' or (key, note)
     ask_continue: Callable[[int], object]          # -> bool or (bool, guidance)
     notify: Callable[[str], None]                  # notices (degrade, cancel)
-    cancelled: Callable[[], bool]                  # poll for Ctrl+C
+    cancelled: Callable[[], bool]                  # poll for a user cancel (Esc/Ctrl+C)
     checkpoint: Callable[[str, dict], object] | None = None  # pre-mutation snapshot (R47/R181)
     on_request: Callable[[], None] | None = None   # an LLM request is starting
     # R58: secret-redaction challenge. None means the feature is OFF (the

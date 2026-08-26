@@ -1,6 +1,6 @@
-"""OpenAI-compatible servers: llama.cpp (--jinja), OpenRouter, LM Studio, …
-Streaming, tool calls, usage. Malformed tool-call responses raise
-MalformedToolCall so agent.py can retry-then-degrade (R5)."""
+"""OpenAI-compatible servers: llama.cpp (--jinja), OpenRouter, LM Studio,
+Ollama (R223), …. Streaming, tool calls, usage. Malformed tool-call
+responses raise MalformedToolCall so agent.py can retry-then-degrade (R5)."""
 
 import ipaddress
 import json
@@ -529,20 +529,31 @@ class OpenAICompatProvider(Provider):
             new_client.close()
         return client
 
+    def _is_ollama(self) -> bool:
+        """R223: an explicit opt-in via config.yaml's `type: ollama` — the
+        same field `Engine.provider_kind()` already reads, previously only
+        for a display label. Ollama's server has no /props (llama.cpp-only)
+        and no reliable auto-detectable signature worth guessing at, so this
+        stays config-driven rather than magic port/route sniffing."""
+        return self.config.get("type") == "ollama"
+
     def _probe(self, url: str) -> bool:
         """Quick connectivity test for a local endpoint. Public URLs are
         assumed reachable and not probed; local endpoints are checked with a
-        short /props request so we can fail over fast instead of waiting for
-        the main request to time out."""
+        short request so we can fail over fast instead of waiting for the
+        main request to time out. llama.cpp answers /props; Ollama has no
+        such route but answers a plain GET on its root ("Ollama is
+        running") — R223."""
         if not _is_lan_host(url):
             return True
         base = url.removesuffix("/v1")
+        path = "/" if self._is_ollama() else "/props"
         try:
             h = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
             # R95h: reuse this endpoint's pooled client. A bare `httpx.get`
             # built a fresh client — and so a fresh TCP+TLS handshake — for
             # every probe, which is most of what a probe costs.
-            self._client_for(url).get(f"{base}/props", headers=h,
+            self._client_for(url).get(f"{base}{path}", headers=h,
                                       timeout=2).raise_for_status()
             return True
         except Exception:
@@ -573,8 +584,34 @@ class OpenAICompatProvider(Provider):
         self.base_url = urls[0]
         return urls[0]
 
+    def _ollama_live_context_limit(self, model: str) -> int | None:
+        """R223: Ollama's /api/show reports a model's real trained context
+        window by NAME (`POST {"name": model}`), for any installed model —
+        unlike llama.cpp's /props, which only ever describes whatever is
+        CURRENTLY loaded and needs the "model: local" sentinel to be
+        trustworthy. The context-length field is keyed per model FAMILY
+        (`llama.context_length`, `qwen2.context_length`,
+        `gemma2.context_length`, …), not one fixed name — `model_info`'s own
+        `general.architecture` field names which family key to read."""
+        try:
+            r = self._client.post(
+                f"{self.base_url.removesuffix('/v1')}/api/show",
+                json={"name": model}, timeout=4, headers=self._auth_headers())
+            info = r.json().get("model_info", {})
+            arch = info.get("general.architecture")
+            n = info.get(f"{arch}.context_length") if arch else None
+            return int(n) if n else None
+        except Exception:
+            return None
+
     def live_context_limit(self, model: str = "local") -> int | None:
-        """llama.cpp exposes the real loaded -c via /props (R13)."""
+        """llama.cpp exposes the real loaded -c via /props (R13); Ollama via
+        /api/show (R223)."""
+        self.pick_endpoint(cache_ok=True)
+        if not _is_lan_host(self.base_url):
+            return None
+        if self._is_ollama():
+            return self._ollama_live_context_limit(model)
         # /props is a llama.cpp endpoint; a PUBLIC API (OpenRouter, …) has no
         # such route, so probing it just wastes a slow request (~6s) on the
         # first status render — and it's on the UI thread, so it freezes the
@@ -588,9 +625,6 @@ class OpenAICompatProvider(Provider):
         # identifies the local model — check that too.
         if model != "local":
             return None
-        self.pick_endpoint(cache_ok=True)
-        if not _is_lan_host(self.base_url):
-            return None
         try:
             r = self._client.get(f"{self.base_url.removesuffix('/v1')}/props",
                                  timeout=4,
@@ -601,7 +635,13 @@ class OpenAICompatProvider(Provider):
             return None
 
     def live_model_name(self) -> str | None:
-        """llama.cpp exposes the real loaded model's basename via /props."""
+        """llama.cpp exposes the real loaded model's basename via /props.
+        R223: Ollama can have several models resident at once (`GET
+        /api/ps`), which doesn't map onto this method's single "the loaded
+        model" concept — left returning None for Ollama, same as any remote
+        provider gets today, rather than guessing which one "the" model is."""
+        if self._is_ollama():
+            return None
         self.pick_endpoint(cache_ok=True)
         if not _is_lan_host(self.base_url):
             return None

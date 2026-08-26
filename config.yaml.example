@@ -14,11 +14,30 @@ providers:
     # llama.cpp server is reachable both over LAN and a VPN/tailnet.
     base_url: http://localhost:8080/v1
     api_key_env: LLAMA_API_KEY   # unset/blank if your server needs no key
+  # R223: Ollama needs `type: ollama`, not `type: openai` — its chat API is
+  # OpenAI-compatible (streaming, tool calls, all work through the same
+  # code path as `local` above), but its reachability check and live
+  # context-window lookup use Ollama's own routes (no /props, unlike
+  # llama.cpp). No key needed; omit api_key_env entirely.
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434/v1
 
 # first entry = the model Aurora starts on
 models:
   - provider: local
     model: local            # whatever your local server currently has loaded
+    tools: true
+  - provider: ollama
+    # must match `ollama list`'s NAME:TAG exactly. Verified live against a
+    # real Ollama server (2026-08-26): Ollama's model listing can claim
+    # "tools" capability for a model that then never actually emits a
+    # structured tool call — qwen2.5-coder:3b consistently printed the call
+    # as plain JSON text instead (3/3 tries) despite being marked
+    # tools-capable. The Qwen3 family (tested: qwen3:1.7b) reliably emits
+    # real tool calls — prefer it over Qwen2.5 for an Ollama backend Aurora
+    # will actually use tools with.
+    model: qwen3:1.7b
     tools: true
   - provider: openrouter
     model: moonshotai/kimi-k2.7-code

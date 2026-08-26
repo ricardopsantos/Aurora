@@ -2,8 +2,9 @@
 
 <img src="images/base_logo.png" alt="Aurora logo" width="120" align="right">
 
-Micro terminal coding agent — OpenRouter / a local llama.cpp
-server, with a tool loop, approval gates, session logs, and support for the
+Micro terminal coding agent — OpenRouter / a local llama.cpp server / a
+local Ollama server, with a tool loop, approval gates, session logs, and
+support for the
 [`.agentic_context`](https://github.com/ricardopsantos/AgenticContext)
 protocol via its MCP server (`agentic_context_mcp`, configured in
 `config.yaml`'s `mcp_servers:`).
@@ -36,7 +37,7 @@ offers to run it at every boot (a good default ships in
 tool output before it ever reaches the model or a log; every write/edit/
 command previewed and approval-gated, with a shadow-git snapshot before
 each so `/rewind` can undo any step; one `/model` menu across OpenRouter and
-a local llama.cpp server, models added by pasting a URL; prompt caching and
+a local llama.cpp or Ollama server, models added by pasting a URL; prompt caching and
 concurrent read-only tool calls so a multi-step task doesn't quietly burn
 tokens; a full-screen TUI with streaming markdown, collapsible thinking
 blocks and mouse support; resumable/exportable sessions, `/compact`; and a
@@ -58,7 +59,7 @@ Clones into `~/Aurora` (override with `AURORA_DIR=/path ...`), then runs
 API key interactively if none is configured yet. Or do it by hand:
 
 ```bash
-git clone https://ricardopsantos.org/aurora Aurora
+git clone https://github.com/ricardopsantos/Aurora.git Aurora
 cd Aurora && ./install.sh     # prompts for the data dir (default ~/.aurora)
                                # first run also creates config.yaml from
                                # config.yaml.example if you don't have one yet,
@@ -81,8 +82,10 @@ aurora key status                 # is a key set, and where from?
 ```
 
 No OpenRouter key? Aurora still works — only the paid remote models are
-unusable; pick your local model with `/model`. Full key table, `key_fetch:`
-and `aurora wipe` — see **[documents/KEYS.md](documents/KEYS.md)**.
+unusable; pick your local model with `/model`. A local llama.cpp or Ollama
+server needs no key either — see `config.yaml.example`'s `ollama:` entry
+(`type: ollama`). Full key table, `key_fetch:` and `aurora wipe` — see
+**[documents/KEYS.md](documents/KEYS.md)**.
 
 ## Run
 
@@ -131,7 +134,7 @@ writeup: **[documents/ARCHITECTURE.md](documents/ARCHITECTURE.md)**.
 Everything below `README.md` lives in **[documents/](documents/)**:
 
 - **[CHANGELOG_TECHNICAL.md](documents/CHANGELOG_TECHNICAL.md)** — the
-  canonical spec: every numbered requirement (R1+, currently through R218),
+  canonical spec: every numbered requirement (R1+, currently through R243),
   build plan and test plan, written before the code and kept in sync with
   behaviour. When any doc disagrees with it, this one wins. (Formerly
   `AURORA.md`.)
@@ -153,6 +156,12 @@ Everything below `README.md` lives in **[documents/](documents/)**:
   (not to be confused with `CHANGELOG_TECHNICAL.md` above).
 - **[bootstrap.example.md](documents/bootstrap.example.md)** — the default
   session-start bootstrap prompt.
+
+Plus, at the repo root, **[REQUIREMENTS.md](REQUIREMENTS.md)** — the newest
+requirements stated as testable rules, written alongside the
+`CHANGELOG_TECHNICAL.md` entry rather than instead of it. Not to be confused
+with `documents/REQUIREMENTS_OVERVIEW.md`, which is the high-level index and
+was itself once named `REQUIREMENTS.md`.
 
 **Rule: README, `CHANGELOG_TECHNICAL.md` and `ARCHITECTURE.md` must stay in
 sync with the code — any behaviour change ships with its doc update in the
