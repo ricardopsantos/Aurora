@@ -44,8 +44,9 @@ from .colors import (
     colour_diff,
     dim,
     strip_dangerous_escapes,
+    visible,
 )
-from .engine import Engine
+from .engine import Engine, _assistant_text
 from .paths import aurora_home, write_text_atomic
 
 HELP = f"""\
@@ -139,6 +140,17 @@ class TerminalFrontend:
             sys.stdout.flush()
             self._mdbuf = ""
 
+    def _flush_partial_text(self) -> None:
+        """R288: emit the held-back partial line (markdown renders whole
+        lines, so `on_text` keeps an unterminated tail in `_mdbuf`) BEFORE
+        any other output. Models usually narrate without a trailing newline
+        right before a tool call; left buffered, that narration printed
+        AFTER the tool block and glued onto the next round's text."""
+        if self._mdbuf:
+            sys.stdout.write(self._md.render(self._mdbuf) + "\n")
+            sys.stdout.flush()
+            self._mdbuf = ""
+
     # streaming
     def on_text(self, chunk: str) -> None:
         # R206: the TUI has stripped these since R170l/R171, but this
@@ -173,13 +185,15 @@ class TerminalFrontend:
             self._think_marker_shown = True
 
     def on_tool_start(self, name: str, args: dict) -> None:
+        self._flush_partial_text()                          # R288
         print(f"\n{CYAN}⚙ {name}{RESET}")
         for k, v in args.items():
             # R206: tool ARGUMENTS are model-authored too — echoing them back
             # unfiltered is the same channel as echoing its reply.
-            print(f"  {dim(k)}: {strip_dangerous_escapes(str(v))}")
+            print(f"  {dim(k)}: {visible(v)}")               # R287
 
     def on_tool_result(self, name: str, output: str) -> None:
+        self._flush_partial_text()                          # R288
         # R206: this is the subprocess output R170l stripped for the TUI.
         head = strip_dangerous_escapes(output).strip().splitlines()
         shown = "\n".join(head[:6])
@@ -187,31 +201,49 @@ class TerminalFrontend:
         print(dim(f"  ↳ {shown}{more}"))
 
     def notify(self, message: str) -> None:
+        self._flush_partial_text()                          # R288
         print(f"\n{YELLOW}· {message}{RESET}")
 
     # prompts (called from the worker thread; main thread is join-waiting)
-    def approve(self, tool: str, args: dict, diff: str) -> str:
+    def approve(self, tool: str, args: dict, diff: str) -> tuple[str, str]:  # noqa: C901
         print(f"\n{MAGENTA}{BOLD}── approval: {tool} ─────────────────────{RESET}")
+        # R287: everything shown at the gate goes through `visible()` —
+        # model-authored text must not be able to hide part of itself.
+        V = visible
         if tool == "run_command":
-            print(f"  {BOLD}$ {args.get('command', '')}{RESET}")
+            print(f"  {BOLD}$ {V(args.get('command', ''))}{RESET}")
+            _show_exec_context(args, V)
         elif tool == "wait_until":
             # bug fix: this used to fall through to the generic `path` branch
             # below, which is empty for wait_until — the command being
             # polled (and now, its optional `then` follow-up) never showed
             # at the approval prompt at all.
-            print(f"  {BOLD}$ {args.get('command', '')}{RESET}")
+            print(f"  {BOLD}$ {V(args.get('command', ''))}{RESET}")
             if args.get("then"):
-                print(f"  {dim('then:')} {BOLD}{args['then']}{RESET}")
+                print(f"  {dim('then:')} {BOLD}{V(args['then'])}{RESET}")
+            _show_exec_context(args, V)
+        elif tool == "cancel_command":
+            # R246: the generic `path` branch below is empty for this tool
+            # (its arg is job_id, not path/command) — without this the
+            # approval prompt showed nothing to approve.
+            print(f"  {BOLD}kill background job {V(args.get('job_id', ''))}{RESET}")
+        elif tool == "web_fetch":
+            # R283: gated only for a private/local host or a URL carrying a
+            # query string — say which, so the user can judge the risk
+            print(f"  {BOLD}GET {V(args.get('url', ''))}{RESET}")
+            print(dim("  (asked because it targets a private/local address, "
+                      "sends a query string, or carries data-like path/host "
+                      "parts)"))
         elif tool.startswith("mcp_"):
             # R119: MCP tool args rarely have a "path"/"command" key the
             # generic branch below expects — show them as key: value instead,
             # same shape as on_tool_start's own tool-call rendering
             for k, v in args.items():
-                print(f"  {dim(k)}: {v}")
+                print(f"  {dim(V(k))}: {V(v)}")
         else:
-            print(f"  {BOLD}{args.get('path', '')}{RESET}")
+            print(f"  {BOLD}{V(args.get('path', ''))}{RESET}")
         if diff:
-            print(colour_diff(diff))
+            print(colour_diff(V(diff)))
         key = select("Approve?", [
             ("y", "Yes, run once"),
             ("a", "Always allow this (remember)"),
@@ -264,6 +296,8 @@ class TerminalFrontend:
             where = "your prompt"
         elif context == "reply":
             where = "the assistant's reply"
+        elif context == "commit diff":            # R284
+            where = "the staged diff /commit would send to the model"
         elif context.startswith("write:"):
             where = f"the `{context[len('write:'):]}` call about to run"
         else:
@@ -544,6 +578,12 @@ def _run_turn(engine: Engine, fe: TerminalFrontend, text: str,
 
 
 # ── /model picker ─────────────────────────────────────────────────────────
+# R297: how long `/model` waits, up front, for per-model health probes before
+# building the menu anyway — long enough for a normal LAN/Ollama round trip,
+# short enough that a dead host doesn't make the command itself feel hung.
+# A module constant (not a literal inline) so a test can shrink it instead of
+# actually waiting out the real deadline.
+_MODEL_HEALTH_DEADLINE_S = 2.5
 def _prompt_and_store_key(engine: Engine, env: str) -> None:
     """Offer to enter/store a missing key right after picking a model that
     needs one — instead of leaving the user with '(no key set)' and no way
@@ -582,7 +622,16 @@ def _prompt_and_store_key(engine: Engine, env: str) -> None:
     print(f"{GREEN}stored {env} in {where}{RESET}")
 
 
-def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
+def _pick_model(engine: Engine, fe: TerminalFrontend,
+                on_pick=None) -> None:
+    """R253: `on_pick` replaces the `engine.switch_model()` at the end — the
+    picker runs identically, but the caller decides what "picked" means.
+    The TUI passes one when `/model` is opened on the side channel while a
+    turn is running: switching there would change the model *under* the
+    in-flight turn (its next provider call would use the new one), so the
+    payload is parked and applied when that turn ends. Everything before the
+    switch — building the rows, the price refresh, the missing-key prompt —
+    is unchanged either way, since none of it touches the running turn."""
     loaded = None
 
     from .providers import openai_compat
@@ -617,6 +666,46 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
     # latency/complexity to opening the picker itself, so this is read-only
     # and can be stale or simply absent for a model not used recently.
     latencies = sessions.last_latency_by_model()
+    # R297: per-model reachability/existence. Unlike the price refresh below,
+    # this can't be a pure background-then-relabel job: `update_menu_labels`
+    # is a DOCUMENTED no-op on the classic (non-TUI) frontend — "the classic
+    # REPL's select() already PRINTED its numbered list" — so a warning that
+    # only ever arrives via relabel would never reach a classic-mode user at
+    # all, defeating the point (a fast Enter on the TUI has the same gap).
+    # Probed bounded + in parallel, before the menu is ever built, so the
+    # common case (a reachable LAN/Ollama host answering in tens of ms) is
+    # already known by the time the picker is shown. `_run_model_health`
+    # caps the wait so a wedged host can't stall opening the picker past its
+    # deadline; anything still unresolved when the deadline hits is picked
+    # up by the straggler watcher below and reaches the TUI via relabel (the
+    # classic frontend has already committed to printing without it, same as
+    # a stale/no price today).
+    health: dict[tuple[str, str], dict] = {}
+
+    def _run_model_health(models, timeout: float) -> list[threading.Thread]:
+        import time
+        lock = threading.Lock()
+        threads = []
+        for m in models:
+            provider = engine._provider_for(m)
+            fn = getattr(provider, "model_health", None) if provider else None
+            if not callable(fn):
+                continue
+
+            def work(m=m, fn=fn):
+                h = fn(m.get("model"))
+                if h is not None:
+                    with lock:
+                        health[(m.get("provider"), m.get("model"))] = h
+            th = threading.Thread(target=work, name="model-health", daemon=True)
+            th.start()
+            threads.append(th)
+        deadline = time.monotonic() + timeout
+        for th in threads:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                th.join(remaining)
+        return [th for th in threads if th.is_alive()]
 
     def _build_entries() -> tuple[list[tuple[str, dict]], int]:
         """(entries, current_index) — the labelled rows, read fresh out of
@@ -628,6 +717,7 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
         for m in sorted(engine.list_models(),
                         key=lambda m: str(m.get("model", "")).lower()):
             name = m.get("model", "")
+            health_key = (m.get("provider"), name)
             is_openrouter = name != "local" and "openrouter" in str(m.get("provider", ""))
             remote = REMOTE_CONTEXT_LIMITS.get(name, {}) if is_openrouter else {}
             # a known-$0 OpenRouter model (e.g. a ":free" variant) is genuinely
@@ -663,12 +753,36 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
             mark = f"  {GREEN}{BOLD}✔{RESET}" if is_current else ""
             no_key = (f"  {RED}(no key set){RESET}"
                       if not engine.has_key(m.get("provider")) else "")
+            # R297: a config entry can name a model that was never actually
+            # `ollama pull`ed (or a LAN backend that's simply down) — flag it
+            # loudly rather than let the user find out by having the pick
+            # fail mid-turn. `health` is absent (not yet probed) or None
+            # (nothing to check for this provider, e.g. a remote paid API)
+            # for most entries — only an explicit {"ok": False} warns.
+            bad = health.get(health_key)
+            warn = (f"  {RED}⚠ {bad.get('detail') or 'unavailable'}{RESET}"
+                    if bad is not None and not bad.get("ok") else "")
             if is_current:
                 current_index = len(entries)
-            entries.append((f"{name}{mark}  {tag} {info}{no_key}", m))
+            entries.append((f"{name}{mark}  {tag} {info}{no_key}{warn}", m))
         return entries, current_index
 
+    # Bounded total (parallel, not per-model) — stragglers picked up below.
+    _stragglers = _run_model_health(engine.list_models(),
+                                    timeout=_MODEL_HEALTH_DEADLINE_S)
+
     entries, current_index = _build_entries()
+    # R251: an EMPTY picker is not a picker. `/model remove` of the last entry
+    # (R81) — and a `models: []` config — leave nothing to choose from, and a
+    # zero-option menu cannot be answered: in the TUI an arrow key divides by
+    # `len(options)` and Enter indexes it, so the menu is unresolvable and the
+    # worker thread blocks on `select_menu()`'s queue for the rest of the
+    # session (the deadlock shape `open_nano` documents). `engine.send` already
+    # has the right words for this state; say them here instead of opening it.
+    if not entries:
+        print(f"{YELLOW}· no models configured — /model add <url> to add "
+              f"one{RESET}")
+        return
     prompt = "Select model"
     options = [(str(i), label) for i, (label, _) in enumerate(entries, 1)]
 
@@ -695,6 +809,22 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
          if m.get("model") != "local"
          and "openrouter" in str(m.get("provider", ""))], on_done=_relabel)
 
+    # R297: the bounded probe above already covers the common case (the
+    # entries built into `options` reflect it), but a host that was still
+    # unreachable-or-slow past the 2.5s deadline left its thread running —
+    # relabel once those actually land, same shape as the price refresh
+    # (TUI only; the classic frontend already committed to its printed list).
+    if _stragglers:
+        def _await_stragglers():
+            try:
+                for th in _stragglers:
+                    th.join()
+                _relabel()
+            except Exception:
+                pass   # background chore — must never take the session down
+        threading.Thread(target=_await_stragglers, name="model-health-late",
+                         daemon=True).start()
+
     chosen = select(prompt, options, default_index=current_index)
     if chosen is None:   # TUI: menu dismissed (e.g. a second click on the
         return            # status bar's model name) — no change
@@ -712,6 +842,9 @@ def _pick_model(engine: Engine, fe: TerminalFrontend) -> None:
                 print(f"{YELLOW}· no key stored — keeping "
                       f"'{engine.current.get('model')}'{RESET}")
                 return
+    if on_pick is not None:       # R253 — deferred switch, see the docstring
+        on_pick(payload)
+        return
     engine.switch_model(payload)
     print(f"{GREEN}→ {payload.get('model')}{RESET}")
 
@@ -820,7 +953,8 @@ COMMAND_INFO = {
     "clear":     "start fresh — history cleared",
     "reset":     "clear history + system prompt; offers /bootstrap",
     "copy":      "copy Nth-last response to the clipboard",
-    "copy-last": "copy last turn's RAW response (thinking included) to the clipboard",
+    "copy-last": "copy last turn IN FULL — prompt, thinking, every reply",
+    "copy-response": "copy just the model's final reply from the last turn",
     "copy-all":  "copy the whole chat (questions + answers) to the clipboard",
     "redact":    "secret detection on|off · allowlist [clear] (persisted)",
     "cost":      "per-model token + $ breakdown across every session on this machine",
@@ -828,6 +962,8 @@ COMMAND_INFO = {
     "cache":     "prompt caching on|off — stops re-billing the system prompt",
     "autocompact": "silently fold older history near the context limit on|off",
     "fallback":  "retry a failed turn on the next configured model on|off (persisted)",
+    "auto-approve": "on|off — skip the approval prompt for every gated tool "
+                    "call (denylist + secrets still apply, not persisted)",
     "allowlist": "show the persistent approval allowlist",
     "denylist":  "show tool calls always denied by policy",
     "rewind":    "restore the working tree to a pre-mutation checkpoint",
@@ -836,7 +972,8 @@ COMMAND_INFO = {
     "commit":    "stage + draft a commit message from the diff + commit (optional message)",
     "resume":    "pick a past session to continue",
     "search":    "search every session log for text (add a number to resume that hit)",
-    "export":    "dump this conversation as markdown",
+    "sessions":  "list past session ids, last-active time, and first task",
+    "export":    "dump this (or a past, by id) conversation as markdown",
     "skills":    "list installed skills",
     "extensions": "list loaded extension tools + how to add one",
     "bootstrap": "run the saved bootstrap prompt (set/show/clear)",
@@ -848,6 +985,42 @@ COMMAND_INFO = {
     "exit":      "quit aurora immediately (alias of /quit)",
 }
 COMMANDS = list(COMMAND_INFO)
+
+# R253: the commands `_handle_command` can run on the TUI's side channel —
+# concurrently with whatever the main worker is mid-turn on — instead of
+# queueing behind it. Membership is not "feels quick", it is three hard
+# properties, all of which have to hold:
+#   1. It mutates no Engine/session state the worker thread owns. ARCHITECTURE
+#      §6's whole no-lock design rests on `engine.messages`/`session` having a
+#      single writer; anything that writes them stays on `_inbox`.
+#   2. It never prompts — no `ask()`, `select_menu()`, `confirm()`, `input()`.
+#      Those write single slots (`_question`, `_menu_options`) and block on one
+#      `_answers` queue, so two threads in there corrupt both (the R142a shape).
+#      `/model` is the deliberate exception and does NOT live here: it is
+#      routed separately, under the input-line lock, and defers its switch.
+#   3. It touches no `_bash_cwd`/scrollback state the side channel already
+#      refuses to race (R245).
+# Read-only against the filesystem is NOT a criterion — `/export` writes a
+# file and qualifies; it writes a fresh transcript, not shared session state.
+SIDE_SAFE_COMMANDS = frozenset({
+    "status", "cost", "context", "diff", "skills", "extensions",
+    "allowlist", "denylist", "copy", "copy-last", "copy-all", "export",
+    "help", "sessions",
+})
+
+
+def side_safe_command(line: str) -> bool:
+    """Is this `/…` line safe to run on the side channel (R253)?
+
+    `/<anything> help` (and its `man` alias) is safe for EVERY command, not
+    just the ones above: that branch is checked before the dispatch chain in
+    `_handle_command` and only ever prints `man.command_man` text — so
+    `/rewind help` reads the manual without arming the command itself."""
+    cmd, _, arg = line[1:].partition(" ")
+    cmd, arg = cmd.strip().lower(), arg.strip().lower()
+    if arg in ("help", "man") and cmd in COMMAND_INFO:
+        return True
+    return cmd in SIDE_SAFE_COMMANDS
 
 
 class SlashCompleter(Completer):
@@ -951,6 +1124,19 @@ def _run_bootstrap(engine: Engine, fe: TerminalFrontend, redownload: bool = Fals
     if not text:
         print("· no bootstrap prompt saved — /bootstrap set")
         return
+    if bootstrap.needs_trust("."):
+        # R286: a project prompt comes with the repo in cwd — possibly
+        # someone else's. Show ALL of it (not a 70-char first line) and
+        # default to NO; approval is remembered for this exact content.
+        print(f"{YELLOW}· this project's bootstrap prompt [{source}] has not "
+              f"been approved on this machine (or changed since). It runs "
+              f"as a tool-enabled turn:{RESET}")
+        print(text[:4000] + ("\n…[truncated]" if len(text) > 4000 else ""))
+        if not confirm("Trust and run this project bootstrap prompt?",
+                       default_yes=False):
+            print("· skipped — not trusted")
+            return
+        bootstrap.trust(".")
     print(dim(f"· running bootstrap [{source}]"))
     engine.session.log("bootstrap", source=source, chars=len(text))
     if sync:
@@ -1087,10 +1273,28 @@ def _commit_cmd(engine: Engine, fe: TerminalFrontend, arg: str) -> None:
     print(colour_diff(shown))
 
     message = arg.strip()
-    if not message:
+    draft_diff = diff
+    if not message and getattr(engine, "redact_secrets", False):
+        # R284: the staged diff goes to the provider to draft the message —
+        # new content off disk, the same R58 gate every other path to the
+        # model passes (prompt, tool output, quick_ask per R254g). Scanned
+        # as SENT: the draft only ever sees the first _DRAFT_DIFF_CAP chars.
+        from . import secrets as secretscan
+        sent = diff[:gitcommit._DRAFT_DIFF_CAP]
+        matches = secretscan.scan(sent, engine.secret_allowlist)
+        if matches:
+            decision = engine._secret_challenge(fe, "commit diff", matches,
+                                                source_text=sent)
+            if decision == "stop":
+                print("· not sending the diff to the model — type the "
+                      "message yourself (Edit)")
+                draft_diff = None
+            elif decision == "redact":
+                draft_diff = secretscan.redact(sent, matches)
+    if not message and draft_diff is not None:
         print(dim("· drafting a commit message…"))
         try:
-            message = gitcommit.draft_message(engine, diff,
+            message = gitcommit.draft_message(engine, draft_diff,
                                               gitcommit.recent_log(cwd))
         except Exception as e:
             print(f"· draft failed: {e} — enter a message yourself")
@@ -1223,14 +1427,44 @@ def _undo_cmd() -> None:
 _SEP = "-" * 10
 
 
+def _last_turn_answer_text(engine: Engine) -> str:
+    """R256: everything the model SAID during the last turn, in order.
+
+    Was `engine.last_response()` — the final assistant message alone. On a
+    turn that used tools that is one link of a chain (narrate, call, narrate,
+    call, answer), and the substantive reply is usually an intermediate one
+    while the last is a short wrap-up: a real "back and forth" turn copied as
+    the prompt plus `"Done."`, with the analysis the user wanted dropped.
+
+    Tool CALLS are kept, as a one-line marker each, because the narration
+    around them stops making sense without them ("checking the server next"
+    followed immediately by a conclusion). Tool RESULTS are left out: a
+    single one can be `tools.TOOL_OUTPUT_LIMIT` (60KB) of machine output, and
+    `/copy-last` is for what the model said. `/copy-all` remains the whole
+    chat; `/copy` remains one reply."""
+    parts: list[str] = []
+    for msg in engine.last_turn_messages():
+        if msg.get("role") != "assistant":
+            continue                      # tool results — see the docstring
+        text = _assistant_text(msg).strip()
+        if text:
+            parts.append(text)
+        for call in msg.get("tool_calls") or []:
+            name = (call.get("function") or {}).get("name") or call.get("name")
+            if name:
+                parts.append(f"  → {name}")
+    return "\n\n".join(parts)
+
+
 def _raw_last_response_text(engine: Engine, fe: TerminalFrontend) -> str:
     """Last turn's RAW record (R124): the prompt that started it, the
-    reasoning (if any), then the final answer. Unlike `/copy`/`engine.
+    reasoning (if any), then everything the model said (R256 — the whole
+    turn, not just its final message). Unlike `/copy`/`engine.
     last_response()`, this deliberately includes the prompt and thinking —
     the one place either is allowed to leave the buffer/history."""
     prompt = engine.last_prompt()
     think = fe.think_buffer
-    answer = engine.last_response()
+    answer = _last_turn_answer_text(engine)
     parts = []
     if prompt:
         parts.append(f"[prompt]\n{prompt}")
@@ -1387,6 +1621,17 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
         else:
             suffix = " (thinking included)" if label == "raw response" else ""
             print(f"· {label}{suffix} copied via {clipboard.copy(text)}")
+    elif cmd == "copy-response":
+        # R256: the narrow counterpart to /copy-last. Same "last turn" scope,
+        # but only what the model finally said — no prompt, no thinking, no
+        # tool markers. `last_turn_final_reply` skips a trailing tool-call-
+        # only message, which is how a turn stopped at the approval gate ends
+        # and where plain `/copy` hands back an empty string.
+        text = _outbound(engine.last_turn_final_reply())
+        if not text:
+            print("· no reply in the last turn to copy")
+        else:
+            print(f"· final reply copied via {clipboard.copy(text)}")
     elif cmd == "copy-all":
         text = _all_chat_text(engine)
         if not text.strip():
@@ -1464,6 +1709,16 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
               f"failure, retries the turn against the next model with a "
               f"usable key\n" + dim(f"  chain from {engine.current.get('model')}: "
                                    f"{chain or '(no other model with a usable key)'}"))
+    elif cmd == "auto-approve":
+        if arg.lower() in ("on", "off"):
+            engine.auto_approve = arg.lower() == "on"
+        elif arg:
+            print("· usage: /auto-approve on|off")
+            return True
+        state = "ON — every gated tool call runs unprompted" \
+            if engine.auto_approve else "OFF"
+        print(f"· auto-approve {state} (this session only — "
+              f"denylist rules and secret detection still apply)")
     elif cmd == "multiline":
         engine.set_multiline(not engine.multiline)
         print(f"· multiline {'ON' if engine.multiline else 'OFF'} "
@@ -1521,6 +1776,15 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
             print(f"· resumed {sid} ({n} turns)")
         elif raw:
             print("· no such session — enter a number from the list, or empty to cancel")
+    elif cmd == "sessions":
+        limit = int(arg) if arg.isdigit() else 20
+        rows = sessions.list_sessions(limit=limit)
+        if not rows:
+            print("· no past sessions")
+            return True
+        for i, (sid, mtime, first) in enumerate(rows, 1):
+            mark = "  (current)" if sid == engine.session.id else ""
+            print(f"  {i}. {sid}  {mtime}  {first}{mark}")
     elif cmd == "search":
         if not arg:
             print("· usage: /search <text>")
@@ -1539,17 +1803,29 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
         elif raw:
             print("· no such session — enter a number from the list, or empty to cancel")
     elif cmd == "export":
-        out = f"aurora-session-{engine.session.id}.md"
+        # R263: an optional id/prefix exports a PAST session straight from
+        # its on-disk log, no `/resume` (and no mutation of the live
+        # engine/current session) required — `export_markdown` already read
+        # from disk by id; only the arg-parsing here was missing.
+        sid = engine.session.id
+        if arg.strip():
+            try:
+                sid = sessions.resolve_session_id(arg.strip())
+            except ValueError as e:
+                print(f"· {e}")
+                return True
+        out = f"aurora-session-{sid}.md"
         # R207: `open(out, "w")` used the LOCALE's encoding, so exporting a
         # transcript containing any non-ASCII — an em dash, a non-English
         # reply, unicode in a code block — raised UnicodeEncodeError under
         # LANG=C. And mode "w" truncates before it encodes, so the failure
         # left a 0-byte .md behind. `write_text_atomic` pins UTF-8 and lands
         # the file whole or not at all.
-        write_text_atomic(out, _all_chat_text(engine))   # R208
+        write_text_atomic(out, _outbound(sessions.export_markdown(sid)))   # R208, R263
         print(f"· wrote {out}")
     elif cmd == "skills":
-        print(skills.listing(engine.cfg.get("_base_dir")))
+        print(skills.listing(engine.cfg.get("_base_dir"),
+                             engine.cfg.get("doc_skill_roots")))
     elif cmd == "extensions" and arg.split(" ", 1)[0] == "new":
         ext_name = arg.split(" ", 1)[1].strip() if " " in arg else ""
         if not ext_name:
@@ -1598,9 +1874,33 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
             # the OTHER entry point, a mouse click racing an unrelated
             # command — would always find "itself" busy and self-block.
             tui.open_nano(Path(arg).expanduser(), check_busy=False)
-    else:  # /name args → a skill (R11)
-        print(skills.run(cmd, arg, engine.cfg.get("_base_dir")))
+    else:  # /name args → a skill (R11), or a doc skill (R247)
+        base_dir = engine.cfg.get("_base_dir")
+        if cmd in skills.discover(base_dir):
+            print(skills.run(cmd, arg, base_dir))
+        else:
+            _run_doc_skill(engine, fe, cmd, arg)
     return True
+
+
+def _run_doc_skill(engine: Engine, fe: TerminalFrontend, name: str,
+                   arg: str) -> None:
+    """R247: `/name` for a Markdown SKILL.md (Claude Code/Hermes-shaped,
+    discovered via `doc_skill_roots`) — unlike an executable skill there is
+    nothing to subprocess, so the body is fed to the model as a real,
+    tool-enabled turn instead of being printed. Same mechanism `/bootstrap`
+    already uses to turn a saved file into a prompt (`_run_turn`), not a
+    new one — a doc skill is not different in kind from a bootstrap prompt,
+    only in where it's discovered from."""
+    text = skills.load_doc(name, engine.cfg.get("doc_skill_roots"))
+    if text is None:
+        print(f"[unknown skill: /{name} — try /skills]")
+        return
+    if arg:
+        text += f"\n\n---\nAdditional instructions for this invocation: {arg}"
+    print(dim(f"· loading skill '{name}'..."))
+    engine.session.log("skill_doc", name=name, chars=len(text))
+    _run_turn(engine, fe, text, is_bootstrap=False)
 
 
 def _banner(engine: Engine) -> None:
@@ -1742,3 +2042,15 @@ def run(engine: Engine) -> None:
 
     print(f"\nResume this session with:\n  aurora --resume {engine.session.id}")
     print("bye")
+
+
+def _show_exec_context(args: dict, V) -> None:
+    """R303: `cwd` and `background` change what a command DOES (`rm -rf
+    build` in the project vs in ~; a one-shot vs a detached job), yet the
+    prompt showed only the command text, so the user approved a different
+    action than the one that ran. Both are shown whenever set."""
+    cwd = args.get("cwd")
+    if cwd:
+        print(f"  {dim('in:')} {BOLD}{V(str(cwd))}{RESET}")
+    if args.get("background"):
+        print(f"  {YELLOW}{BOLD}runs in the BACKGROUND (detached, keeps running){RESET}")

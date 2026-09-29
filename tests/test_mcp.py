@@ -284,6 +284,23 @@ def test_mcp_manager_survives_one_bad_server(tmp_path):
         manager.close_all()
 
 
+# ── R229: config.yaml is shared across machines with different home
+# layouts; command/args must expand ~ and $VARS like a shell would, since
+# Popen never does that itself and a literal path only ever worked on the
+# machine it was written on ──────────────────────────────────────────────
+def test_mcp_manager_expands_home_and_env_vars_in_command_and_args(
+        monkeypatch):
+    monkeypatch.setenv("AURORA_TEST_PY", sys.executable)
+    monkeypatch.setenv("HOME", str(Path(_FAKE_SERVER).parent.parent))
+    manager = mcp.MCPManager([{"name": "fake", "command": "$AURORA_TEST_PY",
+                              "args": ["~/fixtures/fake_mcp_server.py"]}])
+    try:
+        assert manager.errors == []
+        assert manager.runners()["mcp_fake_echo"](text="hi") == "echo: hi"
+    finally:
+        manager.close_all()
+
+
 def test_mcp_manager_skips_entries_missing_name_or_command():
     manager = mcp.MCPManager([{"command": sys.executable}, {"name": "x"}])
     assert manager.specs() == []

@@ -35,6 +35,15 @@ EXCLUDES = ["node_modules/", ".venv/", "venv/", "__pycache__/", ".build/",
 
 MAX_LABEL = 72
 
+# R275: a checkpoint runs `git add -A` synchronously on the approval path, and
+# git hashes + zlib-compresses every new/changed file in full — measured: one
+# 800MB file blocked the first approval 16.9s and duplicated 801MB into
+# AURORA_HOME, and past `_git`'s 60s timeout the checkpoint silently didn't
+# exist at all. Files above this are left out of snapshots (listed in the
+# shadow repo's exclude file) — build outputs, datasets, model weights; not
+# the source edits /rewind exists for.
+MAX_CHECKPOINT_FILE_BYTES = 50 * 1024 * 1024
+
 # R193: the per-file snapshot holds the target's WHOLE content in the marker
 # JSON, and `snapshot_before_write` sits directly on the approval path — so an
 # unbounded read here is a memory spike triggered by whatever file the model
@@ -251,16 +260,81 @@ def _read_last_mutation(wt: Path) -> dict | None:
         return None
 
 
+def _too_broad(wt: Path) -> bool:
+    """R275: a checkpoint root that is the home directory or the filesystem
+    root would snapshot an entire user's (or machine's) files on every
+    approval. Such a cwd gets no checkpoints — and `covers()` says so."""
+    return wt == Path.home().resolve() or wt == Path(wt.anchor)
+
+
+def _gitignore_literal(rel: str) -> str:
+    """A path as a gitignore pattern matching only itself: glob characters,
+    backslashes and trailing spaces escaped (a leading `#`/`!` is harmless
+    after the `/` anchor the caller prepends)."""
+    out = "".join("\\" + c if c in "\\*?[" else c for c in rel)
+    return out[:-1] + "\\ " if out.endswith(" ") else out
+
+
+def _exclude_large_files(wt: Path) -> None:
+    """R275/R296: keep every file over MAX_CHECKPOINT_FILE_BYTES out of the
+    snapshot, via the shadow repo's info/exclude.
+
+    R296 fixed two things R275 got wrong:
+    - **It only worked once.** The exclude list was rebuilt from what git
+      currently listed — and an already-excluded file is, by definition, not
+      listed any more, so the NEXT checkpoint dropped it from the list and
+      `add -A` snapshotted it anyway. Excluded paths are now remembered in
+      `info/aurora-large` and re-checked (a file that shrank below the cap is
+      snapshotted again).
+    - **It doubled the per-approval cost.** `ls-files -o -m` took ~93ms on a
+      50k-file tree — more than the `add -A` it guarded (~40ms).
+      `status --porcelain -uall` answers the same question in ~35ms.
+    A large file that was ALREADY tracked (snapshotted before the cap
+    existed) is dropped from the index once, or `add -A` would keep hashing
+    it: excludes never apply to tracked paths."""
+    info = _gitdir(wt) / "info"
+    record = info / "aurora-large"
+    try:
+        prev = [p for p in record.read_text(encoding="utf-8").split("\0") if p]
+    except OSError:
+        prev = []
+    r = _git(wt, "status", "--porcelain", "-z", "-uall", "--no-renames",
+             check=False)
+    candidates = set(prev)
+    for entry in r.stdout.split("\0"):
+        if len(entry) > 3:
+            candidates.add(entry[3:])
+    big = []
+    for rel in sorted(candidates):
+        try:
+            if (wt / rel).stat().st_size > MAX_CHECKPOINT_FILE_BYTES:
+                big.append(rel)
+        except OSError:
+            continue
+    newly = [b for b in big if b not in prev]
+    if big != sorted(prev):
+        record.write_text("\0".join(big), encoding="utf-8")
+        (info / "exclude").write_text(
+            "\n".join(EXCLUDES + ["/" + _gitignore_literal(b) for b in big])
+            + "\n", encoding="utf-8")
+    if newly:
+        _git(wt, "rm", "--cached", "-q", "--ignore-unmatch", "--", *newly,
+             check=False)
+
+
 def checkpoint(label: str, cwd: str = ".") -> str | None:
     """Snapshot the working tree. Returns the short hash, or None when the
     tree is unchanged since the last snapshot or git is unavailable."""
     try:
         wt = Path(cwd).resolve()
+        if _too_broad(wt):                                    # R275
+            return None
         _ensure(wt)
         # R191: held across add/commit/rev-parse so a background prune's
         # `gc --prune=now` cannot land in the middle of them.
         with _repo_lock(wt):
-            _git(wt, "add", "-A")
+            _exclude_large_files(wt)                            # R275
+            _git(wt, "add", "-A", "--ignore-errors", check=False)   # R274
             msg = " ".join(label.split())[:MAX_LABEL] or "checkpoint"
             r = _git(wt, "commit", "--quiet", "-m", msg, check=False)
             if r.returncode:  # "nothing to commit" — tree unchanged
@@ -399,9 +473,29 @@ def covers(path: str, cwd: str = ".") -> bool:
         return False
     if not (target == root or root in target.parents):
         return False
+    if _too_broad(root):                                      # R275
+        return False
     if target == root:
         return True
+    if _in_nested_repo(target, root):
+        return False
     return not _excluded(target.relative_to(root).as_posix())
+
+
+def _in_nested_repo(target: Path, root: Path) -> bool:
+    """R274: is `target` inside a git repository nested BELOW the checkpoint
+    root (a sub-repo when Aurora runs from ~/repositories or ~, a submodule,
+    a vendored checkout)? `git add -A` records such a directory as a gitlink
+    (mode 160000) — a commit pointer, not its files — so no checkpoint holds
+    their content and /rewind cannot restore them. Checked from the target's
+    parent up to (not including) the root: the root's own .git is the
+    project itself, which the shadow repo does see."""
+    d = target if target.is_dir() else target.parent
+    while d != root and root in d.parents:
+        if (d / ".git").exists():
+            return True
+        d = d.parent
+    return False
 
 
 _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git's canonical empty-tree hash
@@ -456,8 +550,12 @@ def diff_since(ref: str | None, cwd: str = ".") -> str:
         if ref and _git(wt, "rev-parse", "--verify", f"{ref}^{{commit}}",
                         check=False).returncode:
             return f"[diff error: no such checkpoint: {ref}]"
-        _git(wt, "add", "-A", check=False)
-        return _git(wt, "diff", "--cached", base, "--", check=False).stdout
+        # R280: under the repo lock — /diff is side-safe (R253), so this
+        # runs CONCURRENTLY with the worker's checkpoint(); two `add -A`s
+        # on one index collide on index.lock and checkpoint() swallows it.
+        with _repo_lock(wt):
+            _git(wt, "add", "-A", "--ignore-errors", check=False)
+            return _git(wt, "diff", "--cached", base, "--", check=False).stdout
     except Exception as e:
         return f"[diff error: {e.__class__.__name__}: {e}]"
 
@@ -498,11 +596,12 @@ def restore(ref: str, cwd: str = ".") -> str:
         # reset below would orphan every commit newer than `ref`)
         undo = (checkpoint(f"before /rewind to {ref}", cwd=str(wt))
                 or _git(wt, "rev-parse", "--short", "HEAD").stdout.strip())
-        _git(wt, "reset", "--hard", "--quiet", ref)
-        _git(wt, "clean", "-fdq", check=False)
-        # keep the pre-rewind state reachable even though HEAD moved back
-        if undo:
-            _git(wt, "tag", "-f", f"undo-{undo}", undo, check=False)
+        with _repo_lock(wt):                                   # R280
+            _git(wt, "reset", "--hard", "--quiet", ref)
+            _git(wt, "clean", "-fdq", check=False)
+            # keep the pre-rewind state reachable though HEAD moved back
+            if undo:
+                _git(wt, "tag", "-f", f"undo-{undo}", undo, check=False)
         return (f"restored {ref}"
                 + (f" (undo with /rewind {undo})" if undo else ""))
     except Exception as e:
@@ -550,9 +649,10 @@ def undo_preview(cwd: str = ".") -> tuple[str, list[str]]:
             return ("file", [m["path"]])
         if not (_gitdir(wt) / "HEAD").exists():
             return ("none", [])
-        _git(wt, "add", "-A", check=False)
-        dirty = _git(wt, "diff", "--cached", "--name-status", "--no-renames",
-                     "HEAD", check=False).stdout.strip()
+        with _repo_lock(wt):                                   # R280
+            _git(wt, "add", "-A", "--ignore-errors", check=False)
+            dirty = _git(wt, "diff", "--cached", "--name-status",
+                         "--no-renames", "HEAD", check=False).stdout.strip()
         if not dirty:
             return ("none", [])
         paths = [line.split("\t", 1)[1] for line in dirty.splitlines() if line]
@@ -589,8 +689,9 @@ def undo_diff(cwd: str = ".") -> str:
                 fromfile=f"{m['path']} (before)", tofile=f"{m['path']} (now)"))
         if not (_gitdir(wt) / "HEAD").exists():
             return ""
-        _git(wt, "add", "-A", check=False)
-        return _git(wt, "diff", "--cached", "HEAD", check=False).stdout
+        with _repo_lock(wt):                                   # R280
+            _git(wt, "add", "-A", "--ignore-errors", check=False)
+            return _git(wt, "diff", "--cached", "HEAD", check=False).stdout
     except Exception:
         return ""
 
@@ -638,7 +739,8 @@ def undo(cwd: str = ".") -> str:
             except Exception as e:
                 return f"undo failed: {e.__class__.__name__}: {e}"
             return f"undone: reverted {m['path']}"
-        _git(wt, "reset", "--hard", "--quiet", "HEAD")
+        with _repo_lock(wt):                                   # R280
+            _git(wt, "reset", "--hard", "--quiet", "HEAD")
         return (f"undone: reverted {len(paths)} uncommitted file(s) — "
                 + ", ".join(paths[:5])
                 + (f" (+{len(paths) - 5} more)" if len(paths) > 5 else ""))

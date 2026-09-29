@@ -8414,3 +8414,549 @@ dirtying a clean repo and failing on a read-only directory. Verified:
 linting a one-line file left a `__pycache__` directory behind. Replaced
 with the built-in `compile()` on the source text: same syntax check, in
 process, no write and no interpreter spawn per call.
+
+### R244–R252. Deep-dive pass, part 2: the seven largest files — `config.py`, `providers/openai_compat.py`, `ctxtree.py`, `__main__.py`, `tui.py`, `ui.py` (2026-08-26)
+
+Continues the 2026-08-26 audit that produced R229–R243 and stopped before
+`tui.py`, `ui.py`, `engine.py`, `providers/openai_compat.py`, `ctxtree.py`,
+`man.py` and `__main__.py` (~8k lines). `man.py` was checked and found
+accurate — every `COMMAND_ORDER` entry, every `COMMAND_INFO` key and every
+numeric claim spot-checked (`/nano`'s 1MB cap matches `_NANO_MAX_BYTES`) —
+so it carries no requirement of its own.
+
+**R244 — a bare `runtime:` line in config.yaml made Aurora unstartable.**
+`load_config`'s `cfg.setdefault("runtime", {})` is a no-op when the key
+EXISTS holding `None`, which is exactly what a value-less `runtime:` line
+parses to. `Engine.__init__` then called `.get()` on that `None` and died
+with `AttributeError` before the app could render anything — on the file
+Aurora explicitly invites the user to hand-edit (R199, R202). R150e fixed
+this for `models` alone, inside `Engine`; the same hazard sat on all four
+top-level keys. The coercion now lives in `load_config`, where the shape is
+promised. The WRITE side had it too: `persist_runtime_value` /
+`persist_model_entry` did `raw.setdefault(key, ...)[...]`, which raised
+`TypeError` against that same `None` — so no setting could be saved at all
+until the file was hand-repaired. Both go through `_raw_with_section` now.
+
+**R245 — `api_key: none` meant two different things depending on the code
+path.** `_auth_headers` treats the literal string `"none"` as "keyless" (the
+convention for a local llama.cpp server), but `OpenAICompatProvider._probe`
+and `Engine._provider_health_uncached` each rebuilt the header themselves
+and sent `Authorization: Bearer none`. A server that validates tokens 401s
+that, so `pick_endpoint` marks a perfectly healthy endpoint dead and fails
+over off it, and `/status` reports a live backend as unreachable. Both sites
+ask the provider for its headers now.
+
+**R246 — an all-decimal session id was read as a turn count.**
+`ctxtree.report` claimed a bare number "can't shadow a real one" because
+"session ids are 12 hex chars". Ids are `uuid4().hex[:12]`, and roughly one
+in 300 of those comes out all-decimal — `/context <that id>` then silently
+rendered the CURRENT session under a turn limit of several hundred billion
+instead of the session actually asked for. Gated on length as well as digits.
+
+**R247 — `has_pricing` and `cost_for` disagreed about what "priced" means.**
+`has_pricing` tested that the two price KEYS exist while `cost_for` tested
+their VALUES, so an entry carrying `"price_in_per_mtok": null` (a hand edit
+of `remote_context_limits.json`) satisfied the badge's gate and then
+rendered `cost()`'s `0.0` fallback — a confident "$0.00" for a model whose
+price is unknown. `has_pricing` now asks `price_for`, the same predicate the
+arithmetic uses.
+
+**R248 — `--resume <typo>` silently started a fresh session.**
+`resume_from` only adopts the past session when it restored something, so an
+unknown id printed "· resuming session <id> (0 turns)" and then ran in a
+BRAND-NEW session: the log the user believed they were continuing was never
+opened, and everything typed afterwards landed somewhere else. `/context`
+has refused an unknown id since R134; the CLI flag doing the same lookup
+never did.
+
+**R249 — `/nano` wrote the user's file non-atomically.** R241 made the
+model's three write paths (`write_file`/`edit_file`/`apply_patch`) atomic
+and mode/symlink preserving, and left the human's one on `Path.write_text`,
+which truncates before it writes. `/nano` edits the same class of file those
+tools do — config.yaml, a shell script, a doc — so a crash or ENOSPC mid-save
+left it truncated. Now uses `paths.write_text_preserving`, the helper R241
+introduced for exactly this.
+
+**R250 — the crash-log cap allocated everything it exists to refuse.** The
+TUI's asyncio exception handler kept the last 1MB of `tui_crash.log` via
+`read_bytes()[-CAP:]` — R240's shape again (a bound applied after the
+allocation it bounds). A 500MB log, which is what an app crashing in a loop
+writes, meant a 500MB read to keep 1MB, inside the handler that runs BECAUSE
+something already went wrong. Seeks to the tail instead. Extracted as
+`_truncate_crash_log` so the bound is testable without an Application.
+
+**R251 — `/model` with no models configured opened an unanswerable menu.**
+Reachable via `/model remove` of the last entry (R81) or a `models: []`
+config. `_pick_model` built an empty option list and handed it to `select()`;
+in the TUI an arrow key then divides by `len(options)` (ZeroDivisionError)
+and Enter indexes it (IndexError), inside key bindings — so the menu could
+never be resolved while `select_menu()` blocked the worker on its answers
+queue for the rest of the session. `_pick_model` reports the state instead
+(reusing `engine.send`'s wording), and `select_menu`/`_open_ui_menu` refuse a
+zero-option list structurally; `_resolve_menu` bounds-checks its index, which
+a stale mouse handler can hold past the menu's life.
+
+**R252 — a confirmed cancel could not reach a blocked question, and while
+busy there was no way to quit.** Reported from a live session: on a first run
+with the model not loaded, a prompt was accepted, no reply came, and neither
+cancel nor quit worked — the app had to be killed. Every blocking ask in a
+turn (the API-key prompt `_provider_for(interactive=True)` raises on a first
+run, an approval gate, a secret challenge) waited on `self._answers.get()`
+with no timeout, so it was deaf to `fe.cancel_event` — the only thing
+Esc-Esc's "Cancel this?" sets. And because `self._busy` stays True for the
+whole line, the Esc gesture offered cancel and nothing else, so with the
+worker parked there the app had no exit at all. Opening that confirm menu
+also HIDES the pending question (`_prompt()` returns `[]` while a menu is
+up), which is why no prompt was visible to answer. Three parts: `ask()` and
+`select_menu()` now wait through `_await_answer`, which polls the queue and
+`cancel_event` at the same 0.15s cadence `cancellable_sse` uses and answers
+with the caller's own safe value on a cancel (`""` for a prompt, `eof_key`
+for a menu — the answer R214 already settled for "nobody is here to ask");
+the busy Esc menu gains a "Quit Aurora" row; and `_worker` clears
+`cancel_event` when a line ends, so a cancel belongs to the line it
+cancelled rather than auto-answering the next line's first question.
+
+### R253. Typing while a turn runs: a read-only command, a question, or a model switch no longer has to wait — `tui.py`, `ui.py`, `engine.py` (2026-09-20)
+
+Reported with a screenshot: a `run_command` 182s into a 300s window, and
+both `/model` and a typed "are you there?" answered with
+`(queued — still running previous command)`. R245 had already made this
+complaint half-fixable — `run_command(background=True)`/`check_command` for
+the model, and a `!` bash side channel (`_side_inbox`/`_side_worker`) for the
+human — but deliberately scoped that channel to `!` commands only, leaving
+every `/command` and every prompt on `_inbox`, whose sole consumer is
+`_worker`. So the two things actually typed in that screenshot were exactly
+the two R245 didn't cover.
+
+The constraint that shaped the fix is `ARCHITECTURE.md` §6: `engine.messages`
+and the session have exactly one writer (the worker thread), which is why
+neither has a lock. Nothing here adds a second writer.
+
+**Routing (`Tui._route_submitted_line`, the sole producer of both queues).**
+Idle, every line goes to `_inbox` in submission order, exactly as before —
+the fork only exists while `_busy`, and only then does it split by what a
+line would *touch*:
+
+- a read-only `/command` → side channel, runs now;
+- `/model` with no sub-command → side channel, under the input-line lock,
+  switch deferred;
+- a plain prompt → side channel as a quick-ask;
+- anything else (`/clear`, `/compact`, `/rewind`, `/model add`, …) → `_inbox`,
+  still queued, but now saying *which* command and *why*, and that Esc-Esc
+  cancels the turn it is waiting on.
+
+`_side_inbox` entries became `(kind, payload)` tuples rather than bare
+command strings: a bash command can itself begin with `/` (`/usr/bin/ls`) or
+`!`, so no prefix character can tell the four kinds apart unambiguously.
+
+**Which commands qualify (`ui.SIDE_SAFE_COMMANDS`, `ui.side_safe_command`).**
+`status cost context diff skills extensions allowlist denylist copy
+copy-last copy-all export help`, plus `/<any> help|man` — that branch is
+checked ahead of the dispatch chain and only prints `man.command_man` text,
+so `/rewind help` reads the manual without arming `/rewind`. Membership is
+three properties, not a feel: mutates no engine/session state, never prompts,
+never touches `_bash_cwd`/the scrollback. Filesystem read-only is explicitly
+*not* the test — `/export` writes a file and still qualifies, because the
+file it writes is a fresh transcript, not shared state.
+
+**The input line is now locked (`_prompt_lock`, `_acquire_input_line`).**
+`ask()` and `select_menu()` write single slots (`_question`,
+`_menu_prompt`/`_menu_options`, `_saved_draft`) and block on one `_answers`
+queue — two threads in there corrupt both prompts, the same shape R142a
+already survived once. An `RLock` (reentrant: `/model` on a keyless provider
+prompts twice, picker then key) is held for the whole duration of a prompting
+command. A leaked `_prompt_lock` is permanent — the worker blocks on its next
+prompt and nothing ever releases it — so the claim, the setup that follows it
+and the restore that follows THAT all sit under try/finally, with the release
+itself in a nested `finally`. Both halves were found by the test rather than
+by reading: a raise while OPENING the prompt (a buffer write, a render)
+skipped the release, and so did a raise while RESTORING, since the release
+sat after `app.invalidate()` in the same finally block. The main worker blocks for it, which is correct — whoever holds it
+is something a human is looking at. The side worker marks its own thread
+`_prompt_nowait` and takes an `InputLineBusy` refusal instead, reported with
+its reason: parking it behind a turn's approval gate for as long as that gate
+goes unanswered would defeat the point of a channel that exists so a question
+never waits.
+
+**`/model` mid-turn defers its switch.** `ui._pick_model` gained `on_pick`,
+which replaces its closing `engine.switch_model()` and leaves everything
+before it — row building, background price refresh, missing-key prompt —
+identical. The TUI passes `_defer_model`, which parks the payload in
+`_pending_model`; `_worker`'s `finally` applies it via `_apply_pending_model`
+once the turn ends, so the switch happens on the thread every other engine
+write happens on. `Engine.send` has already bound its provider and model for
+the turn in flight, so switching during it would either do nothing visible or
+change the model under the next round of a tool loop. If the turn happens to
+finish while the picker is open, `_defer_model` switches immediately rather
+than deferring into a switch that silently never lands.
+
+**`Engine.quick_ask(user_text, on_text, cancel=None)`** answers against the
+current conversation without joining it: one `provider.turn` call, `tools=[]`,
+built on `list(self.messages)` — a snapshot, so the running turn can append
+while the request is in flight and neither sees the other. Nothing is written
+back. The trade is stated where it's made: it can answer, it cannot act, and
+the model won't remember the exchange next turn. That is the price of not
+needing a lock. Spend is real, so `self._cost` accrues exactly as
+`_live_usage` does it; `self._used` is deliberately left alone, since the
+context gauge tracks the real conversation. Both halves are logged as
+`side_ask`/`side_answer` — distinct event names so `/cost`'s turn counting
+(R92), the cost tree and the markdown export don't read a side exchange as a
+turn that never happened.
+
+It builds its OWN provider (`Engine._side_provider`) rather than reusing the
+cached one. This was the subtlest part and it was wrong first: a provider
+carries plain mutable attributes — `on_think`, `extra_body`, `cache_prompt`,
+`notify` — that `send()` assigns per turn. Sharing the instance means either
+inheriting the live turn's callbacks (a side answer's reasoning streaming
+into the main turn's think row) or writing them from this thread, changing a
+request already in flight. The side instance sets `on_think = None`, a no-op
+`notify`, `cache_prompt = False`, and resolves its key NON-interactively — a
+missing key must not open a prompt from a channel that doesn't own the input
+line. It is closed in a `finally`, since each instance owns a pool of
+keep-alive sockets (R145b). The same reasoning applies one layer up in the
+TUI: `_side_quick_ask` streams through `Tui.append`, not `fe.on_text`, which
+closes the live think block and sets the phase — that renderer belongs to the
+running turn. The chat labels it `⤷ side-turn (no tools, not
+saved to history)` before the answer streams, because "this reply couldn't
+have checked anything and won't be remembered" is not a cosmetic difference.
+
+**`_side_busy` is rendered.** It had been set and read since R245 but never
+drawn, so a concurrent side command was invisible while the main spinner
+talked about something else. The busy status bar now carries ` │ ⇄ side`.
+Esc-Esc is deliberately not offered for it — that gesture cancels the turn.
+
+`_note_if_busy()` is removed. It printed one generic "still running previous
+command" for every line submitted while busy, which is the screenshot on the
+card: two different problems, one uninformative sentence, no recourse offered
+for either. Most of those lines no longer queue, and the ones that must now
+say why at the point they're routed.
+
+23 tests: routing per kind (including that idle submission order is
+untouched), a guard on the SIDE_SAFE list itself, the queue-with-a-reason
+path, side-worker dispatch, the lock refusing one thread while blocking the
+other and reporting the refusal, both lock-leak paths, deferred vs immediate
+model switch, the status-bar indicator, that a side turn renders through
+neither the turn's provider nor its frontend, and `quick_ask` itself —
+history untouched, snapshot identity (not just contents), cost accrued
+without moving the gauge, its own log event names, and the no-model case. Each was verified
+to fail against a mutation of the specific behavior it covers, not merely to
+pass — which is how both lock leaks and one vacuous assertion were caught:
+`_prompt_lock` is reentrant, so an acquire from the thread that leaked it
+SUCCEEDS and proves nothing. Every lock assertion probes from another
+thread.
+
+### R254a–R254i. Review pass on R253: four races, a secret leak, two costs — `tui.py`, `engine.py` (2026-09-20)
+
+A deliberate adversarial re-read of R253, which had shipped green (1296 tests,
+every one mutation-checked). Nine defects, seven of them in code written the
+same day. Worth recording *how* they were found, because "the tests pass and
+each was verified to fail against a mutation" demonstrably did not catch any
+of them: they were found by asking, of each new line, **which thread runs this
+and what else is true at that moment** — and then reproducing the answer in a
+script before writing a line of fix.
+
+**R254a — a real task typed at the end of a turn was silently answered as a
+side turn and dropped.** The worst of the set. `_route_submitted_line` runs on
+the UI thread and reads `_busy`, which the worker thread writes; the decision
+is then acted on much later by `_side_worker`, which also drains `!` commands
+ahead of it. So the window is not the microseconds the phrase "race" suggests
+— it is however long the side channel is backed up. A prompt routed as an
+`ask` while busy, reaching the side worker after the turn ended, was answered
+by a toolless `quick_ask` whose exchange is *by design* never written to
+history. The user's task got a worse answer and then vanished. The routing
+decision is now re-validated where it is acted on, and handed back to
+`_inbox` as an ordinary turn when there is no longer anything to work around.
+
+**R254b — a model picked mid-turn could be parked forever.** `_defer_model`
+(side thread) did "read `_busy`, then park"; `_apply_pending_model` (worker
+thread, in `_worker`'s `finally`) does "take, then clear". A park landing
+between those two is lost: the user is told *"will switch when the current
+turn finishes"*, it finishes, and nothing happens until some later, unrelated
+line ends. R253's own docstring claimed "the deferral never becomes a switch
+that silently didn't happen" — the code contradicted the comment. Both halves
+now run under `_model_lock`, and `_worker` claims `_busy` under the same lock,
+so a turn can also never start midway through a switch and read half of it out
+of `engine.current`.
+
+**R254c — side output closed and split the running turn's think row.**
+`append()` calls `_close_think_locked()` on the sound reasoning that plain
+output means *this request* moved past thinking. That inference belongs to the
+turn's own output; from the side channel it is simply false. Any side output
+froze the running turn's live clock and marked its row done, and because
+`think_chunk`/`begin_think` only recognised their row as `_chat[-1]`, the next
+reasoning chunk opened a *second* row with a restarted timer. `think_chunk`
+now continues the request's open row wherever it sits
+(`_open_think_index_locked`, gated on the `_open_think` flag so the scan only
+runs when there is something to find, and stopping at the row so it walks only
+what was appended after it).
+
+**R254d — two concurrent streams were shredded into one transcript entry.**
+`append()` merges into the previous string entry while that entry is small, so
+a turn streaming its reply and a side turn streaming its own interleaved
+character by character. Measured: `MAIN ANSWER` + `side answer` rendered as
+`MsAiIdNe  AaNnSsWwEeRr`. A side answer is now collected while it streams and
+appended whole, as its own entry kind that can never be merged (`append_side`,
+the same "own kind" reasoning `bash_output` already used). Note the renderer
+had to learn the kind too: `_entry_fragments` falls through to the *think*
+branch for any dict it doesn't recognise, which would have `KeyError`d on the
+new one.
+
+**R254e — the side turn re-billed the whole system prompt on every question.**
+`cache_prompt` was hardcoded `False`, which is not the neutral choice it looks
+like: it drops the `cache_control` breakpoint off the system message, so the
+base preamble + AGENTS.md + the three indexes + every `[CORE]` doc are billed
+at full rate on every mid-turn question — on exactly the models where that
+prompt is largest. It reads `cache_enabled(entry)` now, the same switch
+`send()` reads; the text is byte-identical, so the side request hits the
+prefix the turn already paid to cache. The R253 test asserted
+`cache_prompt is False` — it pinned the bug as if it were the intent, which is
+the failure mode no amount of mutation testing catches.
+
+**R254f — a fresh provider per question re-probed and re-handshaked.** A new
+instance has an empty endpoint cache, so `pick_endpoint` probes before every
+side turn, and a new pooled client means a fresh TCP (and for a remote
+provider, TLS) handshake for the probe *and* the request. R95h removed exactly
+this cost from probing — `_probe` reuses the pooled client because "a fresh
+client, and so a fresh TCP+TLS handshake, is most of what a probe costs" — and
+R253 quietly reintroduced it one layer up. The side provider is now cached and
+reused on the same terms `_provider_for` caches the turn's, closed when the
+provider changes (R145b), with `extra_body` re-applied per call since that
+belongs to the model entry rather than the provider.
+
+**R254g — the side path sent secrets to the provider and wrote them to disk.**
+The serious one. `send()` runs R58's scan before the prompt enters history or
+the log; `quick_ask` ran no scan at all. Verified rather than reasoned about: a
+`ghp_…` inside "does this token still work?" went to the provider in cleartext
+*and* into the session JSONL, with redaction ON. It now **refuses** rather than
+challenging — the challenge is interactive and this path may not own the input
+line, so there is nobody to ask, and the two fallbacks are both wrong
+(prompting anyway deadlocks or steals the turn's gate; silently redacting
+changes what was asked without saying so). It names the kind via
+`secrets.preview`, never the value, and points at the path that *can* run the
+challenge.
+
+**R254h — the side indicator vanished exactly when it mattered most.** R253's
+` │ ⇄ side` lived inside the status bar's `_busy` branch, but a side command
+routinely *outlives* the turn it was queued behind — that is the normal way a
+long `!` ends. So the indicator disappeared at the moment the side command
+became the only work running and the only thing the bar could be reporting.
+
+**R254i — a side turn could not be stopped.** It is a network call that can
+stream for minutes, and there was no cancel: `fe.cancel_event` belongs to the
+turn, and Esc-Esc only ever offered to cancel that. R246 already settled this
+exact shape for background jobs ("a job that was started could not be stopped
+short of it finishing on its own or the whole process exiting"). A
+`_side_cancel` event is now honoured by `quick_ask`, and Esc-Esc grows a
+"Cancel the side question" row — only when something is actually on the
+channel, so the rows are unchanged in the common case, and reachable now even
+when the main worker is idle.
+
+15 further tests, plus four of R253's own rewritten (two had pinned the
+bug as the intent — see R254e). Each was mutation-checked like R253's, but
+the pass was
+driven by reproduction scripts first: every one of R254a, b, c, d and g existed
+as a runnable demonstration of the wrong behaviour before any fix was written.
+Full suite 1311 passed, 2 skipped; ruff unchanged at its 7 pre-existing
+findings.
+
+### R255. The approval gate's "explain" threw the explanation away on a thinking model — `providers/base.py`, `agent.py`, `gitcommit.py`, `engine.py` (2026-09-20)
+
+Reported from a live session: at the approval gate, picking *"Explain —
+describe what this will do, then ask again"* produced a short thinking
+indicator, then nothing, then the same approval menu. Reproduced exactly with
+a provider that streams `reasoning_content` and returns empty `content`.
+
+**The explanation was being generated and discarded.** `_explain_tool_call`
+read `(result.text or "").strip()` and nothing else, so a thinking model that
+spent its budget reasoning — which is the normal shape for a short prompt on a
+local reasoning model — produced `"(no explanation returned)"` while the
+actual explanation sat in the reasoning stream. Worse, that stream went
+somewhere invisible: `Engine.send` points `provider.on_think` at the frontend
+for the duration of a turn, and the side completion borrowed the provider
+without touching it, so the explain call's reasoning was appended to the
+RUNNING turn's think row — collapsed by default, which is the "short thinking
+then nothing" the report describes — and into `fe.think_buffer`, which
+`/copy-last` copies as part of the turn's raw response.
+
+This is R254's rule again, in a place R254 didn't look: *anything a turn
+configures by assignment is not safe to borrow.* The provider's `on_think` is
+exactly that, and three independent call sites had the identical pair of bugs
+— `agent._explain_tool_call`, `gitcommit.draft_message`, and the compact
+summarizer in `engine.py`. Each was written separately, each reads
+`result.text` alone, each leaves `on_think` pointing at the turn. The
+consequences differ per site and none of them look like a thinking bug: a
+useless explanation, a commit draft that reads as "nothing could be drafted",
+and a context fold that silently falls back to a clipped flatten without the
+summary it exists to produce.
+
+`providers.base.side_completion(provider, model, prompt, cancel=None)` is now
+the one implementation: it captures reasoning to a local list with the
+previous callback restored in a `finally` (same thread as the turn, which is
+paused waiting on this, so save/restore needs no second instance — unlike
+R253's `quick_ask`, where a second *thread* forced a separate provider), it
+returns `result.text` when there is any and falls back to the reasoning when
+there is not, and it honours `cancel` — the approval gate now passes
+`cb.cancelled`, so Esc-Esc can stop a slow local model mid-explanation, which
+R246's rule already required and this path predated.
+
+The empty-either-way placeholder changed too: `"(no explanation returned)"`
+left the user at the same menu with no next step, which is precisely how the
+report reads. It now names one.
+
+9 tests: the reasoning fallback, that real content still wins over reasoning,
+that the turn's think channel is untouched and restored (including when the
+call raises — left swapped, every later round of the turn would stream into a
+dead list), cancellation passed through, the gate's end-to-end behaviour, the
+both-empty and provider-failure placeholders, and the same fallback through
+`gitcommit.draft_message`. Each mutation-checked. One pre-existing test
+(`test_explain_tool_call_empty_reply_has_a_placeholder`) updated for the new
+placeholder text.
+
+### R256. `/copy-last` copied one reply out of a multi-round turn; `/copy-response` added — `engine.py`, `ui.py`, `tui.py`, `man.py` (2026-09-20)
+
+Reported live: a prompt that went back and forth "on thinking and stuff",
+then `/copy-last`, and what landed on the clipboard was the prompt and a
+single reply out of many.
+
+`_raw_last_response_text` built its record from `engine.last_response()`,
+which scans back for the first `assistant` message and returns it. That is
+correct for `/copy` (one reply) and wrong for `/copy-last`, whose job is the
+turn. A turn that used tools is a chain — narrate, call, narrate, call,
+answer, wrap up — so `last_response()` returns the LAST link, and on a long
+turn that link is usually a short closing line while the reply the user
+wanted is two or three messages back. Reproduced against a realistic turn:
+of four assistant messages, three were dropped and the copy ended on
+`"Done."`, with the analysis gone.
+
+`Engine.last_turn_messages()` returns everything after the most recent `user`
+entry; `ui._last_turn_answer_text` renders the assistant messages from it in
+order. Tool CALLS are kept as a one-line `→ name` marker each, because the
+narration around them stops making sense without them ("checking the server
+next" followed immediately by a conclusion). Tool OUTPUT is deliberately
+left out — a single result can be `tools.TOOL_OUTPUT_LIMIT` (60KB) of
+machine output, and `/copy-all` already exists for the whole chat. The
+prompt and thinking halves of R124's record are untouched; `think_buffer` is
+cleared in `begin_turn` (per turn, not per request), so it already held
+every round's reasoning and was never part of this bug.
+
+`/copy-response` is the counterpart the picker was missing: the last turn's
+final reply, nothing else. It is not a rename of `/copy` — it differs in two
+ways that both come from the same family of bug. It skips a trailing
+tool-call-only assistant message, which is how a turn stopped at the approval
+gate or capped on iterations ends and where `/copy` returns an empty string
+for a turn the user watched happen; and it is scoped to the last turn, so a
+turn that produced no text reports nothing rather than silently handing back
+an older answer. `/copy` is unchanged, including `/copy N`.
+
+The status bar's `copy` picker names both: "copy last (full)" and
+"copy last (response)". The old "copy last" was ambiguous in exactly the way
+this report exposed, and there was no row for "just the answer" at all.
+
+15 tests, each mutation-checked: every reply preserved and in order, calls
+named but output excluded, no bleed into the previous turn, a turn with no
+final reply, the prompt/thinking halves intact, the empty case, both
+commands registered with blurbs that distinguish them, and the two new
+picker rows. Four existing tests updated — three needed the fake engine's
+new methods, one asserted the picker's row order.
+
+### R257a–R257d. Review of R254–R256: one regression, one ordering inversion, two promises the code didn't keep — `providers/base.py`, `agent.py`, `tui.py` (2026-09-20)
+
+A second adversarial pass, this time over the three fixes shipped earlier the
+same day. Four findings, one of which made an existing command worse than
+before it was "fixed".
+
+**R257a — R255 made `/commit` worse.** R255's second half (fall back to the
+reasoning channel when a thinking model returns empty content) was applied
+unconditionally to all three side-completion callers. That is right for
+exactly one of them. In `explain` the reasoning IS the thing the user reads.
+In the other two the returned string becomes an **artifact**: a commit
+message, or a summary injected into history. `/commit` prints the draft and
+offers a "Yes, commit" key — an empty message is refused outright, a
+plausible-looking one is not — so a monologue ("Okay, let me look at this
+diff. Hmm, what did they actually change...") proposed as the commit message
+is strictly worse than the empty draft it replaced, which sent the user to
+write their own. `side_completion` takes `reasoning_fallback` (default
+False); only `_explain_tool_call` opts in.
+
+The R255 test asserted the wrong behaviour here and passed —
+`test_commit_draft_uses_the_reasoning_channel_too` pinned the regression as
+if it were the intent. That is the second time in one day (see R254e's
+`cache_prompt is False`) and it is the same failure mode: mutation testing
+measures a test's sensitivity *against* its expectation, so it can never
+flag an expectation that is itself wrong.
+
+**R257b — R254a fixed the loss and left an ordering inversion.** Re-validating
+`_busy` at the far end stopped a prompt being answered as a side turn after
+the turn had ended. But a prompt sent to a side channel that is ALREADY
+running something waits there, outside the main queue — and a prompt typed
+later goes straight to an idle main worker and runs first. Measured: A typed
+while busy ran after B typed after it. The side channel's entire value is
+running *now*; when it can't, a prompt belongs in the main queue in the order
+it was typed. `_route_submitted_line` checks `_side_busy` and queues in order
+instead, saying so. A residual window remains — the channel can go busy
+between the check and the dequeue — but it is microseconds rather than the
+length of a `!` command, and the R254a handback still catches the outcome.
+
+**R257c — R254c made `begin_think` trust a flag `clear_screen` doesn't
+reset.** `begin_think` now returns early when `_open_think` is set (the row
+is open but no longer last). `clear_screen` drops every row without clearing
+the flag, so the next request opened no timed row at all. It self-heals on
+the next `append()`, which is why no report exists — but a flag outliving the
+state it describes is the defect, not the symptom.
+
+**R257d — the side-cancel row promised a stop it couldn't deliver.** R254i
+offered "Cancel the side question" whenever `_side_busy`, and `_side_cancel`
+is polled by `quick_ask` and nothing else — so while the channel ran a `!`
+command the row did nothing at all. The channel now records `_side_kind`, and
+the row appears only for a quick-ask. A `!` command remains uncancellable,
+which is honest and unchanged from R245; it just no longer claims otherwise.
+
+9 tests, each mutation-checked, each reproduced first. Three existing tests
+corrected — two had pinned behaviour this pass reverses, one asserted a menu
+shape that changed.
+
+### R264–R293. Deep-dive pass (2026-09-24): 30 defects, each reproduced first
+
+A two-part review, a bug/security sweep and then a performance sweep, found
+30 defects. Each was reproduced against the real code, fixed, and given a
+regression test in `tests/test_deepdive_regressions.py` that was verified
+to fail on the unfixed code. The full testable statement of each is in the
+root `REQUIREMENTS.md` (entries 34–63). Summary:
+
+- **Latency.** R264: a bare Esc waited `timeoutlen` (1.0s) because of the
+  escape-prefixed Alt bindings, so the double-Esc gesture's second tap fired
+  ~1s late. R289: chat frames render from an incremental line cache, 63ms →
+  7.6ms at the 10k-line cap. R290: a dead endpoint is backed off for 120s
+  (it was re-probed at 6.5s per agent round). R282: `web_fetch`'s
+  script/style strip is linear (224KB took 33.7s). R275: checkpoints skip
+  files over 50MB and never snapshot `$HOME` (one 800MB file blocked an
+  approval for 16.9s). R292: `find_files` has a 30s deadline and honours
+  cancel. R293: finished background jobs are pruned. R291: an oversized
+  (resumed) history is folded before a turn's first request.
+- **History integrity.** R265: a write-argument secret stop closes the turn
+  validly. R266: progress is a flag, since a mid-turn fold shrinks the
+  list. R267: fallback turns are logged under the model that answered.
+  R268: non-object tool arguments are a malformed call, not an orphaned
+  tool_call.
+- **Security.** R277: "always allow" no longer generalizes over `sed -i`,
+  `git -c`, `tar`, `rsync`, `uv run`, `ssh`, `kill`, …. R278: OpenRouter
+  keys and `export`-ed credentials are detected. R283: `web_fetch` asks
+  before private hosts or query strings and re-checks redirects per hop.
+  R284: `/commit` secret-scans the diff it sends. R286: a project bootstrap
+  prompt runs only after trust, per exact content. R287: the approval
+  prompt renders control/bidi characters literally.
+- **Tools and undo.** R269: edits keep CRLF line endings. R270: `edit_file`
+  refuses an empty `old`. R271: commands get `stdin=DEVNULL`. R272: Esc-Esc
+  cancels a running `run_command`/`wait_until`. R273: a pathless gated call
+  clears the per-file undo snapshot. R274: nested repos aren't claimed as
+  checkpointed, and a commitless one no longer disables checkpoints. R280:
+  every shadow-repo index operation holds the repo lock. R281: patch hunks
+  anchor on whole lines.
+- **UI.** R279: side-channel prints get their own entry and keep the turn's
+  think row open. R285: `/commit` survives non-UTF-8 diffs. R288: a partial
+  narration line is flushed before tool output. R276: rotated session parts
+  10+ aren't phantom sessions.
+
+Existing tests updated for new shapes: the R265 stop test (it pinned the
+unclosed history), four `run_tool` fakes (new `cancel=` keyword), and the
+R96g guard-superset table (new OpenRouter sample).

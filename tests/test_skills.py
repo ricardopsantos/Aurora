@@ -199,3 +199,121 @@ def test_listing_includes_blurb(tmp_path, monkeypatch):
     out = skills.listing(None)
     assert "/greet" in out
     assert "greets the user" in out
+
+
+# ── doc skills (R247) ─────────────────────────────────────────────────────
+# A second skill kind: a Markdown SKILL.md (frontmatter + prose), the same
+# shape Claude Code and Hermes both use. discover_docs()/load_doc() only run
+# against directories the CALLER names via doc_roots — no path on this
+# machine or any other is ever assumed.
+
+def _mk_doc_skill(root, name, description="does a thing", body="Do the thing.\n"):
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n\n{body}")
+    return d / "SKILL.md"
+
+
+def test_doc_roots_empty_when_unconfigured(tmp_path):
+    # No doc_roots argument at all — must not fall back to any path.
+    assert skills.discover_docs(None) == {}
+    assert skills.discover_docs([]) == {}
+
+
+def test_doc_roots_ignores_a_nonexistent_path(tmp_path):
+    missing = str(tmp_path / "does-not-exist")
+    assert skills.discover_docs([missing]) == {}
+
+
+def test_discover_docs_finds_a_nested_skill_md(tmp_path):
+    root = tmp_path / "library"
+    _mk_doc_skill(root / "category", "my-skill")
+    found = skills.discover_docs([str(root)])
+    assert set(found) == {"my-skill"}
+    assert found["my-skill"].name == "SKILL.md"
+
+
+def test_discover_docs_earlier_root_shadows_later(tmp_path):
+    r1, r2 = tmp_path / "r1", tmp_path / "r2"
+    _mk_doc_skill(r1, "dup", description="from r1")
+    _mk_doc_skill(r2, "dup", description="from r2")
+    found = skills.discover_docs([str(r1), str(r2)])
+    assert "from r1" in found["dup"].read_text()
+
+
+def test_discover_docs_survives_an_unreadable_root(tmp_path):
+    root = tmp_path / "library"
+    _mk_doc_skill(root, "ok-skill")
+    os.chmod(root, 0o000)
+    try:
+        # Not asserting emptiness here — root itself is unreadable so
+        # rglob raises, caught the same way discover() tolerates it.
+        result = skills.discover_docs([str(root)])
+        assert result == {}
+    finally:
+        os.chmod(root, 0o755)
+
+
+def test_load_doc_strips_frontmatter_and_keeps_body(tmp_path):
+    root = tmp_path / "library"
+    _mk_doc_skill(root, "greeter", description="says hi",
+                  body="Say hello to the user.\n")
+    text = skills.load_doc("greeter", [str(root)])
+    assert "Say hello to the user." in text
+    assert "says hi" in text          # description folded into the header
+    assert "---" not in text          # frontmatter fence itself is gone
+
+
+def test_load_doc_unknown_name_returns_none(tmp_path):
+    root = tmp_path / "library"
+    _mk_doc_skill(root, "known")
+    assert skills.load_doc("unknown", [str(root)]) is None
+
+
+def test_load_doc_tolerates_malformed_frontmatter(tmp_path):
+    root = tmp_path / "library"
+    d = root / "broken"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text("---\n: : not valid yaml : :\n---\nBody text.\n")
+    text = skills.load_doc("broken", [str(root)])
+    assert text is not None
+    assert "Body text." in text
+
+
+def test_load_doc_recovers_description_with_an_embedded_colon(tmp_path):
+    # Regression: a description containing its own "word: word" is common in
+    # the real skill corpus and is invalid strict YAML (an unquoted colon+
+    # space ends a plain scalar's value) — the bug this was written against:
+    # `agentic-context-bootstrap`'s real description does exactly this
+    # ("...a topic: SOUL.md's machine brief...") and came back with NO
+    # description at all under a strict-only parser.
+    root = tmp_path / "library"
+    d = root / "real-shape"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\nname: real-shape\n"
+        "description: Use when the user asks about a topic: something else.\n"
+        "version: 1.0.0\n---\nBody.\n")
+    text = skills.load_doc("real-shape", [str(root)])
+    assert "Use when the user asks about a topic: something else." in text
+
+
+def test_listing_includes_doc_skills_with_description(tmp_path):
+    root = tmp_path / "library"
+    _mk_doc_skill(root, "my-doc-skill", description="a documented skill")
+    out = skills.listing(None, [str(root)])
+    assert "/my-doc-skill" in out
+    assert "a documented skill" in out
+    assert "[doc]" in out
+
+
+def test_listing_executable_skill_shadows_doc_skill_of_same_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    _mk_skill(tmp_path / "home" / "skills", "dup.py", "# the real one\nprint('x')\n")
+    root = tmp_path / "library"
+    _mk_doc_skill(root, "dup", description="the doc version")
+    out = skills.listing(None, [str(root)])
+    assert out.count("/dup") == 1
+    assert "the real one" in out
+    assert "the doc version" not in out

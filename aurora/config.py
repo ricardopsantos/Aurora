@@ -32,10 +32,16 @@ def load_config(path: str | Path) -> dict:
     # dashes, straight into it. Same defect R146b fixed in session.py.
     with open(path, encoding="utf-8") as f:
         cfg = _expand(yaml.safe_load(f)) or {}
-    cfg.setdefault("providers", {})
-    cfg.setdefault("models", [])
-    cfg.setdefault("runtime", {})
-    cfg.setdefault("skills", {})
+    # R244: `setdefault` does NOT replace a key that exists with a null value,
+    # and a bare `runtime:` line in YAML parses as exactly that. Every consumer
+    # then does `cfg["runtime"].get(...)` on a None and Aurora refuses to start
+    # — on a file it explicitly invites the user to hand-edit. R150e fixed this
+    # for `models` alone, inside Engine; the same hazard is on all four keys, so
+    # the coercion belongs here, where the shape is promised in the first place.
+    for key, empty in (("providers", {}), ("models", []),
+                       ("runtime", {}), ("skills", {})):
+        if not isinstance(cfg.get(key), type(empty)):
+            cfg[key] = empty
     cfg["_path"] = str(path.resolve())
     cfg["_base_dir"] = str(path.resolve().parent)
     return cfg
@@ -64,14 +70,27 @@ def save_state_values(**values) -> None:
     write_text_atomic(_state_path(), yaml.safe_dump(st, sort_keys=False))
 
 
+def _raw_with_section(path: Path, key: str, empty):
+    """R244: the raw config, with `key` guaranteed to hold a container of the
+    right type. The write paths used `raw.setdefault(key, ...)`, which returns
+    the existing None for a bare `runtime:` / `models:` line — so the very next
+    subscript raised TypeError and no setting could be saved at all until the
+    file was hand-edited. `load_config` coerces the same four keys on the READ
+    side; this is the write side of one rule."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw.get(key), type(empty)):
+        raw[key] = empty
+    return raw
+
+
 def persist_runtime_value(cfg: dict, key: str, value) -> None:
     """Rewrite one runtime.<key> in the config file, preserving ${VARS}
     values (the raw, unexpanded text is re-parsed, mutated, and dumped).
     YAML comments do NOT survive the round-trip — anywhere in the file, not
     just the runtime block; acceptable for v1."""
     path = Path(cfg["_path"])
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    raw.setdefault("runtime", {})[key] = value
+    raw = _raw_with_section(path, "runtime", {})
+    raw["runtime"][key] = value
     write_text_atomic(path, yaml.safe_dump(raw, sort_keys=False,
                                           allow_unicode=True))
     cfg["runtime"][key] = value
@@ -83,8 +102,8 @@ def persist_model_entry(cfg: dict, entry: dict) -> None:
     survive, YAML comments do not. Also appends to the live cfg dict so the
     running engine sees it without a reload."""
     path = Path(cfg["_path"])
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    raw.setdefault("models", []).append(dict(entry))
+    raw = _raw_with_section(path, "models", [])
+    raw["models"].append(dict(entry))
     write_text_atomic(path, yaml.safe_dump(raw, sort_keys=False,
                                           allow_unicode=True))
     cfg.setdefault("models", []).append(entry)

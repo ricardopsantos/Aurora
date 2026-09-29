@@ -23,6 +23,10 @@ DEFAULT_TURNS = 20
 # a turn label is a reminder, not the prompt
 _LABEL_CHARS = 40
 
+# R246: `session.Session` mints ids as `uuid4().hex[:12]`. Kept here as the
+# threshold `report()` tells a turn count from a session id by.
+_SESSION_ID_LEN = 12
+
 # R133: only sessions logged after it carry these. A reader must treat their
 # absence as "not recorded" — NEVER as "it didn't happen". Pre-R133 sessions
 # have no approval records at all, so an empty approval list there says
@@ -492,9 +496,13 @@ def report(engine, arg: str) -> str:
     for w in arg.split():
         if w.lower() == "all":
             limit = None
-        elif w.isdigit() and int(w):
-            # a bare number is a turn count, not a session id — session ids
-            # are 12 hex chars, so this can't shadow a real one
+        elif w.isdigit() and int(w) and len(w) < _SESSION_ID_LEN:
+            # a bare number is a turn count, not a session id. R246: the
+            # length test is what makes that true. Session ids are 12 HEX
+            # chars — `uuid4().hex[:12]` — and roughly one in 300 of them
+            # comes out all-decimal, at which point `/context <that id>`
+            # silently rendered the CURRENT session under a turn limit of
+            # several hundred billion instead of the one that was asked for.
             limit = int(w)
         else:
             session_id = w

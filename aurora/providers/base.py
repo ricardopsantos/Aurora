@@ -40,6 +40,62 @@ class TurnResult:
     reasoning_chars: int = 0
 
 
+def side_completion(provider, model: str, prompt: str, *,
+                    cancel: Callable[[], bool] | None = None,
+                    reasoning_fallback: bool = False) -> str:
+    """R255: a one-off, tool-free completion that is NOT part of the
+    conversation — the shape behind the approval gate's "explain" (R103),
+    `gitcommit.draft_message` and the compact summarizer.
+
+    All three were written independently and all three got the same two
+    things wrong, because both only show up on a THINKING model:
+
+    - **They borrowed the turn's `on_think`.** A provider is shared and
+      `Engine.send` points `provider.on_think` at the frontend for the
+      duration of a turn. A side completion left it there, so its reasoning
+      streamed into the running turn's think row — collapsed by default, so
+      what the user saw was a "thinking" row appear and nothing readable —
+      and into `fe.think_buffer`, which `/copy-last` copies as part of the
+      turn's raw response. It is captured here instead, and the previous
+      callback restored: same thread as the turn (which is paused waiting
+      for this), so save/restore is safe and needs no second instance.
+    - **They read `result.text` and nothing else.** A thinking model can
+      spend its whole budget in `reasoning_content` and return empty
+      content. The answer exists; it just arrived on the other channel. The
+      reported symptom was "explain → a short thinking → nothing shown →
+      the approval menu again": the explanation had been generated and
+      thrown away.
+
+    `reasoning_fallback` is what R255 got wrong by making that second fix
+    unconditional, and R257 corrects. Reasoning is PROSE THE USER READS in
+    exactly one of the three callers — `explain`, where the explanation
+    really does live there. In the other two the returned string becomes an
+    ARTIFACT: a commit message, or a summary injected into history. A
+    thinking model's monologue proposed as a commit message ("Okay, let me
+    look at this diff. Hmm, what did they actually do...") is worse than the
+    empty draft it replaced, because `/commit` offers it with a "Yes,
+    commit" key — an empty one is refused outright, a plausible-looking one
+    is not. So it is opt-in, and only `explain` opts in.
+
+    `cancel` is honoured, so a slow local model explaining a command can be
+    stopped — R246's rule, which this path also predated.
+    """
+    previous = getattr(provider, "on_think", None)
+    reasoning: list[str] = []
+    provider.on_think = reasoning.append
+    try:
+        result = provider.turn(model, [{"role": "user", "content": prompt}],
+                               "", None, lambda _s: None,
+                               cancel or (lambda: False))
+    finally:
+        provider.on_think = previous
+    text = (result.text or "").strip()
+    if text or not reasoning_fallback:
+        return text
+    # content came back empty — the model reasoned and never "answered"
+    return "".join(reasoning).strip()
+
+
 class ProviderError(Exception):
     pass
 
@@ -198,3 +254,14 @@ class Provider(ABC):
         engine.py's context_stats()). Providers with no known per-token
         price (e.g. a local model) default to False."""
         return False
+
+    def model_health(self, model: str) -> dict | None:
+        """Best-effort per-model reachability/existence check for the
+        `/model` picker (R254). Returns `{"ok": bool, "detail": str}`, or
+        None when there's nothing worth checking for this provider — the
+        default, so a remote paid API (and any fake provider in the test
+        suite) is silently skipped rather than probed on every picker open.
+        Subclasses that CAN say something meaningful (a local/LAN backend
+        that may be down, an Ollama model that may never have been pulled)
+        override this."""
+        return None

@@ -156,7 +156,10 @@ def write_text_preserving(path: "Path | str", text: str) -> None:
     fd, tmp = tempfile.mkstemp(dir=str(p.parent),
                                prefix=f".{p.name}.", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        # R269: newline="" — write exactly the text given. Text mode's
+        # default newline translation is what callers preserving a file's
+        # own line endings (tools._read_for_edit) must not be undone by.
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())

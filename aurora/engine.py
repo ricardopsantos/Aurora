@@ -29,7 +29,7 @@ from . import secrets as secretscan
 from .config import load_config, persist_runtime_value
 from .frontend import Frontend
 from .providers import make_provider
-from .providers.base import ProviderError
+from .providers.base import ProviderError, side_completion
 from .session import Session
 
 # R156: how much of the window a compaction's INPUT may occupy. The fold has
@@ -174,6 +174,13 @@ class Engine:
         # default, since silently switching models mid-session is a real
         # behavior change some setups don't want (e.g. a fixed-model CI job).
         self.model_fallback = bool(self.runtime.get("model_fallback", False))
+        # R262: `/auto-approve on|off` — deliberately session-only, NOT
+        # read from runtime.yaml like model_fallback/multiline above. A
+        # standing config-file bypass of the approval gate is a much bigger
+        # foot-gun than a toggle that always starts back off on a fresh
+        # run — the whole point is "stop nagging me right now", not "never
+        # ask again on this machine".
+        self.auto_approve = False
         self.system = _base_system()
         self.messages: list[dict] = []
         self._used = 0
@@ -195,6 +202,10 @@ class Engine:
         self._key_ok: dict[str, bool] = {}  # provider → key available (/model picker)
         self._provider = None
         self._provider_key = None
+        # R254f: the side channel's own provider (see `_side_provider`),
+        # cached on the same terms as the one above and never shared with it
+        self._side_provider_obj = None
+        self._side_provider_key = None
         self._limit_cache: dict = {}
         # R95i: keys whose limit refresh is already in flight, so a burst of
         # renders spawns ONE probe thread, not one per frame.
@@ -521,7 +532,11 @@ class Engine:
                 # a brand-new request against another model behind the
                 # user's back, the opposite of what cancel means.
                 return turn
-            if len(self.messages) > before:
+            # R266: `turn.produced`, not `len(self.messages) > before` — a
+            # mid-turn fold shrinks the list in place, so a turn that made
+            # real progress (tools already ran) looked like a dead provider
+            # and was re-run on another model.
+            if getattr(turn, "produced", False) or len(self.messages) > before:
                 return turn   # made progress — stop here, even if imperfect
             if last:
                 return turn   # nothing left to fall back to
@@ -561,6 +576,13 @@ class Engine:
                 elif decision == "redact":
                     user_text = secretscan.redact(user_text, matches)
 
+        # R291: the first request of a turn is otherwise never checked — the
+        # folds run mid-turn from round 2 (agent.py) and at turn END. After
+        # `--continue`/`/resume` (which restores the whole log: measured 1M
+        # estimated tokens from a 46MB session) the very first request went
+        # out over the window, and was rejected before any fold could run.
+        # Here history still ends on an assistant message: a valid fold point.
+        self._maybe_auto_compact(fe)
         user_msg = {"role": "user", "content": user_text}
         self.messages.append(user_msg)
         self.session.log("user", text=user_text, model=model,
@@ -583,6 +605,7 @@ class Engine:
                 # R154: the result is in history now — count it now too
                 self._count_tool_output(fe, len(o))),
             approve=fe.approve,
+            auto_approve=lambda: self.auto_approve,   # R262
             ask_continue=fe.ask_continue,
             notify=fe.notify,
             cancelled=fe.cancelled,
@@ -603,10 +626,15 @@ class Engine:
             # it's inside this checkpointed tree — see rewind.
             # snapshot_before_write's docstring for why the whole-tree
             # checkpoint alone isn't enough.
+            # R273: a gated call with no single target path (run_command,
+            # wait_until, cancel_command, mcp_*) must INVALIDATE the previous
+            # per-file snapshot — `clear_last_mutation` existed for exactly
+            # this and was never called, so /undo reverted an older edit
+            # instead of reporting the real last change.
             checkpoint=lambda tool, args: (
                 rewind.checkpoint(f"[{tool}] {user_text}"),
                 rewind.snapshot_before_write(str(args["path"]))
-                if args.get("path") else None),
+                if args.get("path") else rewind.clear_last_mutation()),
             on_request=getattr(fe, "on_request", None),
             # R58: None (feature off) short-circuits scanning in the agent loop
             secret_challenge=(lambda ctx, m, source_text="":
@@ -631,12 +659,19 @@ class Engine:
             if self.messages and self.messages[-1] is user_msg:
                 self.messages.pop()
             raise
+        # R267: R162 may have switched models mid-send — attribute the
+        # record (tokens, cost basis, latency) to the model that answered,
+        # not the one that failed.
+        model = self.current.get("model", model)
         # R95e: did this turn actually produce anything? The user message is
         # popped below when it didn't, which leaves messages[-1] pointing at
         # the PREVIOUS turn's assistant reply — logging that as a fresh
         # `assistant` event re-records an old answer, inflating /cost's turn
         # count (R92) and duplicating it in the markdown export.
-        produced = len(self.messages) > before
+        # R266: the flag the loop sets, not a length comparison a mid-turn
+        # fold defeats (see `_run_turn_with_fallback`).
+        produced = bool(getattr(turn, "produced", False)) \
+            or len(self.messages) > before
 
         # a turn that produced NOTHING (provider error / interrupt before any
         # assistant output) leaves the user message dangling — the next send
@@ -708,6 +743,150 @@ class Engine:
                          if getattr(self._provider, "extra_body", None)
                          else [])
         self._maybe_auto_compact(fe)
+
+    def quick_ask(self, user_text: str, on_text, cancel=None) -> str:
+        """R253: answer a question against the CURRENT conversation without
+        joining it — one provider call, no tools, nothing appended to
+        `self.messages`.
+
+        This is what the TUI runs when a prompt is typed while a turn is
+        already in flight ("are you there?" while a 182s `run_command`
+        blocks). It exists because the obvious alternative — a second real
+        turn — would put two writers on `self.messages`, and ARCHITECTURE §6's
+        entire lock-free design rests on that list having exactly one (the
+        worker thread). So this reads a SNAPSHOT and writes nothing back:
+        the running turn can append to `self.messages` while this call is
+        in flight and neither sees the other.
+
+        The trade, stated plainly: it can answer, it cannot act. No tools,
+        and the exchange is not in history, so the model won't remember it
+        next turn. That is the price of not needing a lock.
+
+        Spend is real, so it is accounted for: `self._cost` is accrued the
+        same way `_live_usage` does it, and both halves are written to the
+        session log under their own `side_ask`/`side_answer` event names —
+        distinct from `user`/`assistant` so `/cost`'s turn counting, the
+        cost tree and the markdown export don't read a side exchange as a
+        turn that never happened. `self._used` is deliberately NOT touched:
+        the context gauge tracks the real conversation, which this is not
+        part of.
+        """
+        model = self.current.get("model", "")
+        if not model:
+            return "[no model selected — /model to pick one]"
+        # NOT `_provider_for`: that returns the ONE cached provider the
+        # running turn is using, and a provider carries plain mutable
+        # attributes (`on_think`, `extra_body`, `cache_prompt`, `notify`)
+        # that `send()` sets per turn. Reusing it would mean either
+        # inheriting the live turn's callbacks — a side answer's reasoning
+        # streaming into the main turn's think row — or writing them from
+        # this thread, which changes a request already in flight. A short
+        # lived instance of its own has neither problem; it is closed below,
+        # since each one owns a pool of keep-alive sockets (R145b).
+        # one snapshot of the model entry: `switch_model` runs on the worker
+        # thread and can replace `self.current` between any two reads here,
+        # which would otherwise mix one model's provider with another's
+        # extra_body or cache setting.
+        entry = self.current
+        provider = self._side_provider(entry)
+        if provider is None:
+            return "[no provider configured for the current model]"
+        # R254g: R58's gate, which the side path originally skipped outright
+        # — a mid-turn question carrying a token was sent to the provider in
+        # cleartext AND written to the session log, with redaction ON.
+        # Verified, not theorised: a `ghp_…` in "does this token still work?"
+        # leaked both ways.
+        #
+        # It REFUSES rather than challenging. The challenge is interactive,
+        # and this path by definition may not own the input line (the running
+        # turn does), so there is nobody to ask — and the two fallbacks are
+        # both wrong: prompting anyway deadlocks or steals the turn's gate,
+        # and silently redacting changes what was asked without saying so.
+        # Fail closed, name the kind (never the value — `preview`'s whole
+        # job), and point at the path that CAN run the challenge.
+        if self.redact_secrets:
+            matches = secretscan.scan(user_text, self.secret_allowlist)
+            if matches:
+                return (f"[not sent — {secretscan.preview(matches)} detected. "
+                        "A side question can't run the secret challenge: that "
+                        "needs the input line, which the running turn owns. "
+                        "Send it as a normal prompt once the turn ends.]")
+        # a snapshot, taken once: `list()` copies the references, so a
+        # concurrent `append` from the worker thread can't change what this
+        # request sends, and nothing here can change what that turn sees.
+        messages = list(self.messages) + [{"role": "user", "content": user_text}]
+        self.session.log("side_ask", text=user_text, model=model)
+        try:
+            result = provider.turn(model, messages, self.system, [], on_text,
+                                   cancel or (lambda: False))
+            if (result.input_tokens or result.output_tokens) and \
+                    hasattr(provider, "cost"):
+                self._cost += provider.cost(
+                    model, result.input_tokens, result.output_tokens,
+                    result.cached_input_tokens)
+                if (getattr(provider, "has_pricing", None)
+                        and provider.has_pricing(model)):
+                    self._cost_priced = True
+            self.session.log("side_answer", text=result.text, model=model,
+                             input_tokens=result.input_tokens,
+                             output_tokens=result.output_tokens,
+                             cached_input=result.cached_input_tokens)
+            return result.text
+        finally:
+            # R254f: NOT closed here any more — it is cached and reused (see
+            # `_side_provider`); it is closed when the provider changes.
+            pass
+
+    def _side_provider(self, entry: dict | None = None):
+        """R253: the provider instance `quick_ask` uses — separate from the
+        turn's, because a provider carries per-turn mutable attributes (see
+        `quick_ask`), and deliberately NON-interactive: a missing key must
+        not open a prompt from the side channel, which does not own the
+        input line.
+
+        R254f: **cached and reused**, keyed on the provider, exactly the way
+        `_provider_for` caches the turn's. Building one per call looked
+        harmless and was not: a fresh instance has an empty endpoint cache,
+        so `pick_endpoint` re-probes on every question, and a fresh pooled
+        client means a new TCP (and for a remote provider, TLS) handshake
+        for the probe AND the request. R95h removed exactly that cost from
+        probing — `_probe` reuses the pooled client precisely because "a
+        fresh client, and so a fresh TCP+TLS handshake, is most of what a
+        probe costs" — and building per call quietly reintroduced it one
+        layer up. Only the side worker thread touches this instance, so the
+        attributes below are not raced the way the shared one's would be.
+
+        Called from the side worker thread only.
+        """
+        entry = entry if entry is not None else self.current
+        pkey = entry.get("provider")
+        if pkey != self._side_provider_key or self._side_provider_obj is None:
+            # R145b: each instance owns a pool of keep-alive sockets; the one
+            # being replaced has to be closed or the fds are stranded.
+            _close_provider(self._side_provider_obj)
+            pcfg = dict(self.cfg["providers"].get(pkey, {}))
+            env = pcfg.get("api_key_env")
+            if env and not pcfg.get("api_key"):
+                pcfg["api_key"] = keystore.get_key(env, interactive=False) or ""
+            self._side_provider_obj = make_provider(pkey, pcfg, self.timeout)
+            self._side_provider_key = pkey
+        provider = self._side_provider_obj
+        if provider is not None:
+            # re-applied per call: `extra_body` belongs to the MODEL entry,
+            # which can change without the provider changing
+            provider.extra_body = entry.get("extra_body") or {}
+            provider.on_think = None      # no live thinking stream: the think
+            # row on screen belongs to the running turn, not to this
+            provider.notify = lambda _m: None
+            # R254e: was hardcoded False. That is not "neutral" — it drops the
+            # `cache_control` breakpoint off the system prompt, so the base
+            # preamble + AGENTS.md + indexes + every [CORE] doc get billed at
+            # full rate on EVERY mid-turn question, on exactly the models
+            # where that prompt is largest. It reads the same switch `send()`
+            # does; the text is byte-identical, so the side request hits the
+            # prefix the turn already paid to cache.
+            provider.cache_prompt = self.cache_enabled(entry)
+        return provider
 
     def _live_usage(self, fe: Frontend, input_tokens: int,
                     output_tokens: int, cached_tokens: int = 0) -> None:
@@ -823,6 +1002,45 @@ class Engine:
         for m in reversed(self.messages):
             if m.get("role") == "assistant":
                 return _assistant_text(m)
+        return ""
+
+    def last_turn_messages(self) -> list[dict]:
+        """R256: every message of the LAST turn — everything after the most
+        recent `user` entry, in order.
+
+        `last_response()` returns only the final assistant message, which is
+        the right answer for `/copy` (one reply) and the wrong one for
+        `/copy-last`, whose job is the whole turn. A turn that used tools is
+        a chain — narration, tool call, narration, tool call, final answer —
+        and on a long one the substantive reply is usually an INTERMEDIATE
+        message, with the last being a short wrap-up. Reported live: a turn
+        that "went back and forth" copied as the prompt and one reply.
+
+        Returns the raw messages so the caller decides what to render from
+        them (`ui._raw_last_response_text` omits tool RESULTS — one can be
+        60KB, and the clipboard is not where that belongs)."""
+        for i in range(len(self.messages) - 1, -1, -1):
+            if self.messages[i].get("role") == "user":
+                return self.messages[i + 1:]
+        return list(self.messages)
+
+    def last_turn_final_reply(self) -> str:
+        """R256: the last thing the model actually SAID — the final assistant
+        message that carries text.
+
+        Not `last_response()`, which returns the final assistant message even
+        when that message is a tool call with no content: a turn stopped at
+        the approval gate, or capped on iterations, ends exactly that way, and
+        `/copy` then copies an empty string for a turn the user watched
+        happen. Scans back past those to the last one with something in it.
+        Scoped to the last turn, so it never silently reaches into the
+        previous one when this turn produced no text at all."""
+        for msg in reversed(self.last_turn_messages()):
+            if msg.get("role") != "assistant":
+                continue
+            text = _assistant_text(msg).strip()
+            if text:
+                return text
         return ""
 
     def last_prompt(self) -> str:
@@ -1043,10 +1261,12 @@ class Engine:
                    "tasks, constraints the user stated. Drop: pleasantries, "
                    "superseded attempts, full file dumps. Reply with ONLY the "
                    "summary.\n\n" + compact.clip_transcript(transcript, budget))
-            msg = [{"role": "user", "content": ask}]
-            result = provider.turn(self.current.get("model", ""), msg,
-                                   "", None, lambda _s: None, lambda: False)
-            summary = (result.text or "").strip()
+            # R255: the third instance of the side-completion shape. Here an
+            # empty `result.text` from a thinking model meant the summary
+            # silently fell back to a clipped flatten — the fold happened,
+            # just without the summary it exists to produce.
+            summary = side_completion(provider, self.current.get("model", ""),
+                                      ask)
         except Exception:
             pass  # model unreachable → clipped flatten below
         if summary:
@@ -1201,12 +1421,27 @@ class Engine:
 
             from .providers.openai_compat import _is_bare_ip
             base = provider.base_url.removesuffix("/v1")
-            headers = {"Authorization": f"Bearer {provider.api_key}"} \
-                if provider.api_key else {}
+            # R245: same rule as the provider's own probe — ask the provider
+            # for its headers instead of rebuilding them here, so the
+            # `api_key: none` convention can't mean two different things
+            # depending on which code path reached the server.
+            headers = provider._auth_headers() \
+                if callable(getattr(provider, "_auth_headers", None)) \
+                else ({"Authorization": f"Bearer {provider.api_key}"}
+                      if provider.api_key else {})
             r = httpx.get(f"{base}/props", headers=headers, timeout=5,
                          verify=not _is_bare_ip(provider.base_url))
             r.raise_for_status()
             props = r.json()
+            # R295: an idle-unloaded server (m7's idle manager, a gateway)
+            # answers `{"sleeping": true, "model_path": null}`. That is a
+            # healthy backend that loads on the first request — it used to
+            # render as "? ready, ctx unknown — /props schema changed?
+            # (llama.cpp upgrade)" at every startup, a false alarm.
+            if props.get("sleeping"):
+                return {"ok": True,
+                        "detail": "asleep — the model loads on the first "
+                                  "request (expect a slower first reply)"}
             n_ctx = props.get("default_generation_settings", {}).get("n_ctx")
             model = (props.get("model_path") or "?").rsplit("/", 1)[-1]
             # degrade LOUDLY: a llama.cpp upgrade that moves n_ctx/model_path

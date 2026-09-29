@@ -2,6 +2,7 @@
 built but never run (no terminal needed)."""
 
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -121,6 +122,7 @@ class _FakeEngine:
     cfg = {"_base_dir": None}
     messages = []
     multiline = False
+    auto_approve = False    # R262 (read by the status bar)
     _last_resp = ""
 
     def context_stats(self):
@@ -140,6 +142,13 @@ class _FakeEngine:
 
     def last_prompt(self):
         return ""
+
+    def last_turn_messages(self):        # R256
+        return [{"role": "assistant", "content": self._last_resp}] \
+            if self._last_resp else []
+
+    def last_turn_final_reply(self):     # R256
+        return self._last_resp
 
 
 @pytest.fixture
@@ -925,6 +934,20 @@ def test_the_status_bar_shows_one_copy_button_not_four(t):
         assert gone not in bar, gone
 
 
+def test_status_bar_warns_while_auto_approve_is_on(t):
+    """R262: `/auto-approve on` silences every gated tool-call prompt for
+    the rest of the session — the one thing standing between the model and
+    a mutating call it wants to run. Leaving that on with no on-screen
+    reminder is exactly how someone forgets it's still on for an unrelated
+    later request, so the status bar must carry a persistent warning for as
+    long as the flag is on, and nothing at all when it's off."""
+    bar = "".join(f[1] for f in _status_frags(t))
+    assert "auto-approve" not in bar
+    t.engine.auto_approve = True
+    bar = "".join(f[1] for f in _status_frags(t))
+    assert "⚠ auto-approve ON" in bar
+
+
 def test_opening_the_copy_menu_does_not_eat_the_draft(t, monkeypatch):
     """`_open_ui_menu` resets the input buffer, which clears the TEXT and not
     just the selection — so the picker would cost the user a half-typed
@@ -985,7 +1008,9 @@ def test_copy_menu_defaults_to_the_selection_when_there_is_one(t):
     _click_input(t)
     t._copy_menu_click()(_mouse_up())
     assert t._menu_options[t._menu_index][0] == "selected"
-    assert [k for k, _ in t._menu_options][:3] == ["last", "session", "id"]
+    # R256 added the "response" row between "last" and "session"
+    assert [k for k, _ in t._menu_options][:4] == [
+        "last", "response", "session", "id"]
 
 
 def test_copy_menu_reports_a_selection_that_vanished(t, monkeypatch):
@@ -1780,7 +1805,9 @@ def test_double_esc_opens_cancel_confirm_menu(t):
     assert t._esc_armed is None
     assert not t.fe.cancel_event.is_set()                # not yet — needs a menu pick
     assert t._menu_prompt == "Cancel this?"
-    assert [k for k, _ in t._menu_options] == ["cancel", "continue"]
+    # R252 added the "quit" row — while busy this menu is the only exit the
+    # keyboard offers, and cancel alone was not always able to be one.
+    assert [k for k, _ in t._menu_options] == ["cancel", "continue", "quit"]
 
     t._resolve_menu(1)   # "No, keep going"
     assert not t.fe.cancel_event.is_set() and t._menu_options is None
@@ -1813,6 +1840,33 @@ def test_double_esc_opens_quit_confirm_menu(t):
     t._on_escape(lambda: calls.append("exit"))
     t._resolve_menu(0)   # "Yes, quit"
     assert calls == ["exit"]
+
+
+def test_third_esc_cancels_the_quit_menu_it_just_opened(t):
+    """R261: reported lockup — Esc mashed to clear a garbled draft walks
+    clear-draft (1st) → arm quit (2nd, buffer now empty) → open "Quit
+    Aurora?" (3rd) in one breath, and every Esc after that USED to be a
+    no-op like any other confirm menu — so a 4th Esc trying to escape the
+    menu did nothing, and neither did typing (R211 swallows keys while a
+    menu is open): indistinguishable from a frozen app. "Don't quit" is
+    never a destructive default, so bare Esc now cancels this menu the
+    same way it already does for "Select model".
+
+    Fails without the fix: menu is still open after the 3rd Esc."""
+    t.input.buffer.text = "some garbled draft"
+    calls = []
+    t._on_escape(lambda: calls.append("exit"))   # 1st: clears the draft
+    assert t.input.buffer.text == ""
+    t._on_escape(lambda: calls.append("exit"))   # 2nd: arms quit (now empty)
+    t._on_escape(lambda: calls.append("exit"))   # 3rd: opens "Quit Aurora?"
+    assert t._menu_prompt == "Quit Aurora?"
+
+    t._on_escape(lambda: calls.append("exit"))   # 4th: must cancel it, not no-op
+    assert t._menu_options is None
+    assert calls == []                            # never actually quit
+    # normal typing works again right after
+    _type(t, "x")
+    assert t.input.buffer.text == "x"
 
 
 def test_double_esc_opens_leave_bash_confirm_menu(t):
@@ -1941,6 +1995,82 @@ def test_bash_mode_cd_to_missing_dir_reports_error(t, monkeypatch):
     th.join(timeout=2)
     assert not th.is_alive()
     assert t._bash_cwd == before
+
+
+# ── R245: side-channel `!` commands while the main worker is busy ──────────
+def test_bash_command_routes_to_side_inbox_when_main_worker_is_busy(t):
+    from prompt_toolkit.input.defaults import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+    t._busy = True   # simulate the main worker mid-turn
+    with create_pipe_input() as pipe:
+        t.app.input, t.app.output = pipe, DummyOutput()
+        th = threading.Thread(target=t.app.run, daemon=True)
+        th.start()
+        time.sleep(0.3)
+        pipe.send_text("!")
+        time.sleep(0.15)
+        pipe.send_text("echo hi\r")
+        time.sleep(0.15)
+        assert t._inbox.qsize() == 0            # NOT queued behind the turn
+        # R253: the side inbox carries a (kind, payload) tag — a bash
+        # command can itself start with `/` or `!`, so no prefix character
+        # could tell the kinds apart
+        assert t._side_inbox.get_nowait() == ("bash", "echo hi")
+        t.app.exit()
+        time.sleep(0.1)
+
+
+def test_side_worker_runs_a_command_and_reports_output(t):
+    t._bash_cwd = str(Path.cwd())
+    t._side_inbox.put(("bash", "echo side-channel-output"))
+    th = threading.Thread(target=t._side_worker, daemon=True)
+    th.start()
+    for _ in range(50):
+        if t._chat:
+            break
+        time.sleep(0.05)
+    assert any("side-channel-output" in (e.get("text", "") if isinstance(e, dict)
+                                         else e) for e in t._chat)
+
+
+def test_side_worker_rejects_cd_without_touching_bash_cwd(t):
+    before = t._bash_cwd
+    t._side_inbox.put(("bash", "cd /tmp"))
+    th = threading.Thread(target=t._side_worker, daemon=True)
+    th.start()
+    time.sleep(0.2)   # long enough for the (near-instant) rejection to land
+    assert t._bash_cwd == before
+
+
+def test_side_worker_and_main_worker_run_concurrently(t, monkeypatch):
+    # the whole point: a slow main-worker command must not block a
+    # side-channel command from finishing first.
+    from aurora import ui
+    monkeypatch.setattr(t, "_banner", lambda: None)
+    monkeypatch.setattr("aurora.bootstrap.load", lambda cwd: ("", None))
+    monkeypatch.setattr(t.app, "exit", lambda: None)
+    monkeypatch.setattr(ui, "_send_turn", lambda *a, **k: None)
+
+    t._bash_cwd = str(Path.cwd())
+    t._inbox.put("!sleep 0.4")
+    t._inbox.put("/exit")
+    t._side_inbox.put(("bash", "echo fast"))
+
+    main_th = threading.Thread(target=t._worker, daemon=True)
+    side_th = threading.Thread(target=t._side_worker, daemon=True)
+    main_th.start()
+    side_th.start()
+
+    for _ in range(40):
+        if any("fast" in (e.get("text", "") if isinstance(e, dict) else e)
+              for e in t._chat):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("side-channel output never appeared")
+    assert t._busy   # the slow main command is still running
+    main_th.join(timeout=2)
+    assert not main_th.is_alive()
 
 
 def test_bash_mode_command_is_timeout_and_process_group_safe(t, monkeypatch):
@@ -2678,7 +2808,9 @@ def test_nano_save_reports_write_error_instead_of_raising(t, tmp_path, monkeypat
 
     def _boom(*a, **k):
         raise OSError("disk full")
-    monkeypatch.setattr(type(p), "write_text", _boom)
+    # R249: the save goes through `write_text_preserving` now, not
+    # `Path.write_text` — the failure path being asserted is unchanged.
+    monkeypatch.setattr(tui, "write_text_preserving", _boom)
     ok = t._nano_save()
     assert ok is False
     assert "can't save" in capsys.readouterr().out
@@ -2690,7 +2822,7 @@ def test_nano_save_and_close_keeps_editor_open_on_failed_save(t, tmp_path, monke
     p.write_text("hello")
     t.open_nano(p)
     t._editor_area.buffer.text = "hello world"
-    monkeypatch.setattr(type(p), "write_text",
+    monkeypatch.setattr(tui, "write_text_preserving",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("nope")))
     t._nano_save_close_click()(_mouse_up())
     assert t._editor is not None                  # did NOT close/discard
@@ -3059,20 +3191,24 @@ def test_cost_tree_click_queues_the_command_instead_of_working_inline(t, monkeyp
     assert any("/context" in e for e in t._chat if isinstance(e, str))
 
 
-def test_cost_tree_click_notes_the_queue_while_worker_busy(t, monkeypatch):
-    # R219: a click (or typed line) while `self._busy` is True still echoes
-    # into the transcript, but `_worker()` won't touch the inbox until its
-    # current turn finishes — a `wait_until` poll can run up to 300s. With
-    # no note, the echoed "/context" reads as submitted-and-answered, so a
-    # slow-running turn made /context look silently broken (user report).
+def test_cost_tree_click_runs_on_the_side_channel_while_worker_busy(t, monkeypatch):
+    # R219 was the earlier half of this: a click (or typed line) while
+    # `self._busy` is True still echoed into the transcript, but `_worker()`
+    # wouldn't touch the inbox until its current turn finished — a
+    # `wait_until` poll can run up to 300s — so the echoed "/context" read
+    # as submitted-and-answered and looked silently broken (user report).
+    # R253 removes the wait instead of annotating it: /context is read-only,
+    # so it now runs CONCURRENTLY on the side channel. The "it queued"
+    # guarantee R219 added still holds for commands that really must wait —
+    # see test_mutating_command_still_queues_and_says_why.
     from aurora import ctxtree
     monkeypatch.setattr(ctxtree, "render", lambda *a, **k: "")
 
     t._busy = True
     t._cost_tree_click()(_mouse_up())
 
-    assert t._inbox.get_nowait() == "/context"
-    assert any("queued" in e for e in t._chat if isinstance(e, str))
+    assert t._inbox.qsize() == 0       # NOT stuck behind the turn any more
+    assert t._side_inbox.get_nowait() == ("cmd", "/context")
 
 
 def test_cost_tree_click_no_queue_note_when_worker_idle(t, monkeypatch):
@@ -3490,6 +3626,91 @@ def test_editing_keys_are_unaffected_with_no_menu_open(t):
     assert t.input.buffer.text == "ab"
 
 
+def test_backspace_restarts_completion(t):
+    """R258: prompt_toolkit only restarts `complete_while_typing` completion
+    on INSERT (Buffer.insert_text's on_text_insert hook) — any text change,
+    including a delete, unconditionally clears `complete_state`
+    (Buffer._text_changed) and nothing restarts it on its own. Backspacing
+    mid `/command` closed the popup and it stayed closed: same as
+    test_up_arrow_moves_cursor_not_history_when_draft_is_non_empty above,
+    `start_completion()` schedules a background task via `get_app()` that
+    needs a real running event loop this headless fixture doesn't have, so
+    this spies on the call rather than driving the async completer.
+
+    Fails without the fix: start_completion is never called."""
+
+    class _Ev:
+        arg = 1
+
+    buf = t.input.buffer
+    from prompt_toolkit.filters import to_filter
+    buf.complete_while_typing = to_filter(True)
+    buf.text = "/h"
+    buf.cursor_position = len(buf.text)
+    calls = []
+    buf.start_completion = lambda *a, **kw: calls.append((a, kw))
+    _resolved_press(t, Keys.Backspace, _Ev())
+    assert calls, "backspace must restart completion, not just close it"
+
+
+def test_low_chatter_output_requests_1002_not_1003(monkeypatch):
+    """R260: prompt_toolkit's `mouse_support=True` always asks the terminal
+    for mode 1003 ("any-event" tracking — a report on every pixel of mouse
+    movement, click or not). Reported bug: over an SSH session, moving/
+    dragging the mouse over the terminal sometimes typed raw mouse-escape
+    fragments (`90;13M5;77;18M...`) into the prompt — 1003's event volume
+    outpacing what stayed in sync. Aurora's drag-to-select only ever needs
+    motion while a button is down, i.e. mode 1002, which reports nothing
+    for a bare, button-less mouse move.
+
+    Fails without the fix: `enable_mouse_support` writes `?1003h`."""
+    import io
+
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.output import defaults as output_defaults
+    from prompt_toolkit.output.vt100 import Vt100_Output
+
+    from aurora import tui
+
+    out = io.StringIO()
+    real_output = Vt100_Output(out, lambda: Size(24, 80))
+    monkeypatch.setattr(output_defaults, "create_output", lambda: real_output)
+
+    output = tui._low_chatter_output()
+    assert output is real_output
+
+    out.seek(0), out.truncate()
+    output.enable_mouse_support()
+    output.flush()
+    written = out.getvalue()
+    assert "\x1b[?1002h" in written
+    assert "\x1b[?1003h" not in written
+    assert "\x1b[?1000h" in written and "\x1b[?1006h" in written  # unchanged
+
+    out.seek(0), out.truncate()
+    output.disable_mouse_support()
+    output.flush()
+    written = out.getvalue()
+    assert "\x1b[?1002l" in written
+    assert "\x1b[?1003l" not in written
+
+
+def test_low_chatter_output_falls_back_to_none_off_vt100(monkeypatch):
+    """Non-Vt100 outputs (Windows, a piped/non-tty stdout) get no patch —
+    the caller passes `output=None` through to `Application`'s own
+    default, exactly as if this function didn't exist."""
+    import io
+
+    from prompt_toolkit.output import defaults as output_defaults
+    from prompt_toolkit.output.plain_text import PlainTextOutput
+
+    from aurora import tui
+
+    monkeypatch.setattr(output_defaults, "create_output",
+                        lambda: PlainTextOutput(io.StringIO()))
+    assert tui._low_chatter_output() is None
+
+
 # ── R212: a status-render failure was silent ───────────────────────────────
 def test_a_status_render_failure_is_reported_once(t, tmp_path, monkeypatch):
     """R212: the status block is wrapped in `except Exception` so a render
@@ -3541,3 +3762,810 @@ def test_a_status_render_failure_never_propagates(t, tmp_path, monkeypatch):
         log=lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
     frags = t._status_render()          # must not raise
     assert "⚠" in "".join(f[1] for f in frags)
+
+
+# ── R249: /nano saves the user's file atomically ─────────────────────────
+
+def test_nano_save_is_atomic(t, tmp_path, monkeypatch):
+    """R249: R241 made the MODEL's three write paths atomic and left the
+    human's one — `/nano` — on `Path.write_text`, which truncates first. A
+    crash in that window empties the file being edited."""
+    from prompt_toolkit.document import Document
+
+    from aurora import paths
+    p = tmp_path / "notes.txt"
+    p.write_text("original")
+    t.open_nano(p)
+    t._editor_area.buffer.document = Document("new text", 0)
+
+    calls = []
+    real = paths.write_text_preserving
+    monkeypatch.setattr(tui, "write_text_preserving",
+                        lambda path, text: (calls.append(path), real(path, text)))
+    assert t._nano_save() is True
+    assert calls == [p]
+    assert p.read_text() == "new text"
+
+
+def test_nano_save_preserves_the_executable_bit(t, tmp_path):
+    """Guards the R249 fix rather than the old bug: `Path.write_text` kept
+    the mode by accident (the file already existed), but a naive swap to
+    `write_text_atomic` would hand back the temp file's 0600 — which is
+    exactly why R241 introduced `write_text_preserving` instead."""
+    import os
+    import stat
+
+    from prompt_toolkit.document import Document
+    p = tmp_path / "deploy.sh"
+    p.write_text("echo hi\n")
+    os.chmod(p, 0o755)
+    t.open_nano(p)
+    t._editor_area.buffer.document = Document("echo bye\n", 0)
+    assert t._nano_save() is True
+    assert p.read_text() == "echo bye\n"
+    assert stat.S_IMODE(p.stat().st_mode) == 0o755
+
+
+def test_nano_save_writes_through_a_symlink(t, tmp_path):
+    """Same guard, for the other property `write_text_atomic` alone would
+    break: `os.replace` swaps the LINK for a regular file."""
+    from prompt_toolkit.document import Document
+    real = tmp_path / "real.md"
+    real.write_text("body")
+    link = tmp_path / "link.md"
+    link.symlink_to(real)
+    t.open_nano(link)
+    t._editor_area.buffer.document = Document("edited", 0)
+    assert t._nano_save() is True
+    assert link.is_symlink()          # the link itself must survive
+    assert real.read_text() == "edited"
+
+
+# ── R250: the crash-log cap must not allocate the whole log ──────────────
+
+def test_crash_log_truncates_to_the_tail(tmp_path):
+    p = tmp_path / "tui_crash.log"
+    p.write_bytes(b"old" * 1000 + b"KEEPME")
+    tui._truncate_crash_log(p, cap=100)
+    data = p.read_bytes()
+    assert len(data) == 100
+    assert data.endswith(b"KEEPME")
+
+
+def test_crash_log_under_the_cap_is_untouched(tmp_path):
+    p = tmp_path / "tui_crash.log"
+    p.write_bytes(b"short")
+    tui._truncate_crash_log(p, cap=1000)
+    assert p.read_bytes() == b"short"
+
+
+def test_crash_log_truncation_reads_only_the_tail(tmp_path, monkeypatch):
+    """R250: the bound is on the ALLOCATION, not just the result. Reading the
+    whole file and slicing it gives the same bytes back while allocating
+    everything the cap exists to refuse (R240's shape)."""
+    p = tmp_path / "tui_crash.log"
+    p.write_bytes(b"x" * 50_000)
+
+    def _boom(self, *a, **k):
+        raise AssertionError("read the whole log instead of seeking to its tail")
+
+    monkeypatch.setattr(Path, "read_bytes", _boom)
+    tui._truncate_crash_log(p, cap=1_000)
+    assert len(p.read_text(encoding="utf-8", errors="replace")) == 1_000
+
+
+def test_crash_log_missing_file_is_not_an_error(tmp_path):
+    tui._truncate_crash_log(tmp_path / "nope.log", cap=10)
+
+
+# ── R251: a zero-option menu must never open ─────────────────────────────
+
+def test_select_menu_refuses_an_empty_option_list(t):
+    """R251: an empty menu is unresolvable — arrows do `% len(options)` and
+    Enter indexes it — while `select_menu` blocks the worker on its answers
+    queue. Reachable via `/model` with `models: []` (or after removing the
+    last one, R81)."""
+    assert t.select_menu("Select model", []) is None
+    assert t._menu_options is None
+
+
+def test_select_menu_empty_honours_eof_key(t):
+    assert t.select_menu("Approve?", [], eof_key="s") == "s"
+
+
+def test_open_ui_menu_refuses_an_empty_option_list(t):
+    called = []
+    t._open_ui_menu("Quit Aurora?", [], called.append)
+    assert t._menu_options is None
+    assert t._menu_on_select is None
+    assert called == []
+
+
+def test_resolve_menu_ignores_a_stale_index(t):
+    """A mouse handler captures its row index at build time; the menu can be
+    gone (or shorter) by the time the click lands."""
+    t._menu_prompt, t._menu_options, t._menu_index = "pick", [("a", "A")], 0
+    t._resolve_menu(5)                       # out of range — must no-op
+    assert t._menu_options == [("a", "A")]   # menu untouched, nothing queued
+    t._menu_options = None
+    t._resolve_menu(0)                       # menu already closed
+
+
+# ── R252: a confirmed cancel must reach a blocked question ───────────────
+
+def _blocked_ask(t, **kw):
+    """Run `t.ask()` on a worker thread with `_busy` set, as a real turn does."""
+    out = []
+
+    def work():
+        t._busy = True
+        out.append(t.ask("MISSING_KEY (input hidden): ", **kw))
+        t._busy = False
+
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    for _ in range(100):                     # wait for the ask to be pending
+        if t._question is not None:
+            break
+        time.sleep(0.01)
+    return th, out
+
+
+def test_cancel_unblocks_a_pending_question(t):
+    """R252 (reported 2026-08-26, hit on a first run with the model not
+    loaded): the API-key prompt blocks the worker on the answers queue, which
+    polls nothing — so Esc-Esc's "Cancel this?" set `cancel_event` and the
+    turn stayed parked forever. With `_busy` True the Esc gesture offers only
+    cancel, so the app could not be quit either."""
+    th, out = _blocked_ask(t, secret=True)
+    assert t._question is not None
+    t.fe.cancel_event.set()
+    th.join(timeout=3)
+    assert not th.is_alive(), "cancel did not unblock the question"
+    assert out == [""]
+    assert t._question is None
+
+
+def test_esc_esc_while_busy_offers_a_way_out(t):
+    """The other half: cancel was the only option on that menu, so a turn
+    cancel could not reach left no exit at all."""
+    t._busy = True
+    t._on_escape(lambda: None)
+    exits = []
+    t._on_escape(lambda: exits.append(1))
+    assert [k for k, _ in t._menu_options] == ["cancel", "continue", "quit"]
+    t._resolve_menu(2)                        # "Quit Aurora"
+    assert exits == [1]
+
+
+def test_esc_esc_cancel_still_only_cancels(t):
+    t._busy = True
+    t._on_escape(lambda: None)
+    exits = []
+    t._on_escape(lambda: exits.append(1))
+    t._resolve_menu(0)                        # "Yes, cancel"
+    assert t.fe.cancel_event.is_set()
+    assert exits == []
+
+
+def test_answering_the_question_still_wins_over_the_poll(t):
+    th, out = _blocked_ask(t)
+    t._answers.put("typed answer")
+    th.join(timeout=3)
+    assert out == ["typed answer"]
+
+
+def test_cancel_answers_a_later_menu_with_its_eof_key(t):
+    """A cancel confirmed mid-request must not leave the approval gate that
+    the round reaches next blocking with nothing able to answer it. `eof_key`
+    is the caller's own safe answer (R214) — for an approval, "stop"."""
+    t.fe.cancel_event.set()
+    assert t.select_menu("Approve?", [("y", "Yes"), ("s", "Stop")],
+                         eof_key="s") == "s"
+
+
+# ── R253: concurrent input while a turn is running ────────────────────────
+# The card's screenshot: a 182s `run_command` in flight, `/model` and a plain
+# prompt both answered with "(queued — still running previous command)".
+# R245 had already given `!` bash its own worker; these cover the two kinds
+# it deliberately left out.
+
+def test_read_only_command_routes_to_side_channel_while_busy(t):
+    t._busy = True
+    t._route_submitted_line("/status")
+    assert t._inbox.qsize() == 0
+    assert t._side_inbox.get_nowait() == ("cmd", "/status")
+
+
+def test_mutating_command_still_queues_and_says_why(t):
+    """The other half of the split, and the one that must NOT regress: a
+    command that writes the session the running turn owns still waits — but
+    the note now names the command and the reason, where R219's version was
+    one generic line for every case."""
+    t._busy = True
+    t._route_submitted_line("/compact")
+    assert t._inbox.get_nowait() == "/compact"
+    note = "".join(e for e in t._chat if isinstance(e, str))
+    assert "/compact" in note and "queued" in note
+
+
+def test_every_side_safe_command_is_really_side_safe():
+    """A guard on the list itself, not on any one command. Membership means
+    three properties (see `ui.SIDE_SAFE_COMMANDS`); this pins the one that a
+    future edit is most likely to break by accident — nothing in there may be
+    a command that mutates the engine or prompts."""
+    from aurora import ui
+    forbidden = {"clear", "reset", "compact", "rewind", "undo", "commit",
+                 "resume", "search", "bootstrap", "nano", "model", "redact",
+                 "cache", "autocompact", "fallback", "multiline", "thinking",
+                 "markdown", "quit", "exit"}
+    assert not (ui.SIDE_SAFE_COMMANDS & forbidden)
+    assert ui.SIDE_SAFE_COMMANDS <= set(ui.COMMAND_INFO)
+
+
+def test_command_help_is_side_safe_for_any_command():
+    """`/<cmd> help` only ever prints the manual — it never arms the command
+    — so it qualifies even when the command itself never could."""
+    from aurora import ui
+    assert ui.side_safe_command("/rewind help")
+    assert ui.side_safe_command("/reset man")
+    assert not ui.side_safe_command("/rewind")
+    assert not ui.side_safe_command("/reset")
+
+
+def test_plain_prompt_becomes_a_quick_ask_while_busy(t):
+    """The screenshot's "are you there?" — answered now, on the side channel,
+    instead of queueing behind the command it is asking about."""
+    t._busy = True
+    t._route_submitted_line("are you there?")
+    assert t._inbox.qsize() == 0
+    assert t._side_inbox.get_nowait() == ("ask", "are you there?")
+
+
+def test_idle_input_is_unchanged_and_never_uses_the_side_channel(t):
+    """The fork only exists while busy. Idle, every kind still goes to the
+    main worker in submission order — that ordering is what makes a typed
+    sequence behave like a script."""
+    assert t._busy is False
+    for line in ("/status", "/compact", "hello", "/model"):
+        t._route_submitted_line(line)
+    assert t._side_inbox.qsize() == 0
+    assert [t._inbox.get_nowait() for _ in range(4)] == [
+        "/status", "/compact", "hello", "/model"]
+
+
+def test_side_worker_runs_a_read_only_command(t, monkeypatch):
+    from aurora import ui
+    seen = []
+    monkeypatch.setattr(ui, "_handle_command",
+                        lambda e, f, line: seen.append(line) or True)
+    t._side_inbox.put(("cmd", "/status"))
+    threading.Thread(target=t._side_worker, daemon=True).start()
+    for _ in range(50):
+        if seen:
+            break
+        time.sleep(0.02)
+    assert seen == ["/status"]
+
+
+def test_quick_ask_answers_without_touching_history(t, monkeypatch):
+    """`Engine.quick_ask`'s contract as the TUI depends on it: the answer
+    reaches the chat, and `engine.messages` is left exactly as it was — a
+    second writer there is what ARCHITECTURE §6 says cannot happen."""
+    t.engine.messages = [{"role": "user", "content": "earlier"}]
+    before = list(t.engine.messages)
+    t.engine.quick_ask = lambda text, on_text, cancel=None: "still here"
+    t._busy = True            # R254a: a side turn only happens while busy
+    t._side_inbox.put(("ask", "are you there?"))
+    threading.Thread(target=t._side_worker, daemon=True).start()
+    for _ in range(50):
+        if any(isinstance(e, dict) and e.get("kind") == "side"
+               and "side-turn" in e["text"] for e in t._chat):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("the side-turn label never appeared")
+    assert t.engine.messages == before
+
+
+def test_model_picked_mid_turn_is_deferred_not_applied(t, monkeypatch):
+    """Switching while a turn is in flight would change the model under a
+    request already running, so the pick is parked until the turn ends."""
+    switched = []
+    t.engine.switch_model = lambda payload: switched.append(payload)
+    t._busy = True
+    t._defer_model({"model": "next-model"})
+    assert switched == []                       # NOT applied mid-turn
+    assert t._pending_model == {"model": "next-model"}
+
+    t._busy = False
+    t._apply_pending_model()
+    assert switched == [{"model": "next-model"}]
+    assert t._pending_model is None
+
+
+def test_model_picked_after_the_turn_ended_switches_immediately(t):
+    """If the turn finished while the picker was open there is nothing to
+    defer — deferring anyway would be a switch that silently never happens."""
+    switched = []
+    t.engine.switch_model = lambda payload: switched.append(payload)
+    assert t._busy is False
+    t._defer_model({"model": "now-model"})
+    assert switched == [{"model": "now-model"}]
+    assert t._pending_model is None
+
+
+def _hold_input_line(t):
+    """Hold `_prompt_lock` from ANOTHER thread, the way a mid-turn approval
+    gate does. It has to be another thread: the lock is reentrant, so an
+    acquire from the test's own thread would succeed and prove nothing.
+    Returns the release callable."""
+    held, release = threading.Event(), threading.Event()
+
+    def _owner():
+        t._prompt_lock.acquire()
+        held.set()
+        release.wait(5)
+        t._prompt_lock.release()
+
+    threading.Thread(target=_owner, daemon=True).start()
+    assert held.wait(2)
+    return release.set
+
+
+def test_side_channel_refuses_the_input_line_instead_of_blocking(t):
+    """The input line is single-slotted (`_question`/`_menu_options`/one
+    `_answers` queue), so two threads prompting at once corrupt both. The
+    side worker must take a refusal, never park — parking it behind a turn's
+    approval gate would defeat the channel's whole purpose."""
+    free = _hold_input_line(t)
+    try:
+        def _side():
+            t._prompt_nowait.on = True
+            with pytest.raises(tui.InputLineBusy):
+                t._acquire_input_line()
+            raised.append(True)
+
+        raised = []
+        th = threading.Thread(target=_side, daemon=True)
+        th.start()
+        th.join(timeout=2)
+        assert raised == [True]
+    finally:
+        free()
+
+
+def test_main_worker_waits_for_the_input_line_rather_than_failing(t):
+    """The mirror of the above: the main worker has nowhere else to go, so
+    it blocks until the line is free and then proceeds."""
+    free = _hold_input_line(t)
+    done = []
+
+    def _main():
+        t._acquire_input_line()                 # no nowait flag on this thread
+        done.append(True)
+        t._prompt_lock.release()
+
+    th = threading.Thread(target=_main, daemon=True)
+    th.start()
+    time.sleep(0.15)
+    assert done == []                           # still waiting
+    free()
+    th.join(timeout=2)
+    assert done == [True]
+
+
+def test_side_channel_reports_a_refused_input_line(t, monkeypatch, capsys):
+    """A refusal must be visible. Swallowed, it looks identical to the
+    command having run and printed nothing."""
+    from aurora import ui
+    monkeypatch.setattr(ui, "_pick_model",
+                        lambda engine, fe, on_pick=None: t._acquire_input_line())
+
+    free = _hold_input_line(t)                  # the "turn" owns it
+    try:
+        t._side_inbox.put(("model", "/model"))
+        threading.Thread(target=t._side_worker, daemon=True).start()
+        for _ in range(100):
+            if "not now" in capsys.readouterr().out:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("the refusal was never reported")
+    finally:
+        free()
+
+
+def test_status_bar_shows_the_side_channel_is_running(t):
+    """R253 tier 3: `_side_busy` was set and read but never rendered, so a
+    concurrent side command was invisible while the main spinner talked
+    about something else."""
+    t._busy, t._side_busy = True, True
+    t._busy_since = time.time()
+    assert "side" in "".join(f[1] for f in _status_frags(t))
+
+    t._side_busy = False
+    assert "side" not in "".join(f[1] for f in _status_frags(t))
+
+
+def test_a_raise_while_claiming_the_input_line_does_not_leak_the_lock(t, monkeypatch):
+    """A leaked `_prompt_lock` is permanent: the worker thread blocks on its
+    next prompt and nothing ever releases it. So the claim and the setup that
+    follows it — buffer writes, a render — have to share one try/finally, not
+    just the wait at the end."""
+    def _free_from_another_thread():
+        """`_prompt_lock` is an RLock, so an acquire from the thread that
+        leaked it would SUCCEED and prove nothing — it has to be probed from
+        elsewhere, which is also where the real deadlock would be felt."""
+        got = []
+
+        def _probe():
+            if t._prompt_lock.acquire(blocking=False):
+                got.append(True)
+                t._prompt_lock.release()
+
+        th = threading.Thread(target=_probe, daemon=True)
+        th.start()
+        th.join(timeout=2)
+        return got == [True]
+
+    monkeypatch.setattr(t.app, "invalidate",
+                        lambda: (_ for _ in ()).throw(RuntimeError("render boom")))
+    with pytest.raises(RuntimeError):
+        t.ask("secret?")
+    assert _free_from_another_thread(), "ask() leaked the input-line lock"
+
+    with pytest.raises(RuntimeError):
+        t.select_menu("pick", [("y", "Yes")])
+    assert _free_from_another_thread(), "select_menu() leaked the input-line lock"
+
+
+def test_a_side_turn_does_not_render_through_the_running_turns_frontend(t, monkeypatch):
+    """`fe.on_text` closes the live think block and sets the phase — it is
+    the RUNNING turn's renderer. A side answer streaming through it would
+    reach into that turn's display and end its thinking row."""
+    streamed = []
+    monkeypatch.setattr(t.fe, "on_text",
+                        lambda chunk: pytest.fail("used the turn's renderer"))
+    t.engine.quick_ask = lambda text, on_text, cancel=None: (
+        on_text("an answer"), streamed.append(on_text), "an answer")[-1]
+
+    t._side_quick_ask("are you there?")
+
+    # R254c/d: not the frontend's renderer, and not `Tui.append` either —
+    # that one merges into the neighbouring entry and closes the think row.
+    # The sink is a plain collector; the answer lands via `append_side`.
+    assert streamed
+    assert getattr(streamed[0], "__self__", None) is not t.fe
+    assert getattr(streamed[0], "__func__", None) is not tui.Tui.append
+    assert any(isinstance(e, dict) and e.get("kind") == "side"
+               and "an answer" in e["text"] for e in t._chat)
+
+
+# ── R254: review pass on R253 ─────────────────────────────────────────────
+
+def test_a_prompt_is_handed_back_when_the_turn_ended_before_it_ran(t):
+    """R254a — the data-loss one. The route decision is made on the UI thread
+    while `_busy`; the side worker may not reach it for a long time, because
+    it drains `!` commands ahead of it. If the turn has ended by then, the
+    line is a NORMAL prompt again: answering it as a toolless side turn would
+    both give a worse answer and drop a real task out of the conversation for
+    good, since a side turn is never written to history."""
+    t._busy = True
+    t._route_submitted_line("fix the failing test for me")
+    assert t._side_inbox.qsize() == 1
+    t._busy = False                       # the turn finished in the meantime
+
+    threading.Thread(target=t._side_worker, daemon=True).start()
+    for _ in range(100):
+        if t._inbox.qsize():
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("the prompt was neither run nor handed back — lost")
+    assert t._inbox.get_nowait() == "fix the failing test for me"
+
+
+def test_a_deferred_model_lands_even_if_the_turn_ends_mid_park(t):
+    """R254b — the lost update. "Read `_busy`, then park" raced
+    `_apply_pending_model`'s "take, then clear": a park landing between the
+    two was never applied, so the user was told "will switch when this
+    finishes", it finished, and nothing happened."""
+    switched = []
+    t.engine.switch_model = lambda p: switched.append(p)
+    t._busy = True
+
+    # hold the lock from another thread to pin the interleaving exactly:
+    # the worker's take runs while the side thread is inside _defer_model
+    started = threading.Event()
+
+    def _worker_finish():
+        started.wait(2)
+        t._busy = False
+        t._apply_pending_model()
+
+    th = threading.Thread(target=_worker_finish, daemon=True)
+    with t._model_lock:
+        th.start()
+        started.set()
+        time.sleep(0.1)          # the worker is now blocked on the lock
+        t._pending_model = {"model": "picked"}    # the park, under the lock
+    th.join(timeout=2)
+
+    assert switched == [{"model": "picked"}]      # applied, not stranded
+    assert t._pending_model is None
+
+
+def test_a_turn_cannot_start_while_a_model_switch_is_landing(t):
+    """The same lock makes `_worker`'s busy-claim and a side switch mutually
+    exclusive, so a turn can never read half a switch out of `engine.current`."""
+    order = []
+    def _slow_switch(p):
+        order.append("switch-start")
+        time.sleep(0.15)
+        order.append("switch-end")
+    t.engine.switch_model = _slow_switch
+    t._busy = False
+
+    th = threading.Thread(target=lambda: t._defer_model({"model": "m"}),
+                          daemon=True)
+    th.start()
+    time.sleep(0.05)
+    with t._model_lock:          # what _worker does before claiming _busy
+        order.append("turn-claims-busy")
+    th.join(timeout=2)
+    assert order == ["switch-start", "switch-end", "turn-claims-busy"]
+
+
+def test_side_output_does_not_split_the_running_turns_think_row(t):
+    """R254c — `append()` closes the live think row on the sound reasoning
+    that plain output means THIS request moved past thinking. From the side
+    channel that inference is false: it froze the running turn's clock and
+    the next chunk opened a second row."""
+    t.begin_think(live=True)
+    t.think_chunk("reasoning part one ", live=True)
+    row = next(e for e in t._chat
+               if isinstance(e, dict) and e.get("kind") == "think")
+
+    t.append_side("a side answer\n")
+    assert not row["done"], "the running turn's think row was closed"
+
+    t.think_chunk("reasoning part two", live=True)
+    rows = [e for e in t._chat
+            if isinstance(e, dict) and e.get("kind") == "think"]
+    assert len(rows) == 1                       # one request, one row
+    assert rows[0]["text"] == "reasoning part one reasoning part two"
+
+
+def test_two_concurrent_streams_are_not_shredded_into_one_entry(t):
+    """R254d — `append()` merges into the previous string entry while it is
+    small, so a turn streaming its reply and a side turn streaming its own
+    interleaved character by character: 'MAIN ANSWER' + 'side answer' came
+    out as 'MsAiIdNe  AaNnSsWwEeRr'. Measured, not hypothetical."""
+    for main_chunk in "MAIN ANSWER":
+        t.append(main_chunk)
+        t.append_side("x")                      # the side channel, concurrent
+
+    turn_text = "".join(e for e in t._chat if isinstance(e, str))
+    assert "MAIN ANSWER" in turn_text           # the turn's reply is intact
+    sides = [e["text"] for e in t._chat
+             if isinstance(e, dict) and e.get("kind") == "side"]
+    assert sides == ["x"] * len("MAIN ANSWER")  # and each side entry is whole
+
+
+def test_a_side_entry_renders_without_crashing_the_transcript(t):
+    """`_entry_fragments` falls through to the THINK renderer for any dict it
+    doesn't recognise, which would `KeyError` on a new kind — so the renderer
+    has to know about this one, not just the appender."""
+    t.append_side("a side answer\n")
+    t._fragments()                              # would raise on an unknown kind
+    assert t._nlines >= 1
+
+
+def test_a_side_turn_can_be_cancelled(t, monkeypatch):
+    """R254i — it is a network call that can stream for minutes and had no
+    stop at all: `fe.cancel_event` belongs to the turn, and Esc-Esc only ever
+    offered to cancel that. Same standard R246 set for background jobs."""
+    seen_cancel = []
+
+    def _quick_ask(text, on_text, cancel=None):
+        seen_cancel.append(cancel)
+        while not cancel():                     # stream until told to stop
+            time.sleep(0.01)
+        return "stopped"
+
+    t.engine.quick_ask = _quick_ask
+    t._busy = True
+    th = threading.Thread(target=lambda: t._side_quick_ask("q"), daemon=True)
+    th.start()
+    for _ in range(100):
+        if seen_cancel:
+            break
+        time.sleep(0.02)
+    assert seen_cancel and not seen_cancel[0]()  # running, not cancelled
+
+    t._resolve_cancel_menu("side")               # the new Esc-Esc row
+    th.join(timeout=2)
+    assert not th.is_alive(), "the side turn ignored the cancel"
+
+
+def test_esc_offers_the_side_row_only_when_the_side_channel_is_busy(t):
+    """The rows stay exactly as they were whenever nothing is on the side
+    channel — which is the common case, and what R252's tests pin."""
+    t._busy, t._side_busy, t._side_kind = True, False, ""
+    t._on_escape(lambda: None)
+    t._on_escape(lambda: None)
+    assert [k for k, _ in t._menu_options] == ["cancel", "continue", "quit"]
+    t._resolve_menu(1)                           # "No, keep going"
+
+    # R257: a `!` command on the side channel is NOT cancellable — only a
+    # quick-ask polls `_side_cancel` — so the row must not be offered for it
+    t._side_busy, t._side_kind = True, "bash"
+    t._on_escape(lambda: None)
+    t._on_escape(lambda: None)
+    assert [k for k, _ in t._menu_options] == ["cancel", "continue", "quit"]
+    t._resolve_menu(1)
+
+    t._side_kind = "ask"
+    t._on_escape(lambda: None)
+    t._on_escape(lambda: None)
+    assert [k for k, _ in t._menu_options] == [
+        "cancel", "side", "continue", "quit"]
+    t._resolve_menu(2)
+
+    # and a side QUESTION running with the main worker IDLE is still reachable
+    t._busy = False
+    t._on_escape(lambda: None)
+    t._on_escape(lambda: None)
+    assert [k for k, _ in t._menu_options] == ["side", "continue", "quit"]
+
+
+def test_the_side_indicator_survives_the_turn_it_started_behind(t):
+    """R254h: a `!` command routed to the side channel routinely outlives the
+    turn it was queued behind. The R253 indicator lived inside the busy
+    branch, so it vanished exactly when it became the only work running."""
+    t._busy, t._side_busy = False, True
+    assert "side" in "".join(f[1] for f in _status_frags(t))
+
+    t._side_busy = False
+    assert "side" not in "".join(f[1] for f in _status_frags(t))
+
+
+def test_the_copy_menu_names_both_copy_last_variants(t):
+    """R256: "copy last" was ambiguous in the one way that mattered — it
+    takes the whole turn, and a user who wanted just the answer had no row.
+    Both are named now, and the new row sits next to the one it qualifies."""
+    labels = list(t._COPY_LABELS.values())
+    assert "copy last (full)" in labels and "copy last (response)" in labels
+    assert t._COPY_LABELS["last"] == "copy last (full)"
+
+
+def test_the_copy_menu_response_row_copies_only_the_final_reply(t, monkeypatch):
+    from aurora import clipboard
+    copied = []
+    monkeypatch.setattr(clipboard, "copy",
+                        lambda text: copied.append(text) or "test-clipboard")
+    t.engine.last_turn_final_reply = lambda: "the final reply"
+
+    t._resolve_copy_menu("response")
+
+    assert copied == ["the final reply"]
+    assert "final reply copied" in t._sel_notice[0]
+
+
+def test_the_copy_menu_response_row_says_so_when_there_is_no_reply(t, monkeypatch):
+    from aurora import clipboard
+    monkeypatch.setattr(clipboard, "copy",
+                        lambda text: pytest.fail("copied nothing"))
+    t.engine.last_turn_final_reply = lambda: ""
+
+    t._resolve_copy_menu("response")
+    assert "no reply" in t._sel_notice[0]
+
+
+# ── R257: review of R254–R256 ─────────────────────────────────────────────
+
+def test_a_prompt_keeps_its_place_when_the_side_channel_is_busy(t):
+    """R257: R254a stopped prompts being LOST, but sending one to a channel
+    that is already chewing on a `!` command parks it OUTSIDE the main
+    queue — and a prompt typed LATER goes straight to an idle main worker
+    and runs first. Measured before the fix: A typed while busy ran after B
+    typed after it."""
+    t._busy, t._side_busy = True, True
+    t._route_submitted_line("PROMPT-A")
+    assert t._side_inbox.qsize() == 0          # not parked on a busy channel
+    t._busy = False
+    t._route_submitted_line("PROMPT-B")
+
+    assert [t._inbox.get_nowait() for _ in range(2)] == ["PROMPT-A", "PROMPT-B"]
+
+
+def test_a_prompt_still_rides_the_side_channel_when_it_is_free(t):
+    """The fix must not disable the feature: a free channel still answers."""
+    t._busy, t._side_busy = True, False
+    t._route_submitted_line("are you there?")
+    assert t._inbox.qsize() == 0
+    assert t._side_inbox.get_nowait() == ("ask", "are you there?")
+
+
+def test_clearing_the_screen_does_not_strand_the_open_think_flag(t):
+    """R257: R254c made `begin_think` TRUST `_open_think` (it returns early
+    when a row is open but no longer last). `clear_screen` dropped the rows
+    without the flag, so the next request opened no timed row at all."""
+    t.begin_think(live=True)
+    assert t._open_think
+    t.clear_screen()
+    assert not t._open_think and t._open_think_items == []
+
+    t.begin_think(live=True)                   # a fresh row must appear
+    assert sum(1 for e in t._chat
+               if isinstance(e, dict) and e.get("kind") == "think") == 1
+
+
+def test_the_side_cancel_row_is_not_offered_for_work_it_cannot_stop(t):
+    """`_side_cancel` is polled by `quick_ask` and nothing else, so offering
+    the row while a `!` command runs promised a stop that did nothing."""
+    # main worker BUSY: the turn is cancellable, the `!` command is not
+    t._busy, t._side_busy, t._side_kind = True, True, "bash"
+    t._on_escape(lambda: None)
+    t._on_escape(lambda: None)
+    assert [k for k, _ in t._menu_options] == ["cancel", "continue", "quit"]
+    t._resolve_menu(1)
+
+    # main worker IDLE with only a `!` command running: Esc-Esc falls
+    # through to the ordinary idle quit gesture rather than offering a
+    # "cancel" that would do nothing
+    t._busy = False
+    t._on_escape(lambda: None)
+    t._on_escape(lambda: None)
+    assert "side" not in [k for k, _ in (t._menu_options or [])]
+
+
+def _run_with_keys(tui_, sends, tail=0.6):
+    """Drive a real Application over a pipe: `sends` is [(delay_s, text)]."""
+    import io
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output.vt100 import Vt100_Output
+    out = Vt100_Output(io.StringIO(), lambda: Size(rows=30, columns=100),
+                       term="xterm")
+    sent = []
+    with create_pipe_input() as inp:
+        tui_.app.input, tui_.app.output = inp, out
+
+        def feed():
+            time.sleep(0.2)
+            for delay, text in sends:
+                time.sleep(delay)
+                sent.append(time.monotonic())
+                inp.send_text(text)
+            time.sleep(tail)
+            tui_.app.exit()
+        threading.Thread(target=feed, daemon=True).start()
+        tui_.app.run()
+    return sent
+
+
+def test_each_esc_of_a_double_tap_fires_promptly():
+    """R264: escape-prefixed bindings made every bare Esc wait
+    app.timeoutlen (1.0s default) — the second tap of the double-Esc
+    gesture fired ~1s late. Both taps must now fire within 0.3s."""
+    t_ = tui.Tui(_FakeEngine())
+    fired = []
+    t_._on_escape = lambda app_exit: fired.append(time.monotonic())
+    sent = _run_with_keys(t_, [(0, "\x1b"), (0.25, "\x1b")])
+    assert len(fired) == 2
+    for s, f in zip(sent, fired):
+        assert f - s < 0.3, f"Esc handled {f - s:.3f}s after the keypress"
+
+
+def test_alt_enter_still_submits_in_multiline_with_short_timeout():
+    """R264: the short timeoutlen must not break the Alt+Enter chord, which
+    a terminal delivers as one burst."""
+    eng = _FakeEngine()
+    eng.multiline = True
+    t_ = tui.Tui(eng)
+    got = []
+    t_._route_submitted_line = got.append
+    _run_with_keys(t_, [(0, "hello"), (0.05, "\x1b\r")])
+    assert got == ["hello"]

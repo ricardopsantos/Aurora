@@ -563,6 +563,15 @@ class MCPManager:
                 self.errors.append(
                     f"skipped a mcp_servers entry missing name/command: {c!r}")
                 continue
+            # config.yaml is machine-agnostic content shared across hosts with
+            # different home layouts (e.g. macOS ~/Desktop/GitTea/... vs Linux
+            # ~/repositories/...); Popen never does shell-style ~/$VAR
+            # expansion, so a literal path here only ever worked on the
+            # machine it was written on. Expand both here so the same
+            # command/args can use ~ or $HOME and travel between machines.
+            command = os.path.expanduser(os.path.expandvars(command))
+            args = [os.path.expanduser(os.path.expandvars(a))
+                    for a in (c.get("args") or [])]
             # Rejected BEFORE spawning, not after. `self._servers[name] = ...`
             # silently overwrote the earlier entry, dropping the only
             # reference to a child that was already spawned AND handshaked —
@@ -600,7 +609,7 @@ class MCPManager:
                     f"{_DEFAULT_TIMEOUT:g}s")
                 timeout = _DEFAULT_TIMEOUT
             try:
-                server = MCPServer(name, command, c.get("args"), env,
+                server = MCPServer(name, command, args, env,
                                    timeout=timeout)
             except Exception as e:
                 # one bad server must never take down the others, or Aurora
@@ -615,13 +624,32 @@ class MCPManager:
         if self._servers:
             atexit.register(self.close_all)
 
+    def _unique_tools(self) -> list:
+        """R305: `mcp_{server}_{tool}` is ambiguous (server `a_b` + tool `c`
+        and server `a` + tool `b_c` are both `mcp_a_b_c`). specs() kept the
+        first and runners() the last, so the gate showed one tool and the
+        call ran another. A colliding name is dropped from BOTH, warned."""
+        seen: dict[str, list] = {}
+        for name, server in self._servers.items():
+            for t in server.tools:
+                seen.setdefault(f"mcp_{name}_{t['name']}", []).append((name, server, t))
+        out = []
+        for full, hits in seen.items():
+            if len(hits) > 1:
+                msg = (f"tool name {full} is ambiguous across servers "
+                       f"{', '.join(h[0] for h in hits)} — skipped")
+                if msg not in self.errors:
+                    self.errors.append(msg)
+                continue
+            out.append((full, *hits[0]))
+        return out
+
     def specs(self) -> list[dict]:
-        return [_to_aurora_spec(name, t)
-               for name, server in self._servers.items() for t in server.tools]
+        return [_to_aurora_spec(name, t) for _f, name, _s, t in self._unique_tools()]
 
     def runners(self) -> dict:
-        return {f"mcp_{name}_{t['name']}": _make_runner(server, t["name"])
-               for name, server in self._servers.items() for t in server.tools}
+        return {full: _make_runner(server, t["name"])
+                for full, _n, server, t in self._unique_tools()}
 
     def close_all(self) -> None:
         for s in self._servers.values():

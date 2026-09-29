@@ -4,24 +4,24 @@
     "provider": "openrouter",
     "code": "kimi-k3",
     "context_size": 1048576,
-    "price_in_per_mtok": 3.0,
-    "price_out_per_mtok": 15.0,
+    "price_in_per_mtok": 1.7,
+    "price_out_per_mtok": 8.5,
     "pricing_url": "https://openrouter.ai/moonshotai/kimi-k3#pricing",
     "description": "Kimi K3 is a 2.8T parameter open-weight multimodal reasoning model from Moonshot AI. It is suited for complex coding, knowledge work, and long-horizon agentic workflows, and is particularly strong at...",
-    "price_cache_read_per_mtok": 0.3,
-    "refreshed_at": 1787736150.348
+    "price_cache_read_per_mtok": 0.17,
+    "refreshed_at": 1789929447.67
   },
   {
     "model": "moonshotai/kimi-k2.7-code",
     "provider": "openrouter",
     "code": "kimi-k2.7-code",
     "context_size": 262144,
-    "price_in_per_mtok": 0.67,
-    "price_out_per_mtok": 3.4,
+    "price_in_per_mtok": 0.706,
+    "price_out_per_mtok": 3.21,
     "pricing_url": "https://openrouter.ai/moonshotai/kimi-k2.7-code#pricing",
     "description": "MoonshotAI: Kimi K2.7 Code is a coding-focused model in Moonshot AI's Kimi K2 family, built to complete end-to-end programming tasks reliably over long contexts. It uses a native multimodal mixture-of-experts...",
-    "price_cache_read_per_mtok": 0.19,
-    "refreshed_at": 1787736150.348
+    "price_cache_read_per_mtok": 0.18,
+    "refreshed_at": 1789929447.67
   },
   {
     "model": "z-ai/glm-5.2",
@@ -73,7 +73,7 @@
     "pricing_url": "https://openrouter.ai/anthropic/claude-sonnet-4.6",
     "description": "Sonnet 4.6 is Anthropic's most capable Sonnet-class model yet, with frontier performance across coding, agents, and professional work. It excels at iterative development, complex codebase navigation, end-to-end project management with...",
     "price_cache_read_per_mtok": 0.3,
-    "refreshed_at": 1787736150.348
+    "refreshed_at": 1789929447.67
   },
   {
     "model": "openai/gpt-5.6-luna",
@@ -81,9 +81,10 @@
     "code": "gpt-5.6-luna",
     "pricing_url": "https://openrouter.ai/openai/gpt-5.6-luna#pricing",
     "context_size": 1050000,
-    "price_in_per_mtok": 0.1,
-    "price_out_per_mtok": 0.6,
+    "price_in_per_mtok": 0.2,
+    "price_out_per_mtok": 1.2,
     "description": "GPT-5.6 Luna is a fast, cost-efficient model in OpenAI's GPT-5.6 series. It is suited for high-volume, latency-sensitive tasks such as chat, classification, and lightweight agentic workflows, providing capable reasoning for...",
-    "refreshed_at": 1786309779.826
+    "refreshed_at": 1789929447.67,
+    "price_cache_read_per_mtok": 0.02
   }
 ]

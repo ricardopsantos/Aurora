@@ -58,11 +58,70 @@ from . import bootstrap, colors, rewind, tools, ui
 from .colors import BOLD, CYAN, GREEN, RED, RESET, URL_RE, YELLOW, dim
 from .colors import strip_dangerous_escapes as _strip_dangerous_escapes
 from .engine import Engine
-from .paths import aurora_home
+from .paths import aurora_home, write_text_preserving
+
+def _low_chatter_output():
+    """prompt_toolkit's `mouse_support=True` always requests mode 1003
+    ("any-event" tracking, `output.enable_mouse_support` in
+    `prompt_toolkit/output/vt100.py`) — a report on EVERY mouse pixel of
+    movement, held button or not. Aurora only ever needs motion while a
+    button is down (drag-to-select in `_ChatControl.mouse_handler`); the
+    rest is pure chatter.
+
+    Reported bug: over an SSH session (Mac → m7), moving/dragging the mouse
+    over the terminal sometimes typed garbage like `90;13M5;77;18M...` into
+    the prompt. That's an unconsumed mouse-tracking escape sequence
+    (`\\x1b[<0;90;13M`-shaped) falling through to plain self-insert — it
+    happens when the volume of 1003 events outpaces whatever the terminal
+    emulator/pty is able to keep synchronized, and a fragment lands
+    mid-sequence. Mode 1002 ("button-event" tracking: motion only while a
+    button is held) reports nothing while the mouse just sits there or
+    moves without a click, cutting the event volume drastically for the
+    exact case that was overwhelming it, with no loss of the drag-select
+    feature since that already gates on `MouseButton.LEFT` being held.
+
+    Returns a real `Output` with just `enable_mouse_support`/
+    `disable_mouse_support` patched to send 1002 instead of 1003 — `None`
+    when this isn't a patchable Vt100 output (e.g. Windows), so the caller
+    falls back to `Application`'s own default via `output=None`."""
+    from prompt_toolkit.output.defaults import create_output
+    from prompt_toolkit.output.vt100 import Vt100_Output
+    output = create_output()
+    if not isinstance(output, Vt100_Output):
+        return None
+
+    def enable_mouse_support(self=output) -> None:
+        self.write_raw("\x1b[?1000h")
+        self.write_raw("\x1b[?1002h")   # drag-only, not 1003's any-motion
+        self.write_raw("\x1b[?1015h")
+        self.write_raw("\x1b[?1006h")
+
+    def disable_mouse_support(self=output) -> None:
+        self.write_raw("\x1b[?1000l")
+        self.write_raw("\x1b[?1015l")
+        self.write_raw("\x1b[?1006l")
+        self.write_raw("\x1b[?1002l")
+
+    output.enable_mouse_support = enable_mouse_support
+    output.disable_mouse_support = disable_mouse_support
+    return output
+
 
 _DOUBLE_CLICK_S = 0.3     # same window prompt_toolkit's BufferControl uses
+# R252: how often a blocking ask re-checks for a confirmed cancel. Same
+# cadence `providers.base.cancellable_sse` polls at, for the same reason —
+# short enough that Esc feels immediate, long enough not to spin.
+_CANCEL_POLL_S = 0.15
 _SCROLL_STEP = 3          # wheel ticks are per-notch; keep it gentle
 _PAGE_STEP = 10
+
+
+class InputLineBusy(Exception):
+    """R253: raised instead of blocking when a thread that must not wait for
+    the single-slot input line (the side worker) asks for it while another
+    thread holds it. Caught where the side channel dispatches, and reported
+    as a refusal with a reason — never silently swallowed, which would look
+    identical to the command having run and printed nothing."""
 
 # R102: tools whose status-bar phase word gets replaced by a short "what's
 # actually running" label — the ones that can run long enough, and opaquely
@@ -123,6 +182,55 @@ class _ChatControl(FormattedTextControl):
         self._tui = tui
         super().__init__(**kw)
 
+    def create_content(self, width, height):
+        """R289: lines come from the Tui's incrementally-maintained cache and
+        are materialised only when the Window asks for them — i.e. the
+        visible rows (plus the few the wrap/scroll logic probes). The stock
+        implementation split the whole transcript into lines and hashed
+        every fragment on every call, which made frame time linear in
+        scrollback (63ms at 9.6k lines)."""
+        from prompt_toolkit.layout.controls import UIContent
+        tui = self._tui
+        lines = tui._render_lines()
+        pad = tui._pad()
+        sel = tui._sel or tui._sel_frozen
+        n = len(lines)
+
+        def get_line(i: int):
+            if i < pad:
+                return []
+            y = i - pad
+            if y >= n:
+                return []
+            frags = lines[y]
+            if sel is not None:
+                (y0, x0), (y1, x1) = sel
+                if y0 <= y <= y1:
+                    start = (0, x0) if y == y0 else (0, 0)
+                    end = (0, x1) if y == y1 else (1, 0)
+                    frags = _overlay(frags, start, end)
+            return [(f[0], f[1]) for f in frags]
+
+        return UIContent(get_line=get_line, line_count=pad + max(n, 1),
+                         show_cursor=self.show_cursor,
+                         cursor_position=(self.get_cursor_position()
+                                          if self.get_cursor_position else None))
+
+    def _dispatch_click(self, mouse_event):
+        """R289: the per-fragment handler dispatch FormattedTextControl did
+        from its last full fragment list, done from the line cache."""
+        tui = self._tui
+        y = mouse_event.position.y - tui._pad()
+        lines = tui._lines
+        if not 0 <= y < len(lines):
+            return NotImplemented
+        count = 0
+        for item in lines[y]:
+            count += len(item[1])
+            if count > mouse_event.position.x:
+                return item[2](mouse_event) if len(item) >= 3 else NotImplemented
+        return NotImplemented
+
     def mouse_handler(self, mouse_event):
         ev = mouse_event.event_type
         if ev == MouseEventType.SCROLL_UP:
@@ -145,8 +253,8 @@ class _ChatControl(FormattedTextControl):
             if self._tui.sel_finish():
                 return None          # a drag ended in a copy — swallow it
             # plain click → per-fragment handlers (thinking toggle)
-            return super().mouse_handler(mouse_event)
-        return super().mouse_handler(mouse_event)
+            return self._dispatch_click(mouse_event)
+        return self._dispatch_click(mouse_event)
 
 
 def _span(text, y, x):
@@ -323,7 +431,17 @@ class _ChatWriter(io.TextIOBase):
 
     def __init__(self, tui):
         self._tui = tui
-        self._buf: list[str] = []
+        # R279: one buffer PER THREAD. Since R245/R253 the side worker prints
+        # too, and a single shared list let a side print flush the main
+        # turn's partial line (or vice versa) mid-way.
+        self._local = threading.local()
+
+    @property
+    def _buf(self) -> list[str]:
+        buf = getattr(self._local, "buf", None)
+        if buf is None:
+            buf = self._local.buf = []
+        return buf
 
     def write(self, s):
         if not s:
@@ -337,10 +455,18 @@ class _ChatWriter(io.TextIOBase):
         return True
 
     def flush(self):
-        if self._buf:
-            text = "".join(self._buf)
-            self._buf = []
-            self._tui.append(text)
+        buf = self._buf
+        if buf:
+            text = "".join(buf)
+            buf.clear()
+            # R279: side-channel prints (a side-safe /command's output) get
+            # their own non-merging entry and leave the running turn's think
+            # row alone — the same two rules R254c/d established for
+            # quick_ask, which `append()` breaks.
+            if self._tui._on_side_thread():
+                self._tui.append_side(text)
+            else:
+                self._tui.append(text)
 
     def isatty(self):
         return True   # colors.py and friends keep emitting ANSI
@@ -509,6 +635,36 @@ class TuiFrontend(ui.TerminalFrontend):
         return " ".join(parts)
 
 
+# R171/I9: this is an accident log (crash tracebacks), not a record
+# Aurora's "keep everything forever" policy (R20) was ever meant to cover —
+# that's the session JSONL's job, by design. With no cap it grows without
+# bound on a machine that crashes often.
+_CRASH_LOG_CAP = 1_000_000
+
+
+def _truncate_crash_log(log_path: Path, cap: int = _CRASH_LOG_CAP) -> None:
+    """Keep only the last `cap` bytes of the TUI crash log.
+
+    R250: SEEKS to the tail rather than reading the whole file and slicing
+    it. R240 found this exact shape in `rewind.snapshot_before_write` — a cap
+    that allocates everything it exists to refuse. A 500MB log (which is what
+    an app crashing in a loop writes) meant a 500MB read to keep 1MB, inside
+    the handler that runs BECAUSE something already went wrong.
+
+    Module-level, not a closure inside `run()`'s exception handler, so the
+    bound is reachable from a test without standing up an Application."""
+    try:
+        size = log_path.stat().st_size
+        if size <= cap:
+            return
+        with open(log_path, "rb") as f:
+            f.seek(size - cap)
+            data = f.read()
+        log_path.write_bytes(data)
+    except OSError:
+        pass
+
+
 class Tui:
     def __init__(self, engine: Engine, debug: bool = False):
         self.engine = engine
@@ -525,6 +681,15 @@ class Tui:
         # line count) where entry i starts inside _text_cache — lets a rebuild
         # truncate to any dirty entry in O(1) instead of re-flattening
         self._dirty_from: int | None = None   # lowest entry needing a re-parse
+        # R289: `_text_cache` split into LINES, maintained incrementally —
+        # the chat control reads these instead of letting prompt_toolkit
+        # re-split the whole transcript every frame. `_line_starts[i]` is
+        # (fragment index, char offset) where line i begins; `_split_line`
+        # is the first line that must be recomputed (a large sentinel when
+        # everything is current).
+        self._lines: list = []
+        self._line_starts: list = []
+        self._split_line = 0
         self._clock_key = None       # R95j: displayed second of live think rows
         self._nlines = 0
         self._follow = True          # stick to the tail until the user scrolls
@@ -532,6 +697,58 @@ class Tui:
         self._lock = threading.Lock()
 
         self._inbox: queue.Queue[str] = queue.Queue()   # submitted lines
+        # R245: a `!` bash command typed while the main worker is busy (a
+        # long run_command, a model turn) used to just queue behind it —
+        # the exact "is my download done yet?" question this exists to
+        # answer couldn't even be asked until the download's own tool call
+        # returned. Its own queue + worker so it runs CONCURRENTLY with
+        # whatever the main worker is doing, instead of behind it.
+        #
+        # R253 widened what may ride it, from `!` bash only to three kinds,
+        # so entries are now ("bash"|"cmd"|"ask", payload) rather than a bare
+        # command string. A tag, not a prefix: a bash command can itself
+        # start with `/` (`/usr/bin/ls`) or `!`, so no prefix character can
+        # tell the three apart without ambiguity. What may NOT ride it is
+        # unchanged in spirit — anything that would give `engine.messages`
+        # or the session a second writer stays on the main inbox (see
+        # `ui.SIDE_SAFE_COMMANDS` for the exact test).
+        self._side_inbox: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._side_busy = False
+        # R254i: a side turn is a network call that can stream for minutes,
+        # and it had no stop at all — `fe.cancel_event` belongs to the turn,
+        # and Esc-Esc only ever offered to cancel that. R246 already settled
+        # this shape for background jobs ("a job that was started could not
+        # be stopped short of it finishing on its own or the whole process
+        # exiting"); the same standard applies here.
+        self._side_cancel = threading.Event()
+        # R257: WHICH kind of work the side channel is running ("" when
+        # idle). `_side_busy` alone can't answer "is this cancellable?" —
+        # only a quick-ask polls `_side_cancel`.
+        self._side_kind = ""
+        # R253: the input line is single-slotted — `_question`/`_menu_options`
+        # /`_saved_draft` are one each and `_answers` is one queue — so two
+        # threads prompting at once corrupt both prompts (the R142a shape,
+        # already survived once). This serializes the whole input line, held
+        # for the DURATION of a prompting command, not just one `ask()`.
+        # Reentrant because a single command legitimately prompts more than
+        # once (`/model` on a keyless provider: picker, then key prompt).
+        self._prompt_lock = threading.RLock()
+        # per-thread opt-out: the side worker must never BLOCK waiting for
+        # the input line (it would park behind a turn's approval gate for as
+        # long as the human ignores it), so it marks its own thread and takes
+        # a refusal instead. The main worker leaves it unset and keeps
+        # today's blocking behaviour.
+        self._prompt_nowait = threading.local()
+        # R253: a model picked by `/model` on the side channel, applied when
+        # the running turn ends — switching mid-turn would change the model
+        # under a request already in flight. (None = nothing pending.)
+        self._pending_model: dict | None = None
+        # R254b: `_defer_model` (side thread) checks `_busy` then parks;
+        # `_apply_pending_model` (worker thread) takes and clears. Unlocked,
+        # a park landing just after the take is never applied — the user is
+        # told "will switch when this finishes", it finishes, and nothing
+        # happens until some later, unrelated line ends.
+        self._model_lock = threading.Lock()
         self._answers: queue.Queue[str] = queue.Queue() # question-mode replies
         self._question: str | None = None
         self._secret = False
@@ -779,6 +996,38 @@ class Tui:
         except Exception:
             pass
 
+    def append_side(self, text: str) -> None:
+        """R254c/d: a side-channel answer, as ONE discrete entry.
+
+        Two things `append()` does are wrong for output that did not come
+        from the running turn:
+
+        - It MERGES into the previous string entry while that entry is small.
+          Two threads streaming at once therefore interleave character by
+          character in a single entry — a turn streaming "MAIN ANSWER" while
+          a side turn streams "side answer" renders as
+          `MsAiIdNe  AaNnSsWwEeRr`. Measured, not hypothetical.
+        - It calls `_close_think_locked()`, on the sound reasoning that plain
+          output means *this request* moved past thinking. That inference
+          belongs to the turn's own output. From the side channel it is
+          simply false: it freezes the running turn's live clock and marks
+          its row done, so the next reasoning chunk opens a SECOND row and
+          one request's thinking renders as several with restarted timers.
+
+        So: its own entry kind (never merged, like `bash_output`), appended
+        whole rather than streamed, and the think row left alone."""
+        text = _strip_dangerous_escapes(text)
+        with self._lock:
+            self._chat.append({"kind": "side", "text": text})
+            self._cache.append(None)
+            self._line_counts.append(None)
+            self._dirty(len(self._chat) - 1)
+            self._evict_locked()          # R152
+        try:
+            self.app.invalidate()
+        except Exception:
+            pass
+
     def clear_screen(self) -> None:
         """Bash-mode `clear`/`cls` (R116): a real terminal's `clear` resets
         the visible screen, but here stdout is captured by `subprocess.run`
@@ -795,6 +1044,15 @@ class Tui:
         since `_chat` is empty."""
         with self._lock:
             self._chat.clear()
+            # R257: the rows are gone, so the flag saying one is open has to
+            # go with them. R254c made `begin_think` TRUST that flag (it
+            # returns early when a row is open but no longer last), so a
+            # stale True here means the next request opens no timed row at
+            # all. It self-heals on the next `append()`, which is why this is
+            # a one-line guard rather than a reported bug — but a flag that
+            # outlives the state it describes is the bug, not the symptom.
+            self._open_think_items = []
+            self._open_think = False
             self._cache.clear()
             self._line_counts.clear()
             self._dirty_from = None
@@ -806,6 +1064,12 @@ class Tui:
         except Exception:
             pass
 
+    def _on_side_thread(self) -> bool:
+        """R279: is the caller the side worker (R245/R253)? It marks itself
+        via `_prompt_nowait`, the same thread-local R253 uses for the input
+        line."""
+        return bool(getattr(self._prompt_nowait, "on", False))
+
     def append_bash_output(self, text: str) -> None:
         """Bash-mode command output (R10) — same rendering path as
         append(), but tagged as its own entry kind (not merged into a plain
@@ -816,7 +1080,10 @@ class Tui:
         `_strip_dangerous_escapes`."""
         text = _strip_dangerous_escapes(text)
         with self._lock:
-            self._close_think_locked()
+            # R279: a side `!` command's output is not the turn's output —
+            # it must not close the turn's live think row (R254c's rule)
+            if not self._on_side_thread():
+                self._close_think_locked()
             self._chat.append({"kind": "bash_output", "text": text})
             self._cache.append(None)
             self._line_counts.append(None)
@@ -837,6 +1104,8 @@ class Tui:
             if (isinstance(last, dict) and last.get("kind") == "think"
                     and not last["done"]):
                 return                      # this request's row already exists
+            if self._open_think:            # R254c: open, just no longer last
+                return                      # (side output landed after it)
             row = {"kind": "think", "text": "", "open": live,
                   "done": False, "t0": time.monotonic(), "dt": 0}
             self._chat.append(row)
@@ -848,14 +1117,37 @@ class Tui:
             self._open_think = True
         self.app.invalidate()
 
+    def _open_think_index_locked(self):
+        """(index, row) of the request's still-open think row, or (-1, None).
+        Caller holds `self._lock`.
+
+        R254c: that row is normally `_chat[-1]`, which is why callers test
+        that first — but it stops being last the moment side-channel output
+        lands between two reasoning chunks, and continuing the request's own
+        row then beats opening a second one with a restarted clock. Gated on
+        the `_open_think` flag so the scan runs only when there is something
+        to find, and it stops AT the row, so it walks only what was appended
+        after it — normally nothing."""
+        if not self._open_think:
+            return -1, None
+        for i in range(len(self._chat) - 1, -1, -1):
+            item = self._chat[i]
+            if (isinstance(item, dict) and item.get("kind") == "think"
+                    and not item["done"]):
+                return i, item
+        return -1, None       # evicted (R152) — the caller opens a fresh row
+
     def think_chunk(self, chunk: str, live: bool = False) -> None:
         """Grow the current request's thinking block (create it if on_request
         didn't, e.g. under a plain frontend test); collapsed by default — a
         click on its header expands it."""
         with self._lock:
-            last = self._chat[-1] if self._chat else None
+            idx = len(self._chat) - 1
+            last = self._chat[idx] if self._chat else None
             if not (isinstance(last, dict) and last.get("kind") == "think"
                     and not last["done"]):
+                idx, last = self._open_think_index_locked()   # R254c
+            if last is None:
                 import time
                 last = {"kind": "think", "text": "", "open": live,
                         "done": False, "t0": time.monotonic(), "dt": 0}
@@ -865,6 +1157,7 @@ class Tui:
                 self._line_counts.append(None)
                 self._evict_locked()          # R152
                 self._open_think = True
+                idx = len(self._chat) - 1
             # R204: the reasoning stream is model output, exactly like the
             # reply `append()` sanitizes — R171's argument ("a compromised or
             # prompt-injected model can put an OSC 52 in its own reply just as
@@ -873,7 +1166,7 @@ class Tui:
             # a payload in `reasoning_content` reached `_chat` raw and was
             # copied out by /copy-all with it.
             last["text"] += _strip_dangerous_escapes(chunk)
-            self._dirty(len(self._chat) - 1)
+            self._dirty(idx)          # R254c: not necessarily the last entry
         self.app.invalidate()
 
     def _close_think_locked(self) -> None:
@@ -961,6 +1254,11 @@ class Tui:
             frags = _linkify_fragments(
                 _merge_char_runs(ANSI(item["text"]).__pt_formatted_text__()))
             return self._linkify_filenames(frags)
+        if isinstance(item, dict) and item.get("kind") == "side":
+            # R254c/d: its own kind purely so it can never be merged into a
+            # neighbouring string entry — rendered like ordinary chat text
+            return _linkify_fragments(
+                _merge_char_runs(ANSI(item["text"]).__pt_formatted_text__()))
         import time
         secs = int(item["dt"] if item["done"]
                    else time.monotonic() - item.get("t0", time.monotonic()))
@@ -1014,12 +1312,18 @@ class Tui:
         self._dirty_from = None
         if start == 0:
             self._text_cache, self._offsets, total = [], [], 0
+            self._split_line = 0                                  # R289
         elif start >= len(self._offsets):
             # nothing already-flattened changed (the common case: a brand new
             # entry was appended) — resume at the end of what we have
             start, total = len(self._offsets), self._nlines
+            # R289: the last line may be continued by what gets appended
+            self._split_line = min(self._split_line,
+                                   max(len(self._lines) - 1, 0))
         else:
             fo, total = self._offsets[start]
+            # R289: lines before the one this entry starts on are unchanged
+            self._split_line = min(self._split_line, total)
             del self._text_cache[fo:]
             del self._offsets[start:]
         out = self._text_cache
@@ -1120,6 +1424,45 @@ class Tui:
             return 0
         return max(0, info.window_height - self._nlines - 1)
 
+    def _render_lines(self) -> list:
+        """R289: the transcript as a list of lines (fragment lists, handlers
+        kept), re-split only from the first changed line. What
+        `FormattedTextControl.create_content` did from scratch on EVERY frame
+        (~2.6 times per frame, counting preferred_height) — measured at 9.6k
+        lines, 63ms/frame, ~60% of it `split_lines`."""
+        frags = self._fragments()      # takes (and releases) self._lock
+        with self._lock:
+            L = self._split_line
+            if L < len(self._lines) or (L == 0 and not self._lines):
+                if L >= len(self._line_starts):
+                    L = len(self._line_starts)
+                fi, off = self._line_starts[L] if L < len(self._line_starts) \
+                    else (0, 0)
+                del self._lines[L:]
+                del self._line_starts[L:]
+                cur: list = []
+                self._line_starts.append((fi, off))
+                for i in range(fi, len(frags)):
+                    f = frags[i]
+                    text = f[1][off:] if i == fi else f[1]
+                    base = off if i == fi else 0
+                    pos = 0
+                    while True:
+                        nl = text.find("\n", pos)
+                        if nl == -1:
+                            if pos < len(text):
+                                cur.append((f[0], text[pos:], *f[2:]))
+                            break
+                        if nl > pos:
+                            cur.append((f[0], text[pos:nl], *f[2:]))
+                        self._lines.append(cur)
+                        cur = []
+                        self._line_starts.append((i, base + nl + 1))
+                        pos = nl + 1
+                self._lines.append(cur)
+            self._split_line = 1 << 62
+            return self._lines
+
     def _render_fragments(self):
         """What the chat control actually renders: the cached fragments,
         top-padded to bottom-anchor short content, with the live selection
@@ -1179,6 +1522,30 @@ class Tui:
             pass
 
     # ── question mode (blocking asks from the worker thread) ─────────────
+    def _await_answer(self, on_cancel):
+        """Block for the worker's answer, but wake on a confirmed cancel.
+
+        R252: `self._answers.get()` used to block outright. Every blocking
+        ask in a turn — the API-key prompt `_provider_for(interactive=True)`
+        raises on a first run, an approval gate, a secret challenge — is
+        therefore deaf to `fe.cancel_event`, which is the ONLY thing Esc-Esc's
+        "Cancel this?" sets. And while `self._busy` is True the Esc gesture
+        offers cancel and nothing else, so with the worker parked here the
+        app had no way out at all: cancel did nothing, quit was unreachable,
+        and the user had to kill the process. Opening that confirm menu also
+        HIDES the pending question (`_prompt()` returns [] while a menu is
+        up), which is why the prompt nobody answered was invisible.
+
+        `on_cancel()` supplies the answer a cancel means for THIS caller —
+        the same idea R214 settled for EOF: the safe answer differs per
+        prompt, and only the caller knows it."""
+        while True:
+            try:
+                return self._answers.get(timeout=_CANCEL_POLL_S)
+            except queue.Empty:
+                if self.fe.cancel_event.is_set():
+                    return on_cancel()
+
     def ask(self, prompt: str = "", secret: bool = False) -> str:
         # The UI (event-loop) thread is the one that DELIVERS answers, so an
         # ask() from it (e.g. via the builtins.input monkeypatch) can never
@@ -1191,34 +1558,63 @@ class Tui:
             raise RuntimeError(
                 "ask()/input() called from the TUI event-loop thread — this "
                 "would deadlock; route it through the session worker")
-        # the question is NOT printed into the chat — it becomes the input
-        # line's prompt, so the cursor sits right after it; the answered pair
-        # is echoed into the transcript by the enter handler
-        q = prompt or "?"
-        if not q.endswith((" ", "\n")):
-            q += " "
-        # preserve any draft the user was typing before the challenge took
-        # over the input line; restore it after the challenge is answered
-        self._saved_draft = self.input.document.text
-        self._question, self._secret = q, secret
-        self.input.buffer.reset()
-        self.app.invalidate()
+        # R253: everything from here down is inside the try, so that a raise
+        # while CLAIMING the input line (a buffer/render call, not just the
+        # wait below) can't leak the lock — a leaked `_prompt_lock` would
+        # deadlock the worker thread on its next prompt, permanently.
+        self._acquire_input_line()        # released in the finally
         try:
-            return self._answers.get()
-        finally:
-            self._question, self._secret = None, False
-            # restore the draft the user was typing before the challenge
-            # took over the input line; assign .text directly to avoid the
-            # async completer that insert_text() would trigger. R170d: the
-            # .text setter only clamps cursor_position if it now exceeds the
-            # new text's length — it never MOVES it, so it stayed wherever
-            # buffer.reset() left it (0) instead of where the user was
-            # actually typing. Put it back at the end, same place Enter/
-            # normal typing would leave it.
-            self.input.buffer.text = self._saved_draft
-            self.input.buffer.cursor_position = len(self._saved_draft)
-            self._saved_draft = ""
+            # the question is NOT printed into the chat — it becomes the input
+            # line's prompt, so the cursor sits right after it; the answered
+            # pair is echoed into the transcript by the enter handler
+            q = prompt or "?"
+            if not q.endswith((" ", "\n")):
+                q += " "
+            # preserve any draft the user was typing before the challenge took
+            # over the input line; restore it after the challenge is answered
+            self._saved_draft = self.input.document.text
+            self._question, self._secret = q, secret
+            self.input.buffer.reset()
             self.app.invalidate()
+            # R252: "" is what an unanswered prompt already means everywhere
+            # this is reached from — `_prompt_and_store_key` reports "skipped",
+            # `confirm`-style callers fall through to their default.
+            return self._await_answer(lambda: "")
+        finally:
+            # R253: the release is its own nested finally, so a raise while
+            # RESTORING (the buffer writes, the render) can't skip it either.
+            # Ordering matters the other way too — the restore is state this
+            # very lock protects, so it happens before the handoff.
+            try:
+                self._question, self._secret = None, False
+                # restore the draft the user was typing before the challenge
+                # took over the input line; assign .text directly to avoid the
+                # async completer that insert_text() would trigger. R170d: the
+                # .text setter only clamps cursor_position if it now exceeds
+                # the new text's length — it never MOVES it, so it stayed
+                # wherever buffer.reset() left it (0) instead of where the user
+                # was actually typing. Put it back at the end, same place
+                # Enter/normal typing would leave it.
+                self.input.buffer.text = self._saved_draft
+                self.input.buffer.cursor_position = len(self._saved_draft)
+                self._saved_draft = ""
+                self.app.invalidate()
+            finally:
+                self._prompt_lock.release()
+
+    def _acquire_input_line(self) -> None:
+        """R253: take the single-slot input line (see `_prompt_lock`).
+
+        Blocks for the main worker — a turn's approval gate has to wait for
+        whatever owns the line, and the owner is always something a human is
+        actively looking at, so the wait is bounded by them answering it.
+        Raises for a thread that marked itself `_prompt_nowait`, which is the
+        side worker: parking it there would defeat the point of a channel
+        that exists so a question never has to wait."""
+        blocking = not getattr(self._prompt_nowait, "on", False)
+        if not self._prompt_lock.acquire(blocking=blocking):
+            raise InputLineBusy(
+                "the running turn is using the input line")
 
     def select_menu(self, prompt: str, options: list[tuple[str, str]],
                     default_index: int | None = None,
@@ -1251,27 +1647,46 @@ class Tui:
         # worker blocks forever mid-turn. Dropping the unanswered confirm
         # loses a question the user can simply ask again; keeping it loses
         # the session.
-        if self._menu_on_select is not None:
-            self._menu_on_select = None
-            self.append(dim("· pending confirm dismissed — answer this first\n"))
-        self._menu_prompt, self._menu_options = prompt, options
-        self._menu_index = default_index or 0
-        if hasattr(self, "input"):        # a stale draft must not bleed under the menu
-            self._saved_draft = self.input.document.text
-            self.input.buffer.reset()
-        self.app.invalidate()
+        # R251: never open a menu with nothing in it — arrows (`% len`) and
+        # Enter (`options[index]`) both fail on an empty list, leaving a menu
+        # on screen that no key can resolve while this call blocks the worker
+        # thread on `_answers.get()` forever. Callers own the empty case
+        # (`ui._pick_model` reports it); this is the structural backstop.
+        if not options:
+            return eof_key
+        # R253: the claim and the whole setup share one try, so a raise while
+        # opening the menu can't leak the lock — see `ask()` for why a leaked
+        # `_prompt_lock` is permanent.
+        self._acquire_input_line()        # released in the finally
         try:
-            answer = self._answers.get()
+            if self._menu_on_select is not None:
+                self._menu_on_select = None
+                self.append(dim("· pending confirm dismissed — answer this first\n"))
+            self._menu_prompt, self._menu_options = prompt, options
+            self._menu_index = default_index or 0
+            if hasattr(self, "input"):    # a stale draft must not bleed under the menu
+                self._saved_draft = self.input.document.text
+                self.input.buffer.reset()
+            self.app.invalidate()
+            # R252: a cancel confirmed earlier in this same turn must not
+            # leave the NEXT menu of the turn (an approval gate reached
+            # before `run_turn` next polls `cancelled()`) blocking with no
+            # way to answer it. `eof_key` is already the caller's stated safe
+            # answer for "nobody is here to ask" (R214).
+            answer = self._await_answer(lambda: eof_key)
             return eof_key if answer is None and eof_key is not None else answer
         finally:
-            self._menu_prompt = self._menu_options = None
-            if hasattr(self, "input"):    # restore the draft the user was typing
-                self.input.buffer.text = self._saved_draft
-                # R170d: same fix as ask() — the .text setter doesn't move
-                # cursor_position to match, so it stayed at 0 from reset().
-                self.input.buffer.cursor_position = len(self._saved_draft)
-                self._saved_draft = ""
-            self.app.invalidate()
+            try:                          # R253 — see ask()'s finally
+                self._menu_prompt = self._menu_options = None
+                if hasattr(self, "input"):  # restore the draft being typed
+                    self.input.buffer.text = self._saved_draft
+                    # R170d: same fix as ask() — the .text setter doesn't move
+                    # cursor_position to match, so it stayed at 0 from reset().
+                    self.input.buffer.cursor_position = len(self._saved_draft)
+                    self._saved_draft = ""
+                self.app.invalidate()
+            finally:
+                self._prompt_lock.release()
 
     def update_menu_labels(self, prompt: str,
                            options: list[tuple[str, str]]) -> bool:
@@ -1364,7 +1779,11 @@ class Tui:
     # visible chat, but the text comes from the session log, which since
     # R152's scrollback cap can hold more than the pane still shows).
     _COPY_LABELS = {
-        "last": "copy last",
+        # R256: "copy last" was ambiguous in the one way that mattered — it
+        # takes the whole turn (prompt, thinking, every reply), and a user
+        # who wanted just the answer had no row for it. Both are named now.
+        "last": "copy last (full)",
+        "response": "copy last (response)",
         "session": "copy whole session transcript",
         "id": "copy session id",
         "selected": "copy selected",
@@ -1403,6 +1822,7 @@ class Tui:
             # own `_copy_menu_draft`, which only ever became a no-op restore.
             self._copy_menu_sel = sel if sel.strip() else ""
             options = [("last", self._COPY_LABELS["last"]),
+                       ("response", self._COPY_LABELS["response"]),
                        ("session", self._COPY_LABELS["session"]),
                        ("id", self._COPY_LABELS["id"])]
             if self._copy_menu_sel:
@@ -1435,7 +1855,7 @@ class Tui:
         if key == "session":
             self.append(f"\n{CYAN}{BOLD}> {RESET}/copy-all\n")
             self.scroll_end()
-            self._inbox.put("/copy-all")
+            self._route_submitted_line("/copy-all")
             return
         if key == "selected":
             if not sel.strip():
@@ -1457,6 +1877,19 @@ class Tui:
             sid = str(self.engine.context_stats().session_id)
             how = clipboard.copy(sid)
             self._sel_notice = (f"session id copied — {how}", time.monotonic())
+            self.app.invalidate()
+            return
+        if key == "response":
+            # R256: bounded and engine-local, so it copies inline on the UI
+            # thread like the other small rows — no inbox round trip.
+            text = ui._outbound(self.engine.last_turn_final_reply())
+            if not text:
+                self._sel_notice = ("no reply in the last turn",
+                                    time.monotonic())
+            else:
+                how = clipboard.copy(text)
+                self._sel_notice = (f"final reply copied — {how}",
+                                    time.monotonic())
             self.app.invalidate()
             return
         # "last"
@@ -1531,7 +1964,7 @@ class Tui:
         """The draft is already restored by `_resolve_menu` (R171c) before
         this callback runs — nothing left to do here but act on the pick."""
         if key == "y":
-            self._inbox.put("/compact")
+            self._route_submitted_line("/compact")
 
     def _undo_click(self):
         """Click handler for the status bar's `undo` button (feature request,
@@ -1551,9 +1984,8 @@ class Tui:
         def handler(mouse_event):
             if mouse_event.event_type == MouseEventType.MOUSE_UP and self._click_guard():
                 self.append(f"\n{CYAN}{BOLD}> {RESET}/undo\n")
-                self._note_if_busy()
                 self.scroll_end()
-                self._inbox.put("/undo")
+                self._route_submitted_line("/undo")
         return handler
 
     def _cost_tree_click(self):
@@ -1566,9 +1998,8 @@ class Tui:
         def handler(mouse_event):
             if mouse_event.event_type == MouseEventType.MOUSE_UP and self._click_guard():
                 self.append(f"\n{CYAN}{BOLD}> {RESET}/context\n")
-                self._note_if_busy()
                 self.scroll_end()
-                self._inbox.put("/context")
+                self._route_submitted_line("/context")
         return handler
 
     def _cost_report_click(self):
@@ -1580,20 +2011,76 @@ class Tui:
         def handler(mouse_event):
             if mouse_event.event_type == MouseEventType.MOUSE_UP and self._click_guard():
                 self.append(f"\n{CYAN}{BOLD}> {RESET}/cost\n")
-                self._note_if_busy()
                 self.scroll_end()
-                self._inbox.put("/cost")
+                self._route_submitted_line("/cost")
         return handler
 
-    def _note_if_busy(self) -> None:
-        """A line just got echoed and pushed onto `self._inbox` — if the
-        worker is still busy on a prior turn (a `wait_until` poll, a slow
-        tool call), that echo is misleading on its own: it looks submitted
-        and answered, but `_worker()` (the sole inbox consumer) won't even
-        look at it until the current turn finishes. Surfaces the wait so a
-        queued `/context` etc. doesn't read as "silently did nothing"."""
-        if self._busy:
-            self.append(dim("  (queued — still running previous command)\n"))
+    def _route_submitted_line(self, line: str) -> None:
+        """R253: decide which of the two workers a submitted line goes to.
+
+        Idle (the common case) — everything goes to `_inbox` exactly as
+        before; this whole method is a no-op fork then. Busy is where it
+        matters, and the fork is by what the line would TOUCH:
+
+        - a read-only `/command` (`ui.side_safe_command`) → side channel,
+          runs now;
+        - `/model` with no sub-command → side channel, under the input-line
+          lock, with the switch deferred to when the turn ends;
+        - a plain prompt → side channel as a quick-ask (one provider call,
+          no tools, not added to history — `Engine.quick_ask`);
+        - anything else (`/clear`, `/compact`, `/rewind`, `/model add`, …)
+          → main inbox, queued, WITH the reason said out loud.
+
+        The last case is the point of the whole split: those genuinely have
+        to wait, because they write the conversation the running turn owns.
+        Before this, everything looked like that case."""
+        if not self._busy:
+            self._inbox.put(line)
+            return
+        if line.startswith("/"):
+            cmd, _, arg = line[1:].partition(" ")
+            if ui.side_safe_command(line):
+                self._note_if_side_busy()
+                self._side_inbox.put(("cmd", line))
+                return
+            if cmd.strip().lower() == "model" and not arg.strip():
+                self._note_if_side_busy()
+                self._side_inbox.put(("model", line))
+                return
+            self.append(dim(f"  (queued — /{cmd.strip().lower()} changes the "
+                            "session the running turn is using. Esc-Esc "
+                            "cancels that turn.)\n"))
+            self._inbox.put(line)
+            return
+        if self._side_busy:
+            # R257: R254a re-validated `_busy` at the far end, which stopped
+            # prompts being LOST — but a prompt sent to a channel that is
+            # already chewing on something waits there, outside the main
+            # queue, and a prompt typed LATER goes straight to an idle main
+            # worker and runs first. Measured: A typed while busy ran after
+            # B typed after it. The side channel's whole value is running
+            # NOW; when it can't, a prompt belongs in the main queue, in the
+            # order it was typed.
+            self.append(dim("  (queued — the quick-check channel is busy, "
+                            "so this keeps its place in line)\n"))
+            self._inbox.put(line)
+            return
+        self._side_inbox.put(("ask", line))
+
+    # R253 removed `_note_if_busy()`. It printed one generic
+    # "(queued — still running previous command)" for every line submitted
+    # while busy, which is exactly the screenshot on the card: `/model` and
+    # a plain prompt both reported as stuck with no reason and no recourse.
+    # Most of those lines now don't queue at all, and the ones that still
+    # must say WHY in `_route_submitted_line`.
+
+    def _note_if_side_busy(self) -> None:
+        """The side channel's own "you're behind something" note (R245): a
+        command submitted while another side-channel command is still
+        running is draining behind it on `_side_inbox`, not lost — but
+        silently so unless this says so."""
+        if self._side_busy:
+            self.append(dim("  (queued behind the other quick check)\n"))
 
     def _click_guard(self) -> bool:
         """Shared eligibility check for the line-2 hint buttons (/ commands,
@@ -1680,7 +2167,7 @@ class Tui:
             if self._click_guard():
                 self.append(f"\n{CYAN}{BOLD}> {RESET}/model\n")
                 self.scroll_end()
-                self._inbox.put("/model")
+                self._route_submitted_line("/model")
         return handler
 
     def _open_commands(self):
@@ -1886,7 +2373,14 @@ class Tui:
         can refuse to discard the buffer on a failed save."""
         text = self._editor_area.buffer.text
         try:
-            self._editor["path"].write_text(text, encoding="utf-8")
+            # R249: the same atomic, mode- and symlink-preserving write R241
+            # gave `write_file`/`edit_file`/`apply_patch`. `/nano` edits the
+            # SAME class of file those tools do — the user's own config.yaml,
+            # a shell script, a doc — so a plain `write_text` here leaves it
+            # truncated on a crash/ENOSPC exactly as it did there, and swaps
+            # an edited symlink for a regular file. R241 hardened the model's
+            # three write paths and missed the human's one.
+            write_text_preserving(self._editor["path"], text)
         except OSError as e:
             print(f"nano: can't save {self._editor['path']}: {e}")
             return False
@@ -2076,6 +2570,11 @@ class Tui:
         return handler
 
     def _resolve_menu(self, index: int) -> None:
+        # R251: a click/digit/Enter can arrive after the menu closed (a stale
+        # mouse handler holds its own index), and an empty or shorter list
+        # then raises inside a key binding rather than doing nothing.
+        if not self._menu_options or not 0 <= index < len(self._menu_options):
+            return
         key, label = self._menu_options[index]
         self.append(f"{self._menu_prompt}\n  → {label}\n")
         if self._menu_on_select is not None:
@@ -2106,6 +2605,8 @@ class Tui:
         explicit) — only how the choice
         is DELIVERED differs (`on_select(key)` callback vs. the answers
         queue)."""
+        if not options:
+            return                      # R251: see select_menu
         self._menu_prompt, self._menu_options = prompt, options
         self._menu_index = default_index
         self._menu_on_select = on_select
@@ -2131,9 +2632,13 @@ class Tui:
         if key == "yes":
             app_exit()
 
-    def _resolve_cancel_menu(self, key: str) -> None:
+    def _resolve_cancel_menu(self, key: str, app_exit=None) -> None:
         if key == "cancel":
             self.fe.cancel_event.set()
+        elif key == "side":               # R254i — the side turn only
+            self._side_cancel.set()
+        elif key == "quit" and app_exit is not None:
+            app_exit()
 
     def _typed_over_exit(self) -> None:
         """The user started typing while a quit question was pending — they
@@ -2179,6 +2684,28 @@ class Tui:
                 # Every other select()/confirm menu still requires an
                 # explicit pick (see test_menu_esc_is_noop_while_open).
                 self._answers.put(None)
+            elif self._menu_prompt == "Quit Aurora?":
+                # R261: reported lockup — a garbled prompt (leaked mouse
+                # escape bytes) got mashed with repeated Esc to clear it,
+                # which walked straight through THREE different Esc
+                # meanings in one breath: clear-the-draft (1st), arm the
+                # quit gesture (2nd, buffer now empty), open this menu
+                # (3rd, still within the 2s window). From here every
+                # further Esc used to be a no-op (the branch below, same
+                # as any other confirm) — so mashing Esc to escape the
+                # menu you didn't mean to open did nothing, and typing did
+                # nothing either (R211 swallows it while a menu is up):
+                # indistinguishable from the app being frozen. Unlike
+                # leave-bash/cancel/copy, "don't quit" is never a
+                # destructive outcome to default to, so this gets the same
+                # bare-Esc-cancels exemption as "Select model" — resolved
+                # through `_resolve_menu` (not the answers queue, this
+                # menu was opened via `_open_ui_menu`'s callback style) so
+                # the draft-restore and open-menu bookkeeping stay
+                # identical to an explicit "No, stay" pick.
+                self._resolve_menu(
+                    next(i for i, (k, _) in enumerate(self._menu_options)
+                        if k == "no"))
             # else: a challenge/confirm menu is open — require an explicit pick
         elif buf.complete_state:
             # R150d: this branch now sits where the docstring above always
@@ -2203,13 +2730,27 @@ class Tui:
                 buf.reset()
             else:
                 _arm("bash")
-        elif self._busy:
+        elif self._busy or self._side_kind == "ask":
             if _armed("cancel"):
                 self._esc_armed = None
-                self._open_ui_menu("Cancel this?", [
-                    ("cancel", "Yes, cancel"),
-                    ("continue", "No, keep going"),
-                ], self._resolve_cancel_menu)
+                rows = []
+                if self._busy:
+                    rows.append(("cancel", "Yes, cancel"))
+                # R254i: the side channel is separately cancellable, and only
+                # offered when something is actually on it — so the rows stay
+                # exactly as they were whenever nothing is (the common case).
+                # R257: `_side_cancel` is polled by `quick_ask` and by
+                # nothing else, so offering this while the channel is running
+                # a `!` command promised a stop that silently did nothing.
+                if self._side_kind == "ask":
+                    rows.append(("side", "Cancel the side question"))
+                rows.append(("continue", "No, keep going"))
+                # R252: the ONLY exit offered while busy used to be
+                # cancel, so a turn that cancel couldn't reach left no
+                # way out of the app short of killing it.
+                rows.append(("quit", "Quit Aurora"))
+                self._open_ui_menu("Cancel this?", rows,
+                    lambda key: self._resolve_cancel_menu(key, app_exit))
             else:
                 _arm("cancel")
         elif self._exit_confirm:
@@ -2277,6 +2818,13 @@ class Tui:
                 plen = len(prompt_lines[-1]) if self._question else 2
                 rows = extra
                 for i, line in enumerate(self.input.document.lines):
+                    # R294: the box is capped at 8 rows, so once 8 are
+                    # counted nothing further can change the answer. This
+                    # used to textwrap EVERY line of the draft on every
+                    # frame (twice per frame) — 15ms redraws with a 100KB
+                    # paste, growing linearly with the draft.
+                    if rows >= 8:
+                        break
                     # R171: plain char-count ceil-div undercounts against
                     # `wrap_lines=True`'s actual WORD wrap, which breaks
                     # before the column edge whenever a word wouldn't fit —
@@ -2397,16 +2945,22 @@ class Tui:
             if self._bash_mode:                   # run locally, stay in bash mode
                 if line.strip():
                     self.append(f"\n{GREEN}{BOLD}$ {RESET}{line}\n")
-                    self._note_if_busy()
                     self.scroll_end()
-                    self._inbox.put("!" + line)   # worker's `!` path runs bash
+                    if self._busy:
+                        # R245: don't queue behind whatever the main worker
+                        # is doing — run it now, on the side worker, so
+                        # "is it done yet?" never has to wait for the thing
+                        # it's asking about.
+                        self._note_if_side_busy()
+                        self._side_inbox.put(("bash", line))
+                    else:
+                        self._inbox.put("!" + line)  # worker's `!` path
                 return
             if not line.strip():
                 return
             self.append(f"\n{CYAN}{BOLD}> {RESET}{line}\n")
-            self._note_if_busy()
             self.scroll_end()
-            self._inbox.put(line)
+            self._route_submitted_line(line)
 
         @kb.add("enter", filter=_no_editor)
         def _(event):
@@ -2486,6 +3040,20 @@ class Tui:
                 buf.cut_selection()
             else:
                 buf.delete_before_cursor(count=event.arg)
+                # prompt_toolkit only re-triggers `complete_while_typing` on
+                # INSERT (Buffer.insert_text's on_text_insert hook) — any
+                # text change, including this delete, unconditionally clears
+                # complete_state (Buffer._text_changed) and nothing restarts
+                # it. So backspacing mid `/command` (or after committing a
+                # completion, which also plants the cursor via delete-free
+                # text replacement) killed the popup for the rest of the
+                # line: the next character typed inserts fine and normally
+                # would reopen it, but by then `_text_changed` already fired
+                # for the backspace with no completer callback attached, so
+                # nothing was listening. Explicitly restart it here so typing
+                # after a backspace behaves like typing after nothing.
+                if buf.complete_while_typing():
+                    buf.start_completion(select_first=False)
 
         @kb.add("escape", filter=_no_editor)
         def _(event):
@@ -2599,6 +3167,12 @@ class Tui:
                 # plain string spliced into the separator.
                 warn = "  ⚠ context >80% — /compact?" if s.pct >= 80 else ""
                 ml = " │ multiline" if self.engine.multiline else ""
+                # R262: this MUST stay visible for as long as the flag is on
+                # — it silences the one thing standing between the model and
+                # every gated tool call it wants to run. A session toggle
+                # with no on-screen reminder is exactly how someone leaves
+                # it on past the task they turned it on for.
+                aa = "  ⚠ auto-approve ON" if self.engine.auto_approve else ""
                 # R155: the session id is no longer rendered on the bar — it
                 # moved into the copy picker, which reads it from
                 # engine.session.id at pick time
@@ -2663,6 +3237,8 @@ class Tui:
                     frags.append(("class:status", ml))
                 if warn:
                     frags.append(("class:status", warn))
+                if aa:
+                    frags.append(("class:status", aa))
             except Exception as e:
                 # R212: still never crash the render — the status bar repaints
                 # on a timer and an exception here would take the app down.
@@ -2730,6 +3306,20 @@ class Tui:
                 frags.append(("class:status.busy",
                               f" {frame} {phase_text} "
                               f"{secs}s (Tap ESC twice to cancel){tok_bit}"))
+                # R253: the side channel was invisible — `_side_busy` was set
+                # and read but never rendered, so a `!`/`/status`/side-turn
+                # running concurrently looked like nothing was happening
+                # while the main spinner talked about something else. Esc-Esc
+                # is deliberately not offered for it: that cancels the TURN.
+                if self._side_busy:
+                    frags.append(("class:status.hint", " │ ⇄ side"))
+            elif self._side_busy:
+                # R254h: the indicator above lives inside the busy branch, so
+                # a side command that OUTLIVES the turn it was started behind
+                # (the normal way a long `!` ends) went invisible the moment
+                # the turn finished — the one state where it is the only work
+                # running and the only thing the bar could be reporting.
+                frags.append(("class:status.busy", " ⇄ side command running"))
             else:
                 # split out of ui._FOOTER_HINT so "/ commands", the bash
                 # toggle, and "? Help" are clickable — same effect as typing
@@ -2846,7 +3436,7 @@ class Tui:
 
         self.app = Application(
             layout=Layout(root, focused_element=self.input),
-            key_bindings=kb, style=style,
+            key_bindings=kb, style=style, output=_low_chatter_output(),
             mouse_support=True, full_screen=True)
         # prompt_toolkit's default ttimeoutlen (0.5s) is how long it waits
         # after a lone Escape to see if more bytes follow (an Alt-sequence,
@@ -2859,6 +3449,14 @@ class Tui:
         # terminal driver's read() as a single burst, so even a near-zero
         # timeout still resolves it correctly in practice.
         self.app.ttimeoutlen = 0.001
+        # R264: ttimeoutlen is only the byte-level wait. The escape-prefixed
+        # bindings above (escape+enter, escape+m, escape+end) make a bare Esc
+        # a key-SEQUENCE prefix, so the KeyProcessor also holds it for
+        # `timeoutlen` (default 1.0s) before firing the plain "escape"
+        # binding — measured: the second tap of the double-Esc gesture fired
+        # 1.003s after the keypress. An Alt+key chord arrives as one burst,
+        # so a short window still completes it.
+        self.app.timeoutlen = 0.05
 
     # ── worker: the session thread (all command/turn code runs here) ─────
     def _worker(self):
@@ -2884,7 +3482,9 @@ class Tui:
         import time
         while True:
             line = self._inbox.get()
-            self._busy, self._busy_since, self._phase = True, time.time(), "working"
+            with self._model_lock:        # R254b — see `_defer_model`
+                self._busy, self._busy_since, self._phase = \
+                    True, time.time(), "working"
             try:
                 if line.startswith("!"):          # local bash, no LLM (R10)
                     cmd = line[1:]
@@ -2933,6 +3533,13 @@ class Tui:
             finally:
                 self._busy, self._phase = False, ""
                 self._esc_armed = None
+                # R252: a cancel belongs to the line it cancelled. Left set,
+                # it makes the next line's very first question answer itself
+                # (see `_await_answer`). `_send_turn` clears it per turn; a
+                # slash command does not, so clear it here where every line
+                # ends.
+                self.fe.cancel_event.clear()
+                self._apply_pending_model()   # R253
                 self.app.invalidate()
         # app.loop only exists once app.run() has started on the UI thread —
         # a '/quit' typed as the very first input can race that startup and
@@ -2941,6 +3548,196 @@ class Tui:
             self.app.loop.call_soon_threadsafe(self.app.exit)
         else:
             self.app.exit()
+
+    def _side_worker(self):
+        """R245/R253: the side channel — everything submitted while the main
+        worker (`_worker`, above) is busy that does NOT need to wait for it.
+        `_route_submitted_line` is the sole producer and owns the decision of
+        what qualifies; this just runs what it's handed, one of four kinds:
+
+        - `bash` — a `!` command (R245, the original).
+        - `cmd`  — a read-only `/command` (`ui.SIDE_SAFE_COMMANDS`).
+        - `model` — `/model`, under the input-line lock, switch deferred.
+        - `ask`  — a prompt, answered by `Engine.quick_ask` (no tools, not
+          added to history).
+
+        This thread marks itself `_prompt_nowait` so any `ask()`/
+        `select_menu()` reached from here REFUSES rather than blocks when
+        the main worker owns the input line — see `_acquire_input_line`.
+
+        The `bash` branch is deliberately a near-duplicate of `_worker`'s own
+        bash-command block rather than a shared helper: `cd`/`clear` are left
+        OUT here on purpose. Both would mutate state (`self._bash_cwd`, the
+        whole scrollback) the main worker reads or writes at the same time
+        with no lock between the two threads — the exact race the
+        single-inbox design existed to avoid in the first place. Anything
+        read-only (`ps`, `tail`, `du`, tailing a download's log) is
+        unaffected and is the actual use case this exists for; `cd`/`clear`
+        typed here get a one-line explanation instead of silently racing or
+        silently doing nothing.
+
+        `self._bash_cwd` is read once, NOT written — same reasoning: a
+        concurrent write from here could land between the main worker's own
+        read and use of it."""
+        self._prompt_nowait.on = True     # R253 — see _acquire_input_line
+        while True:
+            kind, payload = self._side_inbox.get()
+            self._side_busy, self._side_kind = True, kind
+            try:
+                if kind == "bash":
+                    self._side_run_bash(payload)
+                elif kind == "cmd":
+                    self._side_run_command(payload)
+                elif kind == "model":
+                    self._side_pick_model()
+                elif kind == "ask":
+                    # R254a: the routing decision was made on the UI thread
+                    # when `_busy` was True; by the time it reaches here the
+                    # turn may have ended — and the wait can be long, because
+                    # this thread also drains `!` commands ahead of it. Left
+                    # as-is, a real task typed at the end of a turn is
+                    # silently answered by a toolless side turn and never
+                    # enters the conversation at all. Re-validate where it is
+                    # acted on, and hand it back to the main worker when
+                    # there is no longer anything to work around.
+                    if self._busy:
+                        self._side_quick_ask(payload)
+                    else:
+                        self._inbox.put(payload)
+            except InputLineBusy as e:    # R253 — refuse, with the reason
+                print(dim(f"(not now — {e}. Try again once it finishes.)"))
+            except BaseException as e:   # never kill the side worker
+                print(f"\n{RED}✗ {e.__class__.__name__}: {e}{RESET}")
+            finally:
+                self._side_busy, self._side_kind = False, ""
+                try:
+                    self.app.invalidate()
+                except Exception:
+                    pass
+
+    def _apply_pending_model(self) -> None:
+        """R253: land a model picked mid-turn (`_side_pick_model`), now that
+        the turn owning the provider/model has ended. Runs on the worker
+        thread in `_worker`'s `finally`, so the switch happens where every
+        other `engine` write happens — the side channel only ever parked the
+        payload, it never wrote the engine itself."""
+        with self._model_lock:            # R254b — see `_defer_model`
+            payload, self._pending_model = self._pending_model, None
+        if payload is None:
+            return
+        self.engine.switch_model(payload)
+        print(f"{GREEN}→ {payload.get('model')}{RESET}")
+
+    def _side_run_bash(self, cmd: str) -> None:
+        """R245's original side-channel body — see `_side_worker`'s docstring
+        for why `cd`/`clear` are refused here rather than run."""
+        if (self._bash_cd_target(cmd) is not None
+                or cmd.strip() in ("clear", "cls")):
+            print(dim("(cd/clear not available on the side channel "
+                      "— wait for the current command to finish, "
+                      "or run it there instead)"))
+            return
+        from . import tools as _tools
+        out, code = _tools._run_command_once(cmd, self._bash_cwd)
+        if code is None:
+            out = (out + "\n" if out else "") + \
+                f"[timeout after {_tools.COMMAND_TIMEOUT}s]"
+        if out.strip():
+            self.append_bash_output(out)
+        else:
+            print(dim("(no output)"))
+
+    def _side_run_command(self, line: str) -> None:
+        """R253: a read-only `/command`, run concurrently with the turn.
+
+        Same `ui._handle_command` the main worker calls — the safety is in
+        WHICH commands reach here (`ui.SIDE_SAFE_COMMANDS`), not in a
+        different, weaker implementation of them. Its exit return value is
+        ignored on purpose: `/quit` and `/exit` are not side-safe, so the
+        only thing that could end the session still ends it from `_worker`.
+        """
+        ui._handle_command(self.engine, self.fe, line)
+
+    def _side_pick_model(self) -> None:
+        """R253: `/model` while a turn is running.
+
+        Two things have to be true at once, which is why this isn't just
+        another entry in SIDE_SAFE_COMMANDS. The picker NEEDS the input line
+        (it is a menu, and may go on to prompt for a missing API key), so it
+        takes the lock for the whole command — and refuses, with a reason,
+        if the running turn is at an approval gate holding it. And the
+        switch itself must NOT land now: `Engine.send` already picked its
+        provider and model for the turn in flight, so switching mid-turn
+        would either do nothing visible or change the model under the next
+        round of a tool loop. The pick is parked in `_pending_model` and
+        applied by `_worker` when the turn ends."""
+        self._acquire_input_line()
+        try:
+            ui._pick_model(self.engine, self.fe, on_pick=self._defer_model)
+        finally:
+            self._prompt_lock.release()
+
+    def _defer_model(self, payload: dict) -> None:
+        """R253: park a picked model until the running turn ends (see
+        `_side_pick_model`). If the turn happens to have finished while the
+        picker was open, there is nothing to defer — switch now, so the
+        deferral never becomes a switch that silently didn't happen.
+
+        R254b: that last sentence was the intent and the code contradicted
+        it. "Read `_busy`, then park" is a check-then-act against
+        `_apply_pending_model`'s "take, then clear" on the worker thread, and
+        a park landing in between is simply lost. Both halves now run under
+        `_model_lock`, so the turn either ends before this decides (and this
+        switches immediately) or after it parks (and the `finally` finds the
+        payload) — never between."""
+        with self._model_lock:
+            if self._busy:
+                self._pending_model = payload
+                print(dim(f"· will switch to {payload.get('model')} when the "
+                          "current turn finishes"))
+                return
+            # switched INSIDE the lock, not after it: `_worker` claims
+            # `_busy` under the same lock, so a turn cannot start in the
+            # gap and read half of this switch out of `engine.current`.
+            self.engine.switch_model(payload)
+        print(f"{GREEN}→ {payload.get('model')}{RESET}")
+
+    def _side_quick_ask(self, text: str) -> None:
+        """R253: answer a prompt typed mid-turn, without joining the turn.
+
+        `Engine.quick_ask` is one provider call with no tools on a snapshot
+        of history — see its docstring for why a second REAL turn is not an
+        option (ARCHITECTURE §6: `engine.messages` has exactly one writer).
+
+        Labelled in the chat before the answer streams, because the
+        difference is not cosmetic: this reply is not in the conversation,
+        so the model will not remember it next turn, and it could not have
+        run a tool to check anything it claims.
+
+        Not rendered through `fe.on_text`: that one is the running turn's
+        renderer — it closes the live think block and moves the phase to
+        "generating" — so using it here would make a side answer reach in and
+        end the main turn's thinking row.
+
+        R254c/d: nor through `append()`, which was the first fix and only
+        moved the same two problems one level down (it merges concurrent
+        streams into one entry, and closes the think row itself). The answer
+        is COLLECTED while it streams and appended once, as its own entry
+        kind — see `append_side`. The cost is that a side answer lands whole
+        instead of token by token; it is a short answer, and a shredded one
+        rendered live is worse than a correct one rendered a beat later."""
+        self.append_side(dim("  ⤷ side-turn (no tools, not saved to history)"))
+        chunks: list[str] = []
+        self._side_cancel.clear()      # R254i — belongs to THIS question
+        text_out = self.engine.quick_ask(text, chunks.append,
+                                         cancel=self._side_cancel.is_set)
+        # `quick_ask` returns the assembled text; the collected chunks are the
+        # fallback for a provider that streams but reports no final text
+        body = text_out if text_out.strip() else "".join(chunks)
+        if body.strip():
+            self.append_side(body.rstrip("\n") + "\n")
+        else:
+            self.append_side(dim("(no answer)") + "\n")
 
     def _banner(self):
         import os
@@ -2980,6 +3777,7 @@ class Tui:
         # app.run() below owns THIS thread as the UI event loop
         self._ui_thread = threading.current_thread()
         t.start()
+        threading.Thread(target=self._side_worker, daemon=True).start()  # R245
 
         def _ticker():   # animates the spinner / elapsed seconds while busy
             import time
@@ -3007,21 +3805,8 @@ class Tui:
                 try:
                     log_path = aurora_home() / "tui_crash.log"
                     log_path.parent.mkdir(parents=True, exist_ok=True)
-                    # R171/I9: this is an accident log (crash tracebacks),
-                    # not a record Aurora's "keep everything forever" policy
-                    # (R20) was ever meant to cover — that's the session
-                    # JSONL's job, by design. With no cap it grows without
-                    # bound on a machine that crashes often. Truncate to the
-                    # last 1MB before appending, same "keep the recent tail"
-                    # shape as the session compaction/scrollback caps use
-                    # elsewhere.
-                    _CRASH_LOG_CAP = 1_000_000
-                    try:
-                        if log_path.stat().st_size > _CRASH_LOG_CAP:
-                            data = log_path.read_bytes()[-_CRASH_LOG_CAP:]
-                            log_path.write_bytes(data)
-                    except OSError:
-                        pass
+                    # keep the recent tail only — see _truncate_crash_log
+                    _truncate_crash_log(log_path)
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write(f"\n--- {datetime.datetime.now().isoformat()} ---\n")
                         msg = context.get("message", "")

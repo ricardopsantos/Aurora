@@ -218,6 +218,15 @@ def main() -> None:
     for warning in engine.extension_warnings:
         print(f"· {warning}")
     if resume_id:
+        # R248: a typo'd id used to print "resuming session <id> (0 turns)"
+        # and then run in a BRAND-NEW session — `resume_from` only adopts the
+        # past session when it restored something, so the log the user thinks
+        # they are continuing is never opened and the turns they then type
+        # land somewhere else. `/context` has refused an unknown id since
+        # R134; the CLI flag that does the same lookup never did.
+        if not sessions.Session(resume_id).log_path.exists():
+            sys.exit(f"no session {resume_id} on this machine "
+                     "(run aurora and use /resume to list them)")
         n = engine.resume_from(resume_id)
         print(f"· resuming session {resume_id} ({n} turns)")
     elif resume:

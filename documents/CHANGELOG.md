@@ -8,6 +8,61 @@ release was published — check `aurora --man` or `python3 -c "import aurora;
 print(aurora.__version__)"` for what you're actually running. For the full
 numbered requirements record, see `CHANGELOG_TECHNICAL.md` (formerly
 `AURORA.md`).
+
+## 1.2.57 (2026-09-29)
+
+A big polish-and-safety release: a full audit of the largest files, a
+responsiveness pass on the terminal UI, and a tightening of what Aurora
+will do without asking you.
+
+### Added
+- **`/sessions`** lists past session ids, and **`/export [id]`** exports any
+  past session by id or prefix — no `/resume` needed first.
+- **`/auto-approve on|off`** skips the approval prompt when you want a fully
+  hands-off run.
+- **Plain-Markdown `SKILL.md` doc skills** can now be run by Aurora.
+- **`/model` warns you** when the entry you picked will fail (dead
+  endpoint, missing key) instead of letting you find out on the next turn.
+- **You can type while a turn is running** — your draft no longer has to
+  wait for the reply to finish.
+
+### Changed
+- **The UI is much snappier.** Bare Esc fires in 50ms instead of ~1s, chat
+  frames render from a line cache (63ms → 7.6ms at 10,000 lines), and the
+  input box stops growing at 8 rows.
+- **Safer approvals.** "Always allow" no longer extends to risky forms such
+  as `sed -i`, `git -c`, `tar`, `rsync` or `uv run`; the prompt now shows
+  the working directory and background flag; control and bidirectional
+  characters are shown literally so nothing can be hidden in a command.
+- **Safer web access.** `web_fetch` asks before contacting private hosts or
+  sending query strings, re-checks every redirect hop, and refuses hosts
+  that change address between approval and fetch.
+- **Trust before bootstrap.** A project's bootstrap prompt only runs after
+  you trust that exact content.
+- **Checkpoints are cheaper and more careful**: files over 50MB and `$HOME`
+  are never snapshotted, and nested repos are no longer wrongly claimed.
+- Dead endpoints are backed off for 120s rather than re-probed every round;
+  an oversized resumed history is folded before the first request.
+- `pip install` no longer ships a stale, months-old copy of the app.
+
+### Fixed
+- Edits keep CRLF line endings; `edit_file` refuses an empty search string;
+  `apply_patch` anchors on whole lines only.
+- `/copy-last` copied one reply out of a multi-round turn; choosing
+  "explain" at the approval prompt threw the explanation away.
+- Stray characters leaking into the input after mouse movement; Esc now
+  cancels an accidental "Quit Aurora?" menu and a running command.
+- `/commit` secret-scans the diff it sends and no longer breaks on
+  non-UTF-8 files; secret scanning also detects OpenRouter keys.
+- Background jobs are pruned once finished; `find_files` honours cancel
+  and has a deadline; rotated session files no longer show as phantom
+  sessions; a sleeping local server shows "asleep" instead of a schema
+  alarm.
+- Malformed tool arguments and a secret-stopped write no longer leave the
+  conversation history in a state that breaks the next request.
+- A mistyped key-store passphrase and MCP tool-name collisions are handled
+  cleanly.
+
 ## 1.2.42 (2026-08-26)
 
 A hardening release — two review passes went through the codebase looking

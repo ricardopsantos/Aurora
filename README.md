@@ -134,7 +134,7 @@ writeup: **[documents/ARCHITECTURE.md](documents/ARCHITECTURE.md)**.
 Everything below `README.md` lives in **[documents/](documents/)**:
 
 - **[CHANGELOG_TECHNICAL.md](documents/CHANGELOG_TECHNICAL.md)** — the
-  canonical spec: every numbered requirement (R1+, currently through R243),
+  canonical spec: every numbered requirement (R1+, currently through R306),
   build plan and test plan, written before the code and kept in sync with
   behaviour. When any doc disagrees with it, this one wins. (Formerly
   `AURORA.md`.)

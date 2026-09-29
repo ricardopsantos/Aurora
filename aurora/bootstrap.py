@@ -13,6 +13,8 @@ Engine-side module: no terminal I/O beyond the URL fetch itself; no UI
 imports.
 """
 
+import hashlib
+import json
 from pathlib import Path
 
 import httpx
@@ -187,3 +189,41 @@ def clear(project: bool = False, cwd: str | Path = ".") -> Path | None:
         p.unlink()
         return p
     return None
+
+
+# R286: a PROJECT bootstrap prompt ships with whatever repo is in cwd — a
+# clone of someone else's repo included — and runs as a tool-enabled first
+# turn. It is trusted per machine, per exact content: path → SHA-256 in
+# AURORA_HOME. The global prompt is the user's own and needs no record.
+def _trust_file() -> Path:
+    return aurora_home() / "trusted_bootstraps.json"
+
+
+def _load_trust() -> dict:
+    try:
+        data = json.loads(_trust_file().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def needs_trust(cwd: str | Path = ".") -> bool:
+    """True when the ACTIVE prompt is a project one whose current content
+    has never been approved on this machine."""
+    active = _active_source(cwd)
+    if active is None or active[1] != "project":
+        return False
+    p = active[0]
+    digest = hashlib.sha256(p.read_bytes()).hexdigest()
+    return _load_trust().get(str(p)) != digest
+
+
+def trust(cwd: str | Path = ".") -> None:
+    """Record the active project prompt's current content as approved."""
+    active = _active_source(cwd)
+    if active is None or active[1] != "project":
+        return
+    p = active[0]
+    data = _load_trust()
+    data[str(p)] = hashlib.sha256(p.read_bytes()).hexdigest()
+    write_text_atomic(_trust_file(), json.dumps(data, indent=1) + "\n")

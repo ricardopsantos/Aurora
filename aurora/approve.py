@@ -118,7 +118,28 @@ DANGEROUS_COMMANDS = frozenset({
     # payload and must never be the free-to-vary half of a two-token rule
     "pip", "pip3", "npm", "npx", "yarn", "pnpm", "gem", "cargo", "make",
     "apt", "apt-get", "brew",
+    # R277: more commands whose two-token rule leaves the PAYLOAD free.
+    # Verified before the fix: `sed -i s/a/b/ f` stored `sed -i` and then
+    # auto-approved `sed -i '1e rm -rf ~' ~/.bashrc` (GNU sed's `e` runs a
+    # command); `tar -xf a.tar` → `tar -xf evil.tar -C /`; `rsync -a src/
+    # dst/` → `rsync -a --delete / x`; `uv run app.py` → `uv run evil.py`.
+    # Editors/stream processors that execute or overwrite:
+    "sed", "awk", "gawk", "mawk", "ex", "vim", "vi", "ed",
+    # archivers/copiers whose destination is an argument
+    "tar", "unzip", "rsync", "scp", "sftp", "ssh",
+    # runners that execute whatever file/package the next arg names
+    "uv", "uvx", "pipx", "poetry", "pdm", "hatch", "conda", "go", "deno",
+    "bun", "php", "lua", "java", "Rscript", "xargs", "env",
+    "nohup", "timeout", "nice", "watch", "crontab", "at",
+    # process killers: the target pid/name is the payload
+    "kill", "pkill", "killall",
 })
+
+# R277: `git` itself is safe to generalize (`git status`, `git log …`) —
+# except with a global option that injects configuration or an exec path:
+# `git -c core.sshCommand=… fetch`, `git -c alias.x='!cmd' x`. A stored
+# `git -c` rule used to auto-approve any of those.
+_GIT_EXEC_OPTIONS = ("-c", "--config-env", "--exec-path")
 
 # families whose real binary name carries a suffix: mkfs.ext4, newfs_hfs
 _DANGEROUS_PREFIXES = ("mkfs.", "newfs_")
@@ -172,6 +193,12 @@ _UNSAFE_FLAGS = {
         "-delete", "-exec", "-execdir", "-ok", "-okdir",
         "-fprint", "-fprint0", "-fprintf", "-fls",
     }),
+    # R298: `tree -o FILE` / `--output=FILE` truncates and writes FILE, and
+    # `file -C` compiles a magic file (writes NAME.mgc). Both were in
+    # SAFE_COMMANDS, so "always allow tree" auto-approved overwriting
+    # ~/.bashrc. An entry ending in "=" also matches its `--flag=value` form.
+    "tree": frozenset({"-o", "--output", "--output="}),
+    "file": frozenset({"-C", "--compile"}),
 }
 
 # R141: shell syntax that turns one command string into several, or into a
@@ -219,8 +246,13 @@ def _is_dangerous(toks: tuple) -> bool:
     # flags (`find … -delete`). Both halves must be present, so a bare
     # `-delete` token belonging to some other command doesn't trip this.
     for cmd, flags in _UNSAFE_FLAGS.items():
-        if cmd in names and not flags.isdisjoint(toks):
+        if cmd in names and any(
+                t in flags or any(f.endswith("=") and t.startswith(f) for f in flags)
+                for t in toks):
             return True
+    if "git" in names and any(t == o or t.startswith(o + "=")
+                              for t in toks for o in _GIT_EXEC_OPTIONS):
+        return True
     return False
 
 
@@ -381,10 +413,25 @@ def _resolved_rule(rule: str) -> str:
 _COMMAND_TOOLS = ("run_command", "wait_until")
 
 
+# R283: tools whose allowlist identity is a URL, matched per origin.
+_URL_TOOLS = ("web_fetch",)
+
+
+def _url_origin_rule(url: str) -> str:
+    """`https://host:port/*` — "always allow" for a fetch covers that origin,
+    never the whole web (a bare `*` would re-open the exfil path R283
+    gates)."""
+    from urllib.parse import urlsplit
+    u = urlsplit(url.strip())
+    return f"{u.scheme}://{u.netloc}/*" if u.scheme and u.netloc else ""
+
+
 def _signature(tool: str, args: dict) -> str:
     """The value matched against the allowlist: command prefix or file path."""
     if tool in _COMMAND_TOOLS:
         return args.get("command", "")
+    if tool in _URL_TOOLS:
+        return str(args.get("url", "")).strip()
     return _norm_path(args.get("path", ""))
 
 
@@ -444,6 +491,12 @@ def _matches(tool: str, args: dict, data: dict, strict: bool = False) -> bool:
                     and (not strict or rule[0] in SAFE_COMMANDS)):
                 return True
         return False
+    if tool in _URL_TOOLS:                                    # R283
+        # an origin rule `scheme://netloc/*` — compared on the ORIGIN, since
+        # fnmatch's `*` would otherwise let `https://a.com/*` match
+        # `https://a.com.evil.net/…`
+        origin = _url_origin_rule(sig)
+        return bool(origin) and any(g == origin for g in data.get(tool, []))
     # rules are normalized on both sides, so a rule stored before R95g (raw
     # `~/x.py`) still matches a normalized signature.
     #
@@ -465,11 +518,44 @@ def _matches(tool: str, args: dict, data: dict, strict: bool = False) -> bool:
 
 
 def is_allowed(tool: str, args: dict, data: dict | None = None) -> bool:
+    # R299: wait_until runs a SECOND shell command, `then`, that no rule ever
+    # saw — the signature is `command` only — so one "always allow" on a
+    # polling command (8 such rules live) auto-ran ANY follow-up. A call
+    # carrying `then` is never auto-approved; it always prompts.
+    if tool == "wait_until" and str(args.get("then") or "").strip():
+        return False
+    # R303: rules ignore `cwd`, so an exact `rm -rf ./build` or a `git reset`
+    # prefix followed the model into ANY directory. A command aimed outside
+    # the working directory always prompts (the prompt now shows `in:`).
+    if tool in _COMMAND_TOOLS and _foreign_cwd(args.get("cwd")):
+        return False
     return _matches(tool, args, data if data is not None else load(),
                     strict=True)
 
 
+def _foreign_cwd(cwd) -> bool:
+    if not cwd or not str(cwd).strip():
+        return False
+    try:
+        here = Path.cwd().resolve()
+        there = Path(os.path.expanduser(str(cwd))).resolve()
+    except OSError:
+        return True
+    return there != here and here not in there.parents
+
+
 def is_denied(tool: str, args: dict, data: dict | None = None) -> bool:
+    data = data if data is not None else load_deny()
+    # R299: `then` is a command in its own right — a deny rule that matches
+    # it as a run_command (or as a wait_until command) refuses the call.
+    then = str((args or {}).get("then") or "").strip() if tool == "wait_until" else ""
+    if then and data and (_matches("run_command", {"command": then}, data)
+                 or _matches("wait_until", {"command": then}, data)):
+        return True
+    return _is_denied_inner(tool, args, data)
+
+
+def _is_denied_inner(tool: str, args: dict, data: dict | None = None) -> bool:
     """R120: a matching denylist rule skips the approval prompt entirely and
     auto-refuses — no question asked. Checked before the allowlist by the
     caller (agent.py); an empty/missing denylist.yaml (the common case)
@@ -530,6 +616,8 @@ def _rule_for(tool: str, args: dict) -> str:
         # in a different project/session instead of re-prompting per path
         return toks[0] if toks and toks[0] in SAFE_COMMANDS \
             else shlex.join(toks[:2])
+    if tool in _URL_TOOLS:                                    # R283
+        return _url_origin_rule(str(args.get("url", "")))
     return _norm_path(args.get("path", "")) or "*"
 
 

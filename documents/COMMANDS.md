@@ -29,7 +29,8 @@ Full command reference behind the [README](../README.md)'s quick-start list.
 | `/compact` · `/clear` | summarize-and-continue · start fresh |
 | `/reset` | full reset: clear history + system prompt, then offer to re-run `/bootstrap` |
 | `/copy [N]` | copy Nth-last response to clipboard, SSH-safe (OSC52) |
-| `/copy-last` | copy last turn's RAW record — prompt, thinking, and response — to clipboard, SSH-safe — also `copy last` in the status bar's `copy` picker |
+| `/copy-last` | copy the last turn IN FULL — prompt, thinking, and every reply in order with a marker per tool call (tool output excluded) — to clipboard, SSH-safe — also `copy last (full)` in the status bar's `copy` picker |
+| `/copy-response` | copy just the model's final reply from the last turn — no prompt, no thinking, no tool markers; skips a trailing tool-call-only message — also `copy last (response)` in the `copy` picker |
 | `/copy-all` | copy the whole session transcript (questions + answers, no thinking) to clipboard, SSH-safe — also `copy whole session transcript` in the status bar's `copy` picker |
 | `/rewind [id]` | list checkpoints taken before every approved write/edit/command and restore one — restoring is itself checkpointed, so it can be undone |
 | `/undo` | revert just the LAST mutation rather than the whole tree (`/rewind`'s narrower sibling). Always previews the diff and NAMES the affected paths before asking, so "that's not the file I meant" is catchable before confirming, not after |
@@ -38,7 +39,7 @@ Full command reference behind the [README](../README.md)'s quick-start list.
 | `/nano <file>` | open a text file in the built-in editor — `.txt`/`.md`/`.json`/`.yml`/`.yaml`/`.xml`/`.sh`, up to 1MB. TUI only |
 | `/allowlist` | review the persistent approval allowlist |
 | `/denylist` | review tool calls always denied by policy (set via the approval prompt's "Always DENY") — never asked again, no allowlist bypass |
-| `/resume` · `/export` | pick a past session · dump conversation as markdown |
+| `/resume` · `/export [id]` | pick a past session · dump the current session as markdown, or a past one directly by id/prefix (no `/resume` needed) |
 | `/search <text>` | case-insensitive search over every session log on this machine (not just the current one) — one hit per session, newest first; pick a number to `/resume` it |
 | `/skills` · `/name args` | list / run skills (from `skills/` or `AURORA_HOME/skills/`) |
 | `/extensions` | list loaded extension tools (bundled + your own `AURORA_HOME/extensions/`), plus how to add one — also shown as a count in the startup banner |

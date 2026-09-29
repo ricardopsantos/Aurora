@@ -42,7 +42,11 @@ SESSION_LOG_MAX_BYTES = 5 * 1024 * 1024
 # A rotated part's name: "<id>.<n>.jsonl", n >= 2 (the base "<id>.jsonl" IS
 # part 1, unnumbered — renaming it on first rotation would break every path
 # already holding it open, resume, and every existing on-disk reference).
-_ROTATED_RE = re.compile(r"^(.+)\.([2-9][0-9]*)\.jsonl$")
+# R276: was `[2-9][0-9]*`, which requires the FIRST digit to be 2-9 — so
+# parts 10-19, 100-199, … didn't match, and `<id>.10.jsonl` read as a
+# separate base session `<id>.10` (a phantom in /sessions, double-counted by
+# /cost). Any integer ≥ 2 without a leading zero.
+_ROTATED_RE = re.compile(r"^(.+)\.([2-9]|[1-9][0-9]+)\.jsonl$")
 
 
 def _parts_for(session_id: str) -> list[Path]:
@@ -322,6 +326,30 @@ def search_sessions(query: str, limit: int = 20) -> list[tuple[str, str, str, st
                     found = True
                     break   # one hit per session is enough for a search list
     return out
+
+
+def resolve_session_id(prefix: str) -> str:
+    """Resolve a full or partial (hex-prefix) session id to an exact one, for
+    `/export <id>` (feature request: export a past session without first
+    `/resume`-ing it, since ids are random hex with no visible order — a
+    prefix like `0c46` should be enough).
+
+    An exact match always wins, even if it also happens to prefix a
+    different id (ids are random, but not collision-proof against a
+    deliberately short prefix). Otherwise: exactly one prefix match resolves
+    silently; zero matches or more than one both raise, so the caller can
+    show the same message shape either way instead of silently guessing."""
+    ids = _base_session_ids()
+    if prefix in ids:
+        return prefix
+    matches = sorted(i for i in ids if i.startswith(prefix))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(f"no session matching '{prefix}'")
+    raise ValueError(
+        f"'{prefix}' matches {len(matches)} sessions — be more specific: "
+        + ", ".join(matches))
 
 
 def export_markdown(session_id: str) -> str:

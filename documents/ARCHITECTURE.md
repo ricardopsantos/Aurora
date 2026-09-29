@@ -2,7 +2,7 @@
 
 Reference doc for how the pieces fit together. `CHANGELOG_TECHNICAL.md`
 (formerly `AURORA.md`) is the numbered requirements/spec (the *what* and
-*why*, R1–R243+); this is the *how* — module
+*why*, R1–R306+); this is the *how* — module
 map, data flow, boundaries, and the mechanisms worth understanding before
 touching them. Update this file whenever a change alters one of these shapes,
 not just when adding a requirement.
@@ -266,7 +266,14 @@ area matching a new feature's role:
 1. **Chat/scrollback** (`_ChatControl` in a `Window`) — the only area that
    scrolls; wheel/PgUp/drag-select live here. Fragment-cached per entry
    (`_cache`) since a long session appends thousands of chunks and re-parsing
-   the whole ANSI stream on every keystroke would be O(n²). **Capped at
+   the whole ANSI stream on every keystroke would be O(n²). **Rendered from
+   an incremental LINE cache (R289)**: `_ChatControl` overrides
+   `create_content` and serves `Tui._render_lines()` through a lazy
+   `UIContent.get_line`, so a frame reads only the rows the Window asks for
+   (the visible ones). The stock `FormattedTextControl` re-split and hashed
+   the whole transcript ~2.6× per frame (63ms at 9.6k lines; 7.6ms after).
+   `_rebuild_locked` records the first line a truncation/append can touch
+   (`_split_line`); only lines from there are re-split. **Capped at
    `_SCROLLBACK_MAX_LINES` (R152)**: Aurora's own flatten is flat in session
    length (R96b), but the fragment list goes whole to prompt_toolkit's
    `create_content`, which is linear and runs before its own cache — so the
@@ -325,6 +332,7 @@ Any future float/control built on a library class needs the same scrutiny.
 | `AURORA_HOME/sessions/<id>.jsonl` | per-machine | every turn/tool/approval, append-only. Past `session.SESSION_LOG_MAX_BYTES` (5MB) a session CONTINUES in `<id>.2.jsonl`, `<id>.3.jsonl`, … — one session id maps to a *sequence* of parts, oldest first, and every reader in `session.py` walks that sequence via `_parts_for()`. Nothing is ever deleted; only which file a record lands in changes | `Session.log()` |
 | `AURORA_HOME/keys.enc` + `keys.salt` | per-machine | the opt-in Fernet-encrypted key store and its PBKDF2 salt — see the keyring note at the end of this section | `keystore._encfile_save()` via `paths.write_bytes_atomic` (mode `0600`) |
 | `AURORA_HOME/bootstrap.md` | per-machine | the saved global bootstrap prompt; a project's `.aurora/bootstrap.md` overrides it | `/bootstrap set` |
+| `AURORA_HOME/trusted_bootstraps.json` | per-machine | R286: project bootstrap prompts approved to run, as path → SHA-256 of the approved content (an edit asks again) | `bootstrap.trust()` |
 | `AURORA_HOME/checkpoints/<hash>/` | per-machine | shadow git repo, pre-mutation snapshots (R47), capped at `rewind.RETENTION` (R151) | `rewind.checkpoint()` |
 
 **Every one of these files is written atomically** — `paths.write_text_atomic`
@@ -404,6 +412,38 @@ from an ad-hoc verification run that mocked only one of the two).
   This is where `Engine.send()` and the whole agent loop execute — it's fine
   for this thread to block on network I/O or on `ask()`/`select_menu()`
   (those route back to the UI thread via a `queue.Queue`).
+- **Side worker thread** (`Tui._side_worker`, R245/R253): the second consumer,
+  fed only by `_route_submitted_line` and only while the main worker is busy.
+  It runs the things that must not wait for a turn — a `!` bash command, a
+  read-only `/command`, `/model`, or a prompt answered as a quick-ask. What
+  may reach it is defined by what it must NOT do: nothing here writes
+  `engine.messages` or the session, so the single-writer property below is
+  unchanged. `Engine.quick_ask` is the shape that makes a mid-turn question
+  possible without one — it reads a *snapshot* of history and writes nothing
+  back, rather than becoming a second turn. Note what else is per-turn shared
+  state once a second thread exists: a **provider** carries `on_think`,
+  `extra_body`, `cache_prompt` and `notify`, all assigned by `send()` for the
+  turn in flight, and `fe.on_text` is that turn's renderer. So a side turn
+  builds its own provider (`_side_provider`, cached per provider like the
+  turn's) and renders through neither. The rule generalizes: **anything a
+  turn configures by assignment, or infers from its own output, is not safe
+  to borrow from the side channel** — R254 found four separate instances of
+  it (the provider's per-turn callbacks, the frontend renderer, `append()`'s
+  merge-into-the-previous-entry, and `append()` closing the think row on the
+  reasoning that output means this request stopped thinking). R255 then found
+  three more on a path with **no second thread at all** — the one-off side
+  completions (the approval gate's `explain`, the commit draft, the compact
+  summarizer) each borrowed `provider.on_think`, which `send()` assigns per
+  turn, so their reasoning landed in the running turn's think row. Same
+  thread is not the same as same context: the rule is about what the turn
+  *owns*, not about concurrency. `providers.base.side_completion` is the one
+  correct implementation of that shape.
+
+  The same applies to gates, in the other direction: the side path must pass
+  everything the main path passes. R58's secret scan was skipped there and
+  leaked a token to the provider and to the session log (R254g); it now
+  refuses, because the challenge is interactive and this path may not own
+  the input line.
 - **No per-turn wrapper thread in the TUI (R96f).** `ui._run_turn` wraps a
   turn in its own thread so the MAIN thread can catch `KeyboardInterrupt`
   while `input()` blocks — that only makes sense in the classic REPL, where
@@ -448,6 +488,19 @@ one synchronization primitive between the two threads for interactive
 prompts — session/message state itself is only ever touched by the worker
 thread, so it doesn't need its own lock.
 
+The *input line* does need one (R253). `ask()`/`select_menu()` write single
+slots (`_question`, `_menu_prompt`/`_menu_options`, `_saved_draft`) and block
+on that one `_answers` queue, so once a second thread could prompt, two
+prompts could overwrite each other and neither would ever be answered — the
+shape R142a already survived once with the Esc-Esc confirm. `_prompt_lock`
+(an `RLock`: one command legitimately prompts more than once) is held for the
+whole duration of a prompting command. The main worker blocks for it, because
+whoever holds it is something a human is looking at; the side worker marks
+its thread `_prompt_nowait` and takes an `InputLineBusy` refusal instead,
+since parking there would defeat a channel that exists so a question never
+waits. Note the asymmetry is the design: the lock protects the *terminal's*
+one input line, not engine state, which still has exactly one writer.
+
 ## 7. Secret redaction (R58) — a case study in "engine decides, frontend renders"
 
 Added 2026-07-12; a good template for the next similar feature, since it
@@ -484,6 +537,15 @@ touches all the layers above:
   pre-execution scan (a `write_file`'s content isn't checked until its
   eventual `read_file` output is, through the normal hook above) — this is
   specifically about what's about to be handed to a shell.
+- **A FOURTH hook, `/commit`'s draft (R284)**: the staged diff is new
+  content off disk sent to the provider, so `ui._commit_cmd` scans exactly
+  what `draft_message` would send and runs the same challenge (stop = draft
+  nothing, redact = send the redacted diff).
+- **The approval surface renders control characters literally (R287)**:
+  `colors.visible()` turns every C0/C1 control, DEL and bidi/zero-width
+  character into a visible `\x1b`/`\u202e` escape in everything the gate
+  prints — SGR is otherwise kept for colour, and SGR 8 (conceal) could hide
+  the tail of a command being approved.
 - **The toggle is a capability, not a runtime branch inside `agent.py`**:
   `Engine` only ever passes `AgentCallbacks.secret_challenge=fe.secret_challenge`
   when `self.redact_secrets` is true; otherwise it passes `None`, and the
@@ -568,6 +630,15 @@ revised same-day) before being brought in line with the other two, for one
 reason — an explicit picked choice, not an implicit "you pressed Esc twice,
 that counts."
 
+**A bare Esc must fire promptly (R264).** The escape-prefixed Alt bindings
+(`escape+enter`, `escape+m`, `escape+end`) make a lone Esc a key-SEQUENCE
+prefix, which prompt_toolkit holds for `Application.timeoutlen` (1.0s by
+default) — not just `ttimeoutlen`, the byte-level wait. Both are lowered
+(`ttimeoutlen=0.001`, `timeoutlen=0.05`); an Alt chord arrives from the
+terminal as one burst, so it still completes. Adding another
+`escape`-prefixed binding is fine; raising `timeoutlen` brings the 1s lag
+back on every Esc tap.
+
 **The 2-second window is a real timer, not "immediately after"**: tracked as
 `(self._esc_armed: str | None, self._esc_armed_at: float)` — the KIND of
 pending action plus when it armed. A second Esc past the window, or while a
@@ -578,7 +649,7 @@ not Esc) and a stale arm must never silently fire on an unrelated later Esc.
 
 ## Where to look next
 
-- **Requirements** (R1–R243+, the numbered spec with dates and rationale):
+- **Requirements** (R1–R306+, the numbered spec with dates and rationale):
   `CHANGELOG_TECHNICAL.md`.
 - **User-facing feature list**: `README.md` → "Daily use" and "Esc, the
   double-tap control key".

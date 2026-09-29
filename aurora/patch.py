@@ -146,7 +146,8 @@ def apply(text: str, hunks: list[Hunk]) -> str:
         if not h.changed:
             continue   # a hunk with no real change (every line was
             # context) — nothing to do, not an error
-        n = text.count(h.old)
+        hits = _line_anchored(text, h.old)
+        n = len(hits)
         if n == 0:
             raise PatchError(
                 f"hunk {h.header!r}: context not found — the file may have "
@@ -156,5 +157,21 @@ def apply(text: str, hunks: list[Hunk]) -> str:
             raise PatchError(
                 f"hunk {h.header!r}: context matches {n} times — add more "
                 f"surrounding lines to make it unique")
-        text = text.replace(h.old, h.new, 1)
+        i = hits[0]
+        text = text[:i] + h.new + text[i + len(h.old):]
     return text
+
+
+def _line_anchored(text: str, old: str) -> list[int]:
+    """R281: offsets where `old` matches as WHOLE lines — starting at the
+    beginning of a line and ending at the end of one. A plain substring
+    count let a hunk anchor inside an unrelated line: `-count = 5` edited
+    `total_count = 5`, and reported success."""
+    out, i = [], text.find(old)
+    while i != -1:
+        end = i + len(old)
+        if (i == 0 or text[i - 1] == "\n") and \
+                (end == len(text) or text[end] == "\n"):
+            out.append(i)
+        i = text.find(old, i + 1)
+    return out

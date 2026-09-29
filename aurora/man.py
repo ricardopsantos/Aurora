@@ -13,11 +13,12 @@ from .colors import BOLD, CYAN, DIM, GREEN, RESET, YELLOW
 # Display order for the manual's COMMANDS section. `/cmd help` doesn't need
 # this (it looks up one key directly) — this only controls the full page.
 COMMAND_ORDER = [
-    "model", "compact", "clear", "reset", "copy", "copy-last", "copy-all",
+    "model", "compact", "clear", "reset", "copy", "copy-last", "copy-response",
+    "copy-all",
     "redact", "status", "cost", "context", "cache", "autocompact",
-    "fallback", "thinking", "markdown", "multiline", "allowlist",
+    "fallback", "auto-approve", "thinking", "markdown", "multiline", "allowlist",
     "denylist", "rewind", "undo", "diff", "commit", "resume", "search",
-    "export", "skills", "extensions", "bootstrap",
+    "sessions", "export", "skills", "extensions", "bootstrap",
     "nano", "help", "quit", "exit",
 ]
 
@@ -75,14 +76,29 @@ def _entries(B, C, D, G, Y, R):
     clipboard (default: the last one). Uses OSC52, so it works over SSH
     with no local clipboard access needed on the remote end. Copies the
     final answer only — no thinking, no tool output; see {C}/copy-last{R}
-    for the raw record including reasoning.""",
+    for the whole turn including reasoning, or {C}/copy-response{R} for the
+    last turn's final reply with the empty-message edge handled.""",
 
-"copy-last": f"""Copy the LAST turn's raw record — the prompt that started
-    it, any reasoning/thinking, and the final answer — to the clipboard
-    (OSC52, SSH-safe). This is the one place either the prompt or the
-    thinking is ever copyable; {C}/copy{R} and {C}/copy-all{R} both leave
-    thinking out. Also reachable as "copy last" in the status bar's
-    {C}copy{R} picker.""",
+"copy-last": f"""Copy the LAST turn IN FULL — the prompt that started it,
+    all of the reasoning/thinking, and EVERY reply the model made, in order,
+    with a one-line marker per tool call — to the clipboard (OSC52,
+    SSH-safe). R256: a turn that used tools is a chain (narrate, call,
+    narrate, call, answer), and this used to copy only its final message,
+    which on a long turn is usually a short wrap-up — the substantive reply
+    was dropped. Tool OUTPUT is still left out; one result can be 60KB.
+    This is the one place either the prompt or the thinking is ever
+    copyable; {C}/copy{R} and {C}/copy-all{R} both leave thinking out. Want
+    just the answer? {C}/copy-response{R}. Also reachable as
+    "copy last (full)" in the status bar's {C}copy{R} picker.""",
+
+"copy-response": f"""Copy just the model's FINAL reply from the last turn —
+    no prompt, no thinking, no tool markers (OSC52, SSH-safe). The narrow
+    counterpart to {C}/copy-last{R}, which takes the whole turn. Unlike
+    {C}/copy{R} it skips a trailing tool-call-only message, so a turn stopped
+    at the approval gate still copies the last thing the model actually
+    said instead of an empty string, and it never reaches back into the
+    previous turn to find one. Also reachable as "copy last (response)" in
+    the status bar's {C}copy{R} picker.""",
 
 "copy-all": f"""Copy the WHOLE chat — every question and answer, in order —
     to the clipboard (OSC52, SSH-safe). Thinking is never included. Also
@@ -163,6 +179,20 @@ def _entries(B, C, D, G, Y, R):
     the same order {C}/model{R}'s own picker does. A successful fallback
     silently switches the current model, exactly as if you'd picked it
     from {C}/model{R} yourself.""",
+
+"auto-approve": f"""{G}on|off{R}, SESSION-ONLY — always starts back OFF on a
+    fresh run, unlike {C}/fallback{R}/{C}/multiline{R} above. While ON,
+    every tool call that would normally stop and ask (write/edit a file,
+    run a shell command, …) runs unprompted instead, same as if you'd
+    picked "Yes" at every approval gate yourself.
+    Two things it does NOT bypass: a {C}/denylist{R} rule still blocks its
+    call outright (deny always wins, checked before this), and a detected
+    secret still stops and asks separately — this only skips the ASK for
+    an otherwise-approvable call, never a standing refusal or the
+    secret-detection challenge.
+    The status bar shows a persistent {Y}⚠ auto-approve ON{R} tag for as
+    long as it's on, precisely because it's easy to turn on for one long
+    task and forget it's still on for the next, unrelated one.""",
 
 "thinking": f"""Toggle the live reasoning stream: a dim, real-time stream of
     the model's thinking vs. just a static "(thinking…)" marker while it
@@ -253,10 +283,19 @@ def _entries(B, C, D, G, Y, R):
     session first). Pick a number afterward to jump straight into
     {C}/resume{R}-ing that session.""",
 
-"export": f"""Dump the current conversation as a markdown file in the
-    working directory — questions, answers, and tool activity, formatted
-    for reading outside Aurora (a PR description, a note to a teammate,
-    etc).""",
+"sessions": f"""List every past session on this machine — id, last-active
+    time, and a preview of its first real task — newest first, with the
+    session you're in right now marked {C}(current){R}. Read-only: unlike
+    {C}/resume{R} and {C}/search{R} it never prompts for a number to jump
+    into one. Pass a count ({C}/sessions 50{R}) to see more than the
+    default 20.""",
+
+"export": f"""{C}/export{R} [{G}id{R}]  Dump a conversation as a markdown
+    file in the working directory — questions, answers, and tool activity,
+    formatted for reading outside Aurora (a PR description, a note to a
+    teammate, etc). No arg: the CURRENT session. A full or partial session
+    id (as shown by {C}/resume{R} or {C}/sessions{R}) exports that PAST
+    session straight from its log — no need to {C}/resume{R} it first.""",
 
 "skills": f"""List every installed skill (bundled + your own, from
     {Y}<repo>/skills/{R} or {Y}AURORA_HOME/skills/{R}). Run one directly as

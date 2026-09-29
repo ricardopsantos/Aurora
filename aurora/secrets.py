@@ -35,6 +35,10 @@ PATTERNS: list[tuple[str, re.Pattern]] = [
     ("Slack token",        re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
     ("Stripe key",         re.compile(r"\b(?:sk|pk)_live_[A-Za-z0-9]{16,}\b")),
     ("OpenAI-style key",   re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
+    # R278: Aurora's own remote provider. `sk-or-v1-<64 hex>` fails the
+    # OpenAI shape above (a hyphen after `sk-or`) and the entropy fallback
+    # (lower-case hex has no upper-case letter) — so it went undetected.
+    ("OpenRouter key",     re.compile(r"\bsk-or-v1-[0-9a-fA-F]{32,}\b")),
     ("Bearer token",       re.compile(r"\bBearer\s+[A-Za-z0-9\-._~+/]{16,}=*")),
     ("Private key block",
      re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]+?"
@@ -50,7 +54,9 @@ PATTERNS: list[tuple[str, re.Pattern]] = [
     # dump and never a credential, while `DB_PWD=` is. The other names are
     # credentials on their own.
     ("Env credential",
-     re.compile(r"(?im)^[ \t]*(?:"
+     # R278: an optional `export ` — the shape of every .bashrc/.zshrc/
+     # .envrc credential line, which the line-start anchor used to miss.
+     re.compile(r"(?im)^[ \t]*(?:export[ \t]+)?(?:"
                 r"[A-Za-z0-9_]*(?:API[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD)"
                 r"[A-Za-z0-9_]*"
                 r"|[A-Za-z0-9_]+PWD[A-Za-z0-9_]*"
@@ -74,6 +80,7 @@ _LITERAL_GUARD: dict[str, tuple[str, ...] | None] = {
     "Slack token": ("xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"),
     "Stripe key": ("_live_",),          # covers both sk_live_ and pk_live_
     "OpenAI-style key": ("sk-",),
+    "OpenRouter key": ("sk-or-v1-",),
     "Bearer token": ("Bearer",),
     "Private key block": ("-----BEGIN",),
     "Env credential": None,

@@ -3,7 +3,7 @@
 Aurora is a micro terminal coding agent (macOS + Linux, synced via git).
 
 > **Canonical spec is [`CHANGELOG_TECHNICAL.md`](CHANGELOG_TECHNICAL.md)**
-> (formerly `AURORA.md`). It holds the full numbered requirements (R1–R236+),
+> (formerly `AURORA.md`). It holds the full numbered requirements (R1–R293+),
 > build plan, and test plan, written before the code and kept in sync with
 > behaviour. This file is a stable high-level index; when the two disagree,
 > `CHANGELOG_TECHNICAL.md` wins. Any behaviour change updates
@@ -37,6 +37,21 @@ Aurora is a micro terminal coding agent (macOS + Linux, synced via git).
   socket shutdown) so a cancel lands even during prefill. The key is Esc in
   the TUI (where Ctrl+C only clears the input line) and Ctrl+C in the classic
   REPL — the cancellation MECHANISM is shared, the key is per front end.
+- **Concurrency while a turn runs (R245, R246, R253, R254).** A turn in flight must
+  not make the session unusable. The model can background a long command and
+  poll it (`run_command(background=True)`/`check_command`/`cancel_command`);
+  the human can run a `!` bash command, a read-only `/command`, `/model`, or
+  ask a question and get an answer, all on a second worker. The boundary is
+  fixed: nothing on that channel writes `engine.messages` or the session, so
+  they keep the single writer their lock-free design assumes. A mid-turn
+  question is therefore answered from a snapshot with no tools, and says so;
+  a mid-turn `/model` defers its switch until the turn ends. What genuinely
+  must wait still waits, but says which command and why. Two standing rules
+  came out of R254's review of that machinery: nothing on the side channel
+  may borrow what the turn configures by assignment or infers from its own
+  output (its provider, its renderer, its think row, its transcript entry),
+  and nothing on it may skip a gate the main path applies — R58's secret
+  scan included.
 - **Resilience.** Every backend probe is time-bounded; unreachable backends
   degrade gracefully (picker falls back to config models, sends notify to
   `/model` in ~5s) so Aurora works fully off-LAN with remote providers.

@@ -11,7 +11,7 @@ from pathlib import Path as _Path
 # github-deploy.sh overwrites this exact line on every deploy to GitHub, so
 # it always reflects GitTea's version at deploy time. Left empty here in
 # GitTea itself — empty means "compute live from git" below.
-_PINNED_VERSION = "1.2.42"
+_PINNED_VERSION = "1.2.57"
 
 # 1.2+: the patch number is commits SINCE THE LAST DEPLOY, not the total
 # commit count (that was the 1.1.<total> scheme). VERSION_BASELINE.json

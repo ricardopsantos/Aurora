@@ -351,6 +351,7 @@ def test_literal_guard_is_a_true_superset_of_its_pattern(name, pattern, guard):
         "Slack token": ["xoxb-" + "a" * 20, "xoxp-" + "b" * 20],
         "Stripe key": ["sk_live_" + "a" * 20, "pk_live_" + "b" * 20],
         "OpenAI-style key": ["sk-" + "a" * 24],
+        "OpenRouter key": ["sk-or-v1-" + "0a" * 32],   # R278
         "Bearer token": ["Bearer " + "a" * 20],
         "Private key block": ["-----BEGIN RSA PRIVATE KEY-----\nx\n"
                               "-----END RSA PRIVATE KEY-----"],

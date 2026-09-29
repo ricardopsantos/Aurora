@@ -15,6 +15,8 @@ imports `engine.py`.
 
 import subprocess
 
+from .providers.base import side_completion
+
 _DRAFT_PROMPT = """\
 Write a git commit message for this diff. Follow the style of the repo's \
 own recent commits (below): concise, explains WHY not just WHAT, no AI \
@@ -51,8 +53,13 @@ _DRAFT_DIFF_CAP = 20000
 
 
 def _git(cwd: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    # R285: decode as UTF-8 with replacement, never the strict locale codec —
+    # a staged latin-1 file (or any non-ASCII under LANG=C) raised
+    # UnicodeDecodeError out of staged_diff()/unstaged_summary(), which are
+    # unguarded, killing /commit with a raw exception.
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True,
-                          text=True, timeout=30, check=check)
+                          text=True, encoding="utf-8", errors="replace",
+                          timeout=30, check=check)
 
 
 def is_repo(cwd: str = ".") -> bool:
@@ -107,11 +114,13 @@ def draft_message(engine, diff: str, recent: str) -> str:
         shown_diff = diff[:_DRAFT_DIFF_CAP] + "\n… (truncated)"
     ask = _DRAFT_PROMPT.format(recent=recent.strip() or "(no history yet)",
                                diff=shown_diff)
-    msg = [{"role": "user", "content": ask}]
     provider = engine._provider_for(engine.current, interactive=True)
-    result = provider.turn(engine.current.get("model", ""), msg, "", None,
-                           lambda _s: None, lambda: False)
-    return (result.text or "").strip()
+    # R255: same side-completion shape as the approval gate's "explain" and
+    # the compact summarizer, and it had the same two bugs — the draft's
+    # reasoning streamed into the running turn's think row, and a thinking
+    # model that answered in `reasoning_content` produced an empty draft
+    # (here that reads as "no message could be drafted", which is wrong).
+    return side_completion(provider, engine.current.get("model", ""), ask)
 
 
 def commit(message: str, cwd: str = ".") -> str:

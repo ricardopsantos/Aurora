@@ -12,7 +12,11 @@ from dataclasses import dataclass, field
 
 from . import approve, tools
 from . import secrets as secretscan
-from .providers.base import MalformedToolCall, ProviderError
+from .providers.base import (
+    MalformedToolCall,
+    ProviderError,
+    side_completion,
+)
 
 
 def _provider_label(provider) -> str:
@@ -83,7 +87,8 @@ Arguments: {args}
 """
 
 
-def _explain_tool_call(provider, model, name: str, args: dict) -> str:
+def _explain_tool_call(provider, model, name: str, args: dict,
+                       cancel=None) -> str:
     """R103: the approval gate's "explain" option. A one-off, tool-free
     model completion describing what a PENDING call will do — never added
     to the conversation history, same "side completion" shape as
@@ -93,9 +98,16 @@ def _explain_tool_call(provider, model, name: str, args: dict) -> str:
     answering for a decision it didn't make."""
     ask = _EXPLAIN_PROMPT.format(name=name, args=json.dumps(args, indent=2))
     try:
-        result = provider.turn(model, [{"role": "user", "content": ask}],
-                               "", None, lambda _s: None, lambda: False)
-        return (result.text or "").strip() or "(no explanation returned)"
+        # R255: `side_completion`, not a bare `provider.turn` — see there for
+        # why reading `result.text` alone silently discarded the explanation
+        # on a thinking model, which is what made this option look broken.
+        # R257: the ONE caller that opts into the reasoning fallback —
+        # here the reasoning is prose the user reads, not an artifact
+        # some later step consumes. See `side_completion`.
+        out = side_completion(provider, model, ask, cancel=cancel,
+                              reasoning_fallback=True)
+        return out or ("(no explanation returned — skip with 'n' and ask "
+                       "in chat instead)")
     except Exception as e:
         return f"[explain failed: {e.__class__.__name__}: {e}]"
 
@@ -111,6 +123,12 @@ class AgentCallbacks:
     cancelled: Callable[[], bool]                  # poll for a user cancel (Esc/Ctrl+C)
     checkpoint: Callable[[str, dict], object] | None = None  # pre-mutation snapshot (R47/R181)
     on_request: Callable[[], None] | None = None   # an LLM request is starting
+    # R262: `/auto-approve on` — polled fresh per gated call (not read once
+    # at turn start) so toggling it mid-turn takes effect on the very next
+    # tool call, same as every other live `/command` this loop already
+    # reads through a callback instead of a snapshot. None means "no such
+    # concept" for a caller that never wires it — treated as always-off.
+    auto_approve: Callable[[], bool] | None = None
     # R58: secret-redaction challenge. None means the feature is OFF (the
     # engine only ever sets this when runtime.redact_secrets is true) — the
     # agent loop then skips scanning entirely, no cost when disabled.
@@ -141,7 +159,8 @@ class AgentCallbacks:
 # R133c: the closed set of gate outcomes. Kept as data so the session log and
 # any reader agree on the vocabulary instead of matching free text.
 _APPROVAL_DECISIONS = ("allowlisted", "approved", "always_allow", "denied",
-                       "denied_policy", "always_deny", "steered", "stopped")
+                       "denied_policy", "always_deny", "steered", "stopped",
+                       "auto_approved")
 
 
 def _norm(ans, default_note: str = "") -> tuple:
@@ -184,6 +203,10 @@ class Turn:
     # turn.
     last_request_latency: float = 0.0
     iterations: int = 0
+    # R266: did this turn append ANY assistant message? The engine used to
+    # infer it from `len(messages)` growing, which a mid-turn fold (R154)
+    # shrinks in place — a productive turn then read as "produced nothing".
+    produced: bool = False
     degraded: bool = False
     cancelled: bool = False
     events: list = field(default_factory=list)
@@ -370,6 +393,7 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                     result.text = secretscan.redact(result.text, reply_matches)
                     result.tool_calls = []
                     messages.append(provider.assistant_message(result))
+                    turn.produced = True
                     turn.cancelled = True
                     return turn
                 elif decision == "redact":
@@ -397,13 +421,26 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                 decision = cb.secret_challenge(f"write:{call.name}", write_matches,
                                                source_text=text)
                 if decision == "stop":
+                    # R265: close the turn the way the reply-scan stop above
+                    # does. Returning bare left `messages` ending on the
+                    # user turn (next send stacks two user messages) and
+                    # the requested calls never reached on_tool_result.
                     cb.notify(f"stopped: secret detected in a {call.name} argument")
+                    for c in result.tool_calls:
+                        cb.on_tool_result(
+                            c.name, "[skipped: secret detected — user stopped the turn]")
+                    result.tool_calls = []
+                    if not result.text:
+                        result.text = "[stopped: secret detected in a tool argument]"
+                    messages.append(provider.assistant_message(result))
+                    turn.produced = True
                     turn.cancelled = True
                     return turn
                 elif decision == "redact":
                     call.arguments[field] = secretscan.redact(text, write_matches)
 
         messages.append(provider.assistant_message(result))
+        turn.produced = True
 
         if not result.tool_calls:
             return turn  # final answer
@@ -474,11 +511,16 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
         if tools.PARALLEL_ENABLED and not cb.cancelled():
             batch = [(i, c.name, c.arguments)
                      for i, c in enumerate(result.tool_calls)
-                     if c.name in tools.PARALLEL_SAFE]
+                     if c.name in tools.PARALLEL_SAFE
+                     # R283: a gated fetch must wait for its approval
+                     and not tools.needs_approval(c.name, c.arguments)
+                     # R301: nor may a denied one run in the prefetch
+                     and not (c.name in approve._URL_TOOLS
+                              and (deny_broken or approve.is_denied(c.name, c.arguments, deny)))]
             if len(batch) > 1:
                 for i, name, args in batch:
                     cb.on_tool_start(name, args)   # announce before running
-                prefetched = tools.run_tools_parallel(batch)
+                prefetched = tools.run_tools_parallel(batch, cancel=cb.cancelled)
 
         for idx, call in enumerate(result.tool_calls):
             def _finish(out: str) -> None:
@@ -506,8 +548,12 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                 _flush()
                 turn.cancelled = True
                 return turn
-            if tools.needs_approval(call.name) and (deny_broken or approve.is_denied(
-                    call.name, call.arguments, deny)):
+            # R301: URL tools consult the denylist even when ungated — an
+            # "always deny" origin rule must also stop that origin's plain
+            # public pages ("deny always wins", R120).
+            if ((tools.needs_approval(call.name, call.arguments)
+                 or call.name in approve._URL_TOOLS)
+                    and (deny_broken or approve.is_denied(call.name, call.arguments, deny))):
                 # R120: a denylist match skips the prompt entirely — no
                 # question asked, same as pi-permission-system's fail-closed
                 # "deny always wins" design. Checked before is_allowed: a
@@ -519,8 +565,9 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                 turn.events.append({"tool": call.name, "denied": True,
                                     "policy": True})
                 continue
-            if tools.needs_approval(call.name) and not approve.is_allowed(
-                    call.name, call.arguments, allow):
+            if (tools.needs_approval(call.name, call.arguments) and not approve.is_allowed(
+                    call.name, call.arguments, allow)
+                    and not (cb.auto_approve and cb.auto_approve())):
                 diff = approve.diff_preview(call.name, call.arguments)
                 # R103: "explain" re-asks the SAME challenge after showing a
                 # model-written description of what the call will do — never
@@ -531,7 +578,8 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                     if ans != "e":
                         break
                     cb.notify(_explain_tool_call(provider, model, call.name,
-                                                 call.arguments))
+                                                 call.arguments,
+                                                 cancel=cb.cancelled))
                 if ans == "a":
                     rule = approve.add_rule(call.name, call.arguments)
                     cb.notify(f"always-allow added: {call.name} · {rule}")
@@ -571,7 +619,16 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                     continue
                 else:
                     _gate("approved", note)
-            elif tools.needs_approval(call.name):
+            elif tools.needs_approval(call.name, call.arguments) and not approve.is_allowed(
+                    call.name, call.arguments, allow):
+                # R262: `/auto-approve on` — skip the prompt exactly like an
+                # allowlist hit, but logged under its own decision so the
+                # session log still shows WHY nobody was asked. Denylist
+                # still wins (checked, and `continue`d past, above this
+                # whole if/elif chain) — this only ever bypasses the ASK,
+                # never a standing refusal.
+                _gate("auto_approved")
+            elif tools.needs_approval(call.name, call.arguments):
                 # the gate was passed without a question — an existing
                 # allowlist rule matched. The common path for a daily driver,
                 # and invisible in the log until R133c.
@@ -629,7 +686,8 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                 # R94 parallel batch above
             else:
                 cb.on_tool_start(call.name, call.arguments)
-                out = tools.run_tool(call.name, call.arguments)
+                out = tools.run_tool(call.name, call.arguments,
+                                     cancel=cb.cancelled)   # R272
             # R58: scan tool output for secrets BEFORE the model (or the
             # display/log, which store the same string) ever sees it — covers
             # every tool uniformly, including read-only ones (read_file, grep)

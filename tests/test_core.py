@@ -1721,7 +1721,7 @@ def test_turn_latency_is_the_last_round_not_the_sum(monkeypatch):
 def test_agent_loop_nudge_fires_on_a_true_repeat(tmp_path, monkeypatch):
     """Same call, same result two rounds running — the nudge is accurate and
     must fire."""
-    monkeypatch.setattr(tools, "run_tool", lambda name, args: "same output")
+    monkeypatch.setattr(tools, "run_tool", lambda name, args, **_k: "same output")
     prov = FakeProvider([
         TurnResult(text="", tool_calls=[ToolCall("1", "read_file",
                    {"path": "/x"})], stop_reason="tool_use"),
@@ -1742,7 +1742,7 @@ def test_agent_loop_nudge_does_not_fire_when_the_result_changed(tmp_path, monkey
     identical result it never saw, or a model that trusts it stops
     re-running the fixed test."""
     outputs = iter(["first output", "second output"])
-    monkeypatch.setattr(tools, "run_tool", lambda name, args: next(outputs))
+    monkeypatch.setattr(tools, "run_tool", lambda name, args, **_k: next(outputs))
     prov = FakeProvider([
         TurnResult(text="", tool_calls=[ToolCall("1", "read_file",
                    {"path": "/x"})], stop_reason="tool_use"),
@@ -1857,6 +1857,67 @@ def test_agent_asks_for_approval_when_allowlist_is_corrupt(tmp_path):
     assert f.read_text() == "hi"      # the turn completed rather than dying
 
 
+def test_auto_approve_skips_the_prompt_and_logs_its_own_decision(tmp_path):
+    """R262: `/auto-approve on` (`cb.auto_approve` returning True) must skip
+    `cb.approve()` entirely — no `y`/`a`/`n` question asked, same as an
+    allowlist hit — but logged under its own `auto_approved` decision so the
+    session log still shows WHY nobody was asked (an allowlist hit and an
+    auto-approve bypass are different facts worth telling apart later)."""
+    approve.save({"run_command": [], "write_file": [], "edit_file": []})
+    f = tmp_path / "o.txt"
+    prov = FakeProvider([
+        TurnResult(text="", tool_calls=[ToolCall("1", "write_file",
+                   {"path": str(f), "content": "hi"})], stop_reason="tool_use"),
+        TurnResult(text="all done", stop_reason="end"),
+    ])
+    asked = []
+    log = []
+    cb = agent.AgentCallbacks(
+        on_text=lambda t: None,
+        on_tool_start=lambda n, a: None,
+        on_tool_result=lambda n, o: None,
+        approve=lambda t, a, d: asked.append(t) or "n",  # would refuse if asked
+        auto_approve=lambda: True,
+        ask_continue=lambda i: True,
+        notify=lambda m: None,
+        cancelled=lambda: False,
+        on_approval=lambda tool, decision, detail: log.append((tool, decision)),
+    )
+    msgs = [{"role": "user", "content": "make the file"}]
+    agent.run_turn(prov, "m", msgs, "sys", cb, 5, True)
+    assert f.read_text() == "hi"           # ran, unprompted
+    assert asked == []                     # cb.approve() never called
+    assert ("write_file", "auto_approved") in log
+
+
+def test_auto_approve_never_overrides_a_denylist_rule(tmp_path):
+    """R262: deny always wins. `/auto-approve on` bypasses the ASK, never a
+    standing refusal — a call matching a `/denylist` rule must still be
+    blocked outright, same as with auto-approve off."""
+    approve.save({"run_command": [], "write_file": [], "edit_file": []})
+    approve.save_deny({"write_file": ["*"]})
+    f = tmp_path / "o.txt"
+    prov = FakeProvider([
+        TurnResult(text="", tool_calls=[ToolCall("1", "write_file",
+                   {"path": str(f), "content": "hi"})], stop_reason="tool_use"),
+        TurnResult(text="all done", stop_reason="end"),
+    ])
+    cb = agent.AgentCallbacks(
+        on_text=lambda t: None,
+        on_tool_start=lambda n, a: None,
+        on_tool_result=lambda n, o: None,
+        approve=lambda t, a, d: "y",
+        auto_approve=lambda: True,
+        ask_continue=lambda i: True,
+        notify=lambda m: None,
+        cancelled=lambda: False,
+    )
+    msgs = [{"role": "user", "content": "make the file"}]
+    agent.run_turn(prov, "m", msgs, "sys", cb, 5, True)
+    assert not f.exists()   # denied, even with auto-approve on
+    approve.save_deny({})
+
+
 def test_agent_deny_option_persists_and_stops_future_prompts(tmp_path):
     approve.save({"run_command": [], "write_file": [], "edit_file": []})
     approve.save_deny({})
@@ -1957,12 +2018,16 @@ def test_explain_tool_call_handles_a_provider_error():
 
 def test_explain_tool_call_empty_reply_has_a_placeholder():
     class _EmptyProv:
+        on_think = None
         def turn(self, *a, **k):
             return TurnResult(text="")
 
     out = agent._explain_tool_call(_EmptyProv(), "m", "run_command",
                                    {"command": "ls"})
-    assert out == "(no explanation returned)"
+    # R255: still a placeholder, but one that says what to do instead — the
+    # bare "(no explanation returned)" left the user at the same menu with
+    # no next step, which is how the original report reads.
+    assert "no explanation returned" in out and "ask in chat" in out
 
 
 # ── R58: secret detection in TOOL OUTPUT (covers read-only tools too) ──────
@@ -2116,7 +2181,10 @@ def test_agent_write_file_secret_stop_never_writes(tmp_path):
     t = agent.run_turn(prov, "m", msgs, "sys", _cb(log=log, secret_ans="stop"), 5, True)
     assert t.cancelled
     assert not f.exists()
-    assert msgs == [{"role": "user", "content": "save my key"}]
+    # R265: the turn is CLOSED with a tool-call-free assistant message (it
+    # used to end on the user message, stacking two user turns next send)
+    assert msgs[0] == {"role": "user", "content": "save my key"}
+    assert msgs[-1]["role"] == "assistant" and secret not in str(msgs)
     assert any("secret detected in a write_file argument" in e[1]
               for e in log if e[0] == "notify")
 
@@ -2511,6 +2579,45 @@ def test_list_sessions_skips_bootstrap_turn():
     row = next(r for r in rows if r[0] == s.id)
     assert row[2] == "fix the login bug"
     s.log_path.unlink()
+
+
+def test_sessions_command_lists_ids_and_marks_current(tmp_path, monkeypatch, capsys):
+    """R259: `/sessions` is a read-only list — no picker, no `input()` — of
+    every past session's id, last-active time, and first-task preview,
+    with the session currently running marked so it's not confused for a
+    separate past one."""
+    from aurora import ui
+    e, _ = _mk_or_engine(tmp_path, monkeypatch)
+    e.session.log("user", text="fix the login bug")
+    ui._handle_command(e, None, "/sessions")
+    out = capsys.readouterr().out
+    assert e.session.id in out
+    assert "fix the login bug" in out
+    assert "(current)" in out
+
+
+def test_sessions_command_with_no_sessions(tmp_path, monkeypatch, capsys):
+    from aurora import ui
+    from aurora import session as sessions
+    e, _ = _mk_or_engine(tmp_path, monkeypatch)
+    monkeypatch.setattr(sessions, "list_sessions", lambda limit=20: [])
+    ui._handle_command(e, None, "/sessions")
+    assert "no past sessions" in capsys.readouterr().out
+
+
+def test_sessions_command_takes_an_optional_limit(tmp_path, monkeypatch):
+    from aurora import ui
+    from aurora import session as sessions
+    e, _ = _mk_or_engine(tmp_path, monkeypatch)
+    seen = {}
+    def _fake_list(limit=20):
+        seen["limit"] = limit
+        return []
+    monkeypatch.setattr(sessions, "list_sessions", _fake_list)
+    ui._handle_command(e, None, "/sessions 5")
+    assert seen["limit"] == 5
+    ui._handle_command(e, None, "/sessions")
+    assert seen["limit"] == 20   # non-numeric/blank arg falls back to default
 
 
 def test_search_sessions_finds_a_match_in_user_and_assistant_text():
@@ -4867,6 +4974,45 @@ def test_model_add_rejects_garbage(tmp_path, monkeypatch, capsys):
     assert e.current["model"] == "existing/model"
 
 
+def test_auto_approve_command_toggles_and_reports_status(tmp_path, monkeypatch, capsys):
+    """R262: `/auto-approve on|off` flips `engine.auto_approve`; called with
+    no argument, it just reports the current state rather than erroring or
+    silently toggling — same "no-arg reads, doesn't act" shape as
+    `/redact`."""
+    from aurora import ui
+    e, _ = _mk_or_engine(tmp_path, monkeypatch)
+    assert e.auto_approve is False   # off by default, every fresh run
+
+    ui._handle_command(e, None, "/auto-approve")
+    assert "OFF" in capsys.readouterr().out
+    assert e.auto_approve is False   # no-arg never toggles
+
+    ui._handle_command(e, None, "/auto-approve on")
+    assert e.auto_approve is True
+    assert "ON" in capsys.readouterr().out
+
+    ui._handle_command(e, None, "/auto-approve off")
+    assert e.auto_approve is False
+    assert "OFF" in capsys.readouterr().out
+
+    ui._handle_command(e, None, "/auto-approve sideways")
+    assert "usage: /auto-approve on|off" in capsys.readouterr().out
+    assert e.auto_approve is False   # garbage arg leaves state untouched
+
+
+def test_auto_approve_is_session_only_not_persisted(tmp_path, monkeypatch):
+    """R262: unlike /fallback and /multiline, this must NOT survive a
+    restart — a standing config-file bypass of the approval gate is a much
+    bigger foot-gun than a toggle that always starts back off."""
+    from aurora import ui
+    from aurora.engine import Engine
+    e, cfg = _mk_or_engine(tmp_path, monkeypatch)
+    ui._handle_command(e, None, "/auto-approve on")
+    assert e.auto_approve is True
+    e2 = Engine(str(cfg))
+    assert e2.auto_approve is False
+
+
 # ── /model remove (R81) ────────────────────────────────────────────────────
 def test_remove_model_persists(tmp_path, monkeypatch):
     import yaml
@@ -5162,6 +5308,102 @@ def test_run_command_survives_non_utf8_output(tmp_path):
     read_file and grep both already pass errors="replace"."""
     out = tools.run_command(r'printf "\377\376 readable tail"')
     assert "readable tail" in out
+
+
+# ── R245: run_command(background=True) + check_command ─────────────────────
+def test_background_command_returns_a_job_id_immediately(tmp_path):
+    marker = tmp_path / "done"
+    out = tools.run_command(f"sleep 0.3 && touch {marker}", background=True)
+    assert "background job" in out
+    assert not marker.exists()          # returned before the sleep finished
+
+
+def test_check_command_reports_running_then_exit_code(tmp_path):
+    marker = tmp_path / "done"
+    out = tools.run_command(f"sleep 0.3 && echo hi && touch {marker}",
+                            background=True)
+    job_id = out.split()[2]
+    assert "still running" in tools.check_command(job_id)
+    for _ in range(50):
+        if marker.exists():
+            break
+        time.sleep(0.05)
+    status = tools.check_command(job_id)
+    assert "[exit 0]" in status and "hi" in status
+
+
+def test_check_command_unknown_job_id_is_an_error():
+    assert "no such background job" in tools.check_command("bg999")
+
+
+def test_check_command_with_no_job_id_lists_every_job(tmp_path):
+    out1 = tools.run_command("sleep 0.2", background=True)
+    out2 = tools.run_command("sleep 0.2", background=True)
+    j1, j2 = out1.split()[2], out2.split()[2]
+    listing = tools.check_command()
+    assert j1 in listing and j2 in listing
+    for _ in range(50):
+        if tools._BG_JOBS[j1].done and tools._BG_JOBS[j2].done:
+            break
+        time.sleep(0.05)
+
+
+def test_check_command_tail_keeps_only_the_end_of_long_output():
+    out = tools.run_command("seq 1 5000", background=True)
+    job_id = out.split()[2]
+    for _ in range(50):
+        if tools._BG_JOBS[job_id].done:
+            break
+        time.sleep(0.05)
+    status = tools.check_command(job_id, tail=50)
+    assert "earlier bytes omitted" in status
+    assert "5000" in status               # the tail end survived
+    assert "\n1\n" not in status          # the head did not
+
+
+def test_background_jobs_are_capped(monkeypatch):
+    monkeypatch.setattr(tools, "MAX_BACKGROUND_JOBS", 1)
+    monkeypatch.setattr(tools, "_BG_JOBS", {})
+    first = tools.run_command("sleep 0.3", background=True)
+    assert "background job" in first
+    second = tools.run_command("sleep 0.3", background=True)
+    assert "already running" in second
+
+
+# ── R246: cancel_command ─────────────────────────────────────────────────
+def test_cancel_command_kills_a_running_background_job(tmp_path):
+    marker = tmp_path / "should-not-exist"
+    out = tools.run_command(f"sleep 2 && touch {marker}", background=True)
+    job_id = out.split()[2]
+    assert "still running" in tools.check_command(job_id)
+    result = tools.cancel_command(job_id)
+    assert "kill signal sent" in result
+    for _ in range(50):
+        if tools._BG_JOBS[job_id].done:
+            break
+        time.sleep(0.05)
+    assert tools._BG_JOBS[job_id].done
+    time.sleep(0.2)
+    assert not marker.exists()          # killed before it could touch it
+
+
+def test_cancel_command_unknown_job_id_is_an_error():
+    assert "no such background job" in tools.cancel_command("bg999")
+
+
+def test_cancel_command_on_an_already_finished_job_is_a_no_op(tmp_path):
+    out = tools.run_command("true", background=True)
+    job_id = out.split()[2]
+    for _ in range(50):
+        if tools._BG_JOBS[job_id].done:
+            break
+        time.sleep(0.05)
+    result = tools.cancel_command(job_id)
+    assert "already finished" in result
+
+
+def test_cancel_command_needs_approval():
+    assert tools.needs_approval("cancel_command")
 
 
 def test_run_tool_does_not_die_on_an_extension_returning_a_non_string(
@@ -6181,7 +6423,7 @@ def test_run_tools_parallel_single_call_runs_sequential_path(monkeypatch):
         called["used_pool"] = True
         raise AssertionError("should not construct a ThreadPoolExecutor for 1 call")
 
-    monkeypatch.setattr(t, "run_tool", lambda name, args: f"{name}:{args}")
+    monkeypatch.setattr(t, "run_tool", lambda name, args, **_k: f"{name}:{args}")
     monkeypatch.setattr("concurrent.futures.ThreadPoolExecutor", fake_pool)
     got = t.run_tools_parallel([(0, "read_file", {"path": "/x"})])
     assert got == {0: "read_file:{'path': '/x'}"}
@@ -6216,7 +6458,7 @@ def test_run_tools_parallel_caps_workers_at_max_parallel(monkeypatch):
             seen_max_workers["n"] = max_workers
             super().__init__(max_workers=max_workers, **k)
 
-    monkeypatch.setattr(t, "run_tool", lambda name, args: "ok")
+    monkeypatch.setattr(t, "run_tool", lambda name, args, **_k: "ok")
     monkeypatch.setattr("concurrent.futures.ThreadPoolExecutor", SpyExecutor)
     calls = [(i, "read_file", {"path": str(i)}) for i in range(t.MAX_PARALLEL + 5)]
     t.run_tools_parallel(calls)
@@ -8037,6 +8279,68 @@ print("OK")
     assert "OK" in r.stdout, f"stdout={r.stdout!r} stderr={r.stderr[-400:]!r}"
 
 
+def test_resolve_session_id_exact_and_unique_prefix(tmp_path, monkeypatch):
+    """R263: `/export <id>` needs to turn a full id or a short hex prefix
+    into the one exact session it means, since ids are random hex with no
+    visible order — an exact match must win outright even where it also
+    happens to prefix another id, and a prefix with exactly one match
+    resolves silently (no picker, no ambiguity)."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    from aurora.session import Session, resolve_session_id
+    a = Session("abc123def456")
+    a.log("user", text="first")
+    b = Session("abc999")
+    b.log("user", text="second")
+    assert resolve_session_id("abc123def456") == "abc123def456"   # exact
+    assert resolve_session_id("abc9") == "abc999"                  # unique prefix
+    assert resolve_session_id("abc123") == "abc123def456"          # unique prefix
+
+
+def test_resolve_session_id_ambiguous_and_missing(tmp_path, monkeypatch):
+    """R263: a prefix matching more than one session, or matching none, must
+    raise rather than silently guessing — `/export` surfaces the message
+    as-is instead of exporting the wrong session."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    from aurora.session import Session, resolve_session_id
+    Session("abc111").log("user", text="one")
+    Session("abc222").log("user", text="two")
+    with pytest.raises(ValueError, match="matches 2 sessions"):
+        resolve_session_id("abc")
+    with pytest.raises(ValueError, match="no session matching"):
+        resolve_session_id("zzz")
+
+
+def test_export_command_accepts_a_past_session_id(tmp_path, monkeypatch):
+    """R263: `/export <id>` must export that PAST session from disk, leaving
+    the currently-active session untouched — no `/resume` required. Exercises
+    the real `_handle_command` dispatch, not just `export_markdown` directly,
+    so the arg-parsing/`resolve_session_id` wiring is covered too."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    from aurora import ui
+    from aurora.session import Session
+
+    past = Session("pastsession01")
+    past.log("user", text="past question")
+    past.log("assistant", text="past answer", model="m")
+
+    class _FakeEngine:
+        def __init__(self):
+            self.session = Session("currentsession02")
+
+    class _FakeFrontend:
+        def notify(self, *a, **k):
+            pass
+
+    ui._handle_command(_FakeEngine(), _FakeFrontend(), "/export pastsession")
+    out = tmp_path / "aurora-session-pastsession01.md"
+    assert out.exists()
+    text = out.read_text(encoding="utf-8")
+    assert "past question" in text and "past answer" in text
+    # the current (different) session must NOT have been exported instead
+    assert not (tmp_path / "aurora-session-currentsession02.md").exists()
+
+
 def test_a_failed_export_does_not_leave_a_truncated_file(tmp_path, monkeypatch):
     """R207: the export lands whole or not at all. `open(out, "w")` truncated
     an existing export the moment it opened, so a re-export that then failed
@@ -8097,7 +8401,8 @@ def test_copy_last_sanitizes_both_of_its_sources(tmp_path, monkeypatch):
     osc = "\x1b]52;c;WFhY\x07"
     engine = types.SimpleNamespace(
         session=Session(), messages=[],
-        last_prompt=lambda: "", last_response=lambda: "")
+        last_prompt=lambda: "", last_response=lambda: "",
+        last_turn_messages=list)             # R256
     fake_tui = types.SimpleNamespace(
         _last_bash_output=f"cmd out{osc} tail",
         _last_bash_at=100.0, _last_llm_at=1.0)
@@ -8627,3 +8932,829 @@ def test_allowing_a_versioned_interpreter_does_not_generalize(tmp_path,
     # the exact command the user did approve still passes without re-asking
     assert approvemod.is_allowed(
         "run_command", {"command": 'python3.11 -c "print(1)"'}) is True
+
+
+# ── R244: a bare `runtime:` line must not make Aurora unstartable ─────────
+
+@pytest.mark.parametrize("null_key", ["providers", "models", "runtime", "skills"])
+def test_null_config_section_does_not_crash_startup(tmp_path, monkeypatch,
+                                                    null_key):
+    """R244: `setdefault` is a no-op when the key EXISTS holding None, which
+    is exactly what a bare `runtime:` line parses to. Every consumer then
+    calls `.get()` on that None. R150e fixed the `models` case inside Engine;
+    the other three still took Aurora down at construction."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    cfg = tmp_path / "config.yaml"
+    sections = {
+        "providers": "providers:\n  local: {type: openai, base_url: 'http://x'}",
+        "models": "models:\n  - {model: m-one, provider: local}",
+        "runtime": "runtime:\n  max_iterations: 3",
+        "skills": "skills:\n  enabled: true",
+    }
+    sections[null_key] = f"{null_key}:"          # the bare, value-less line
+    cfg.write_text("\n".join(sections.values()) + "\n")
+    from aurora.engine import Engine
+    e = Engine(str(cfg))       # must not raise
+    assert isinstance(e.cfg["providers"], dict)
+    assert isinstance(e.cfg["models"], list)
+    assert isinstance(e.cfg["runtime"], dict)
+    assert isinstance(e.cfg["skills"], dict)
+
+
+def test_null_runtime_still_persists_a_runtime_value(tmp_path, monkeypatch):
+    """The same null section reaching the WRITE path: `persist_runtime_value`
+    does `raw.setdefault("runtime", {})[key]`, which is a TypeError against a
+    None the loader left in place."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("providers:\n  local: {type: openai, base_url: 'http://x'}\n"
+                   "models:\n  - {model: m-one, provider: local}\n"
+                   "runtime:\n")
+    from aurora.engine import Engine
+    e = Engine(str(cfg))
+    e.set_multiline(True)
+    assert "multiline: true" in cfg.read_text()
+
+
+# ── R245: `api_key: none` means no key on EVERY path ─────────────────────
+
+def test_probe_does_not_send_a_bearer_none(monkeypatch):
+    """R245: `_auth_headers` treats the literal string "none" as "keyless"
+    (the convention for a local llama.cpp server); `_probe` rebuilt the
+    header itself and so probed with `Authorization: Bearer none`. A server
+    that validates tokens 401s that, and `pick_endpoint` then fails over off
+    a healthy endpoint."""
+    from aurora.providers.openai_compat import OpenAICompatProvider
+    p = OpenAICompatProvider("local", {"base_url": "http://127.0.0.1:8080/v1",
+                                       "api_key": "none"})
+    seen = {}
+
+    class _Fake:
+        def get(self, url, headers=None, timeout=None):
+            seen["headers"] = headers
+
+            class _R:
+                def raise_for_status(self_inner):
+                    return None
+            return _R()
+
+    monkeypatch.setattr(p, "_client_for", lambda url: _Fake())
+    assert p._probe("http://127.0.0.1:8080/v1") is True
+    assert "Authorization" not in seen["headers"]
+
+
+def test_probe_still_sends_a_real_key(monkeypatch):
+    from aurora.providers.openai_compat import OpenAICompatProvider
+    p = OpenAICompatProvider("local", {"base_url": "http://127.0.0.1:8080/v1",
+                                       "api_key": "sk-real"})
+    seen = {}
+
+    class _Fake:
+        def get(self, url, headers=None, timeout=None):
+            seen["headers"] = headers
+
+            class _R:
+                def raise_for_status(self_inner):
+                    return None
+            return _R()
+
+    monkeypatch.setattr(p, "_client_for", lambda url: _Fake())
+    assert p._probe("http://127.0.0.1:8080/v1") is True
+    assert seen["headers"]["Authorization"] == "Bearer sk-real"
+
+
+# ── R246: an all-decimal session id is still a session id ────────────────
+
+def test_context_all_digit_session_id_is_not_read_as_a_turn_count(tmp_path,
+                                                                  monkeypatch):
+    """R246: session ids are `uuid4().hex[:12]`, so about one in 300 is
+    all-decimal. `report()` claimed a bare number "can't shadow a real one"
+    and read such an id as a turn LIMIT — silently rendering the current
+    session instead of the one asked for."""
+    from aurora import ctxtree
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    digits = "123456789012"          # 12 chars, all decimal — a valid id
+    asked = {}
+    monkeypatch.setattr(ctxtree, "render",
+                        lambda sid, limit=None, context_limit=None:
+                        asked.update(sid=sid, limit=limit) or "")
+
+    class _E:
+        class session:
+            id = "abcdef123456"
+
+    monkeypatch.setattr(ctxtree.sessions, "Session",
+                        lambda sid: type("S", (), {
+                            "log_path": type("P", (), {
+                                "exists": staticmethod(lambda: True)})()})())
+    ctxtree.report(_E(), digits)
+    assert asked["sid"] == digits
+    assert asked["limit"] == ctxtree.DEFAULT_TURNS
+
+
+def test_context_bare_number_is_still_a_turn_count(tmp_path, monkeypatch):
+    from aurora import ctxtree
+    asked = {}
+    monkeypatch.setattr(ctxtree, "render",
+                        lambda sid, limit=None, context_limit=None:
+                        asked.update(sid=sid, limit=limit) or "")
+
+    class _E:
+        class session:
+            id = "abcdef123456"
+
+    ctxtree.report(_E(), "5")
+    assert asked["sid"] == "abcdef123456"
+    assert asked["limit"] == 5
+
+
+# ── R247: a free model is priced, not unpriced ───────────────────────────
+
+def test_has_pricing_is_false_for_a_null_price(monkeypatch):
+    """R247: `has_pricing` tested that the two KEYS exist while `cost_for`
+    tested their VALUES, so a null price read as "priced" and rendered the
+    0.0 fallback — a "$0.00" badge for a model whose price is unknown."""
+    from aurora.providers import openai_compat
+    from aurora.providers.openai_compat import OpenAICompatProvider
+    monkeypatch.setattr(openai_compat, "REMOTE_CONTEXT_LIMITS",
+                        {"v/null": {"model": "v/null",
+                                    "price_in_per_mtok": None,
+                                    "price_out_per_mtok": None},
+                         "v/free": {"model": "v/free",
+                                    "price_in_per_mtok": 0.0,
+                                    "price_out_per_mtok": 0.0}})
+    p = OpenAICompatProvider("openrouter", {"base_url": "http://y"})
+    assert p.has_pricing("v/null") is False
+    assert p.has_pricing("v/free") is True
+
+
+# ── R248: --resume with an unknown id must refuse, not fork ──────────────
+
+def test_resume_unknown_session_id_exits(tmp_path, monkeypatch, capsys):
+    """R248: `aurora --resume <typo>` printed "resuming session <typo> (0
+    turns)" and then ran in a BRAND-NEW session — `resume_from` only adopts
+    the past session when it restored something. `/context` has refused an
+    unknown id for a long time; the CLI flag doing the same lookup didn't."""
+    from aurora import __main__ as entry
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_CFG)
+    monkeypatch.setattr(sys, "argv",
+                        ["aurora", "--resume", "deadbeefcafe", str(cfg)])
+    with pytest.raises(SystemExit) as exc:
+        entry.main()
+    assert "no session deadbeefcafe" in str(exc.value)
+
+
+def test_resume_known_session_id_still_resumes(tmp_path, monkeypatch):
+    from aurora import __main__ as entry
+    from aurora.engine import Engine
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_CFG)
+    seed = Engine(str(cfg))
+    seed.session.log("user", text="hello", model="m-one")
+    seed.session.log("assistant", text="hi", model="m-one")
+    sid = seed.session.id
+
+    resumed = {}
+    monkeypatch.setattr(entry.sessions, "latest_session_id", lambda: None)
+    monkeypatch.setattr("aurora.ui.run",
+                        lambda engine: resumed.update(id=engine.session.id))
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    monkeypatch.setattr(sys, "argv", ["aurora", "--resume", sid, str(cfg)])
+    entry.main()
+    assert resumed["id"] == sid
+
+
+# ── R251: /model with nothing configured ─────────────────────────────────
+
+def test_pick_model_with_no_models_reports_instead_of_opening_a_menu(
+        tmp_path, monkeypatch, capsys):
+    """R251: `_pick_model` built an empty option list and handed it to
+    `select()`. In the TUI that is a menu no key can answer while the worker
+    blocks on it; in the classic REPL it is an unanswerable numbered list."""
+    from aurora import ui
+    from aurora.engine import Engine
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("providers:\n  local: {type: openai, base_url: 'http://x'}\n"
+                   "models: []\n")
+    e = Engine(str(cfg))
+
+    def _boom(*a, **k):
+        raise AssertionError("opened a picker with no models in it")
+
+    monkeypatch.setattr(ui, "select", _boom)
+    ui._pick_model(e, ui.TerminalFrontend())
+    assert "no models configured" in capsys.readouterr().out
+
+
+# ── R253: Engine.quick_ask — answer without joining the conversation ──────
+class _QuickAskProvider:
+    """Records what it was handed, so the isolation claims can be checked
+    against the ACTUAL request rather than against side effects."""
+    api_key, extra_body, on_think, cache_prompt = "k", {}, None, False
+
+    def __init__(self):
+        self.seen = []
+        self.raw = []      # the list OBJECT, un-copied — see the snapshot test
+
+    def turn(self, model, messages, system, tools, on_text, cancel):
+        self.raw.append(messages)
+        self.seen.append({"model": model, "messages": list(messages),
+                          "system": system, "tools": tools})
+        on_text("side answer")
+        return TurnResult(text="side answer", input_tokens=7, output_tokens=3)
+
+    def cost(self, m, i, o, cached=0):
+        return 0.5
+
+    def has_pricing(self, m):
+        return True
+
+
+def test_quick_ask_never_touches_the_conversation(tmp_path, monkeypatch):
+    """The whole reason `quick_ask` exists instead of a second real turn:
+    ARCHITECTURE §6 says `engine.messages` has exactly one writer, and the
+    worker thread is it. A mid-turn question must therefore read history and
+    write none of it back."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = [{"role": "user", "content": "earlier q"},
+                     {"role": "assistant", "content": "earlier a"}]
+    before = list(e.messages)
+    prov = _QuickAskProvider()
+    # `_side_provider`, not `_provider_for`: quick_ask deliberately does
+    # not reuse the cached provider the running turn is using — see
+    # test_quick_ask_does_not_borrow_the_running_turns_provider.
+    monkeypatch.setattr(e, "_side_provider", lambda entry=None: prov)
+
+    out = []
+    assert e.quick_ask("are you there?", out.append) == "side answer"
+
+    assert e.messages == before          # nothing appended, nothing popped
+    assert out == ["side answer"]
+    # it still SAW the conversation — an isolated call that can't read
+    # history would answer "are you there?" with no idea what's running
+    sent = prov.seen[0]["messages"]
+    assert [m["content"] for m in sent] == [
+        "earlier q", "earlier a", "are you there?"]
+    assert prov.seen[0]["tools"] == []   # no tools: it answers, it can't act
+
+
+def test_quick_ask_sends_a_snapshot_not_the_live_list(tmp_path, monkeypatch):
+    """The turn it runs alongside appends to `engine.messages` while this
+    request is in flight. The snapshot is what makes that safe — without the
+    copy, a concurrent append would mutate the very list being serialized."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = [{"role": "user", "content": "earlier q"}]
+    prov = _QuickAskProvider()
+    # `_side_provider`, not `_provider_for`: quick_ask deliberately does
+    # not reuse the cached provider the running turn is using — see
+    # test_quick_ask_does_not_borrow_the_running_turns_provider.
+    monkeypatch.setattr(e, "_side_provider", lambda entry=None: prov)
+
+    real_turn = prov.turn
+
+    def _turn_then_mutate(*a, **k):
+        result = real_turn(*a, **k)
+        e.messages.append({"role": "assistant", "content": "from the turn"})
+        return result
+
+    prov.turn = _turn_then_mutate
+    e.quick_ask("mid-turn question", lambda _t: None)
+
+    # the request was built on its OWN list. Identity, not contents: passing
+    # `self.messages` itself would serialize whatever the worker thread had
+    # appended by the time httpx got to it, which is the race this avoids.
+    assert prov.raw[0] is not e.messages
+    assert [m["content"] for m in prov.seen[0]["messages"]] == [
+        "earlier q", "mid-turn question"]
+    assert e.messages[-1]["content"] == "from the turn"   # the turn's write survived
+
+
+def test_quick_ask_accounts_for_its_spend_without_moving_the_gauge(tmp_path, monkeypatch):
+    """The tokens are really billed, so `/cost` must see them. The context
+    gauge must NOT move: it tracks the real conversation, and a side turn is
+    not part of it."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    monkeypatch.setattr(e, "_side_provider", lambda entry=None: _QuickAskProvider())
+    cost_before, used_before = e._cost, e._used
+
+    e.quick_ask("how much?", lambda _t: None)
+
+    assert e._cost == cost_before + 0.5
+    assert e._used == used_before
+
+
+def test_quick_ask_logs_under_its_own_event_names(tmp_path, monkeypatch):
+    """Logged as `side_ask`/`side_answer`, never `user`/`assistant`: a side
+    exchange read back as a turn would inflate /cost's turn count (R92) and
+    appear in the markdown export as something the model actually said in
+    the conversation."""
+    from aurora import session as sessionmod
+
+    e = _mk_engine(tmp_path, monkeypatch)
+    monkeypatch.setattr(e, "_side_provider", lambda entry=None: _QuickAskProvider())
+    e.quick_ask("logged?", lambda _t: None)
+
+    events = [r["event"] for r in e.session.iter_records()]
+    assert "side_ask" in events and "side_answer" in events
+    assert "user" not in events and "assistant" not in events
+    assert sum(v["turns"] for v in
+               sessionmod.usage_by_model(e.session.id).values()) == 0
+
+
+def test_quick_ask_without_a_model_says_so_instead_of_crashing(tmp_path, monkeypatch):
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.current = {}
+    assert "no model selected" in e.quick_ask("hi", lambda _t: None)
+
+
+def test_quick_ask_does_not_borrow_the_running_turns_provider(tmp_path, monkeypatch):
+    """A provider carries plain mutable attributes (`on_think`, `extra_body`,
+    `cache_prompt`, `notify`) that `send()` sets per turn. Sharing the cached
+    instance would mean a side answer's reasoning streaming into the running
+    turn's think row, or writing those attributes from a second thread onto a
+    request already in flight."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    cached = _QuickAskProvider()
+    cached.on_think = "the running turn's think row"
+    e._provider, e._provider_key = cached, e.current.get("provider")
+
+    monkeypatch.setattr(e, "_provider_for",
+                        lambda *a, **k: pytest.fail("used the shared provider"))
+    monkeypatch.setattr(e, "_side_provider",
+                        lambda entry=None: _QuickAskProvider())
+
+    e.quick_ask("hi", lambda _t: None)
+
+    assert cached.on_think == "the running turn's think row"   # untouched
+    assert cached.seen == []                        # never called
+
+
+def test_side_provider_is_reused_across_questions(tmp_path, monkeypatch):
+    """R254f: one instance per provider, not per question. A fresh instance
+    has an empty endpoint cache, so `pick_endpoint` re-probes every time, and
+    a fresh pooled client pays a new TCP/TLS handshake for both the probe and
+    the request — the exact cost R95h took OUT of probing."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    built, closed = [], []
+    monkeypatch.setattr("aurora.engine.make_provider",
+                        lambda *a, **k: built.append(_QuickAskProvider()) or built[-1])
+    monkeypatch.setattr("aurora.engine._close_provider", closed.append)
+
+    first, second = e._side_provider(), e._side_provider()
+    assert first is second and len(built) == 1      # reused, not rebuilt
+    assert closed == [None]                         # nothing real closed yet
+
+    # a different PROVIDER (not just a different model) must rebuild, and
+    # close the one it replaces — each holds a pool of keep-alive sockets
+    e.switch_model({"model": "remote-model", "provider": "remote"})
+    third = e._side_provider()
+    assert third is not first and len(built) == 2
+    assert first in closed
+
+
+def test_side_provider_reapplies_per_model_settings_on_reuse(tmp_path, monkeypatch):
+    """Caching the instance must not cache the MODEL's settings with it:
+    `extra_body` belongs to the model entry, which can change while the
+    provider stays the same."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    monkeypatch.setattr("aurora.engine.make_provider",
+                        lambda *a, **k: _QuickAskProvider())
+
+    p1 = e._side_provider({"model": "m-one", "provider": "local",
+                           "extra_body": {"top_k": 1}})
+    assert p1.extra_body == {"top_k": 1}
+    p2 = e._side_provider({"model": "m-two", "provider": "local"})
+    assert p2 is p1 and p2.extra_body == {}          # same object, fresh settings
+
+
+def test_side_provider_mutes_the_callbacks_that_belong_to_the_turn(tmp_path, monkeypatch):
+    """The real `_side_provider`: `on_think` must be off (the think row on
+    screen is the running turn's) and it must never prompt for a key — the
+    input line belongs to that turn."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    asked = []
+    monkeypatch.setattr("aurora.keystore.get_key",
+                        lambda env, interactive=False: asked.append(interactive) or "")
+
+    e.switch_model({"model": "remote-model", "provider": "remote"})
+    prov = e._side_provider()
+    try:
+        assert prov.on_think is None
+        assert asked == [False]          # never interactive from the side
+        # R254e: the system prompt keeps its cache breakpoint. Hardcoding
+        # this False (as R253 shipped) re-bills the whole preamble — the
+        # base prompt, AGENTS.md, the indexes, every [CORE] doc — on every
+        # mid-turn question, on exactly the models where it is biggest.
+        assert prov.cache_prompt is e.cache_enabled(e.current) is True
+    finally:
+        from aurora.engine import _close_provider
+        _close_provider(prov)
+
+
+def test_side_provider_follows_the_local_models_cache_rule(tmp_path, monkeypatch):
+    """...and it must not blanket-enable it either: `cache_enabled` says OFF
+    for the `local` sentinel (a structured system message is a needless
+    compatibility risk against whatever server is loaded, R91/R223)."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    monkeypatch.setattr("aurora.engine.make_provider",
+                        lambda *a, **k: _QuickAskProvider())
+    entry = {"model": "local", "provider": "local"}
+    assert e._side_provider(entry).cache_prompt is e.cache_enabled(entry) is False
+
+
+def test_quick_ask_refuses_a_prompt_carrying_a_secret(tmp_path, monkeypatch):
+    """R254g: the side path skipped R58's gate outright. Verified before the
+    fix — a `ghp_…` in "does this token still work?" went to the provider in
+    cleartext AND into the session log, with redaction ON.
+
+    It REFUSES rather than challenging: the challenge is interactive and this
+    path may not own the input line (the running turn does), so there is
+    nobody to ask. Silently redacting instead would change what was asked
+    without saying so."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    assert e.redact_secrets                      # the default this relies on
+    prov = _QuickAskProvider()
+    monkeypatch.setattr(e, "_side_provider", lambda entry=None: prov)
+
+    secret = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"
+    out = e.quick_ask(f"does this token still work? {secret}", lambda _t: None)
+
+    assert "not sent" in out
+    assert secret not in out                     # names the KIND, not the value
+    assert prov.seen == []                       # never left the machine
+    assert not any(secret in r.get("text", "")
+                   for r in e.session.iter_records())   # nor reached the disk
+
+
+def test_quick_ask_still_answers_an_ordinary_prompt(tmp_path, monkeypatch):
+    """The gate must not swallow normal questions — the failure mode of a
+    fail-closed check is that it closes on everything."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    monkeypatch.setattr(e, "_side_provider",
+                        lambda entry=None: _QuickAskProvider())
+    assert e.quick_ask("are you there?", lambda _t: None) == "side answer"
+
+
+def test_quick_ask_honours_the_redaction_switch_being_off(tmp_path, monkeypatch):
+    """`/redact off` is a deliberate user choice; the side path reads the same
+    switch `send()` does rather than a policy of its own."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.set_redact_secrets(False)
+    prov = _QuickAskProvider()
+    monkeypatch.setattr(e, "_side_provider", lambda entry=None: prov)
+
+    out = e.quick_ask("token ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+                      lambda _t: None)
+    assert out == "side answer" and prov.seen     # sent, as asked
+
+
+# ── R255: side completions must not borrow the turn's think channel ───────
+class _ThinkingOnlyProvider:
+    """A reasoning model that spends its whole budget in `reasoning_content`
+    and returns empty `content` — the case that made "explain" look broken."""
+    api_key, extra_body, cache_prompt, notify = "k", {}, False, None
+    on_think = None
+
+    def __init__(self, answer="It runs ls and greps for ollama. Read-only."):
+        self.answer = answer
+        self.seen_cancel = None
+
+    def turn(self, model, messages, system, tools, on_text, cancel):
+        self.seen_cancel = cancel
+        if self.on_think:
+            self.on_think(self.answer)
+        return TurnResult(text="", input_tokens=5, output_tokens=20)
+
+
+def test_side_completion_falls_back_to_the_reasoning_channel():
+    """R255, the reported bug: "explain → a short thinking → nothing shown →
+    the approval menu again". The explanation HAD been generated; it arrived
+    as `reasoning_content` and `(result.text or "")` threw it away.
+
+    R257: opt-in, because reasoning is prose the user reads in exactly one
+    of the three callers — see the next test."""
+    from aurora.providers.base import side_completion
+    prov = _ThinkingOnlyProvider()
+    out = side_completion(prov, "local", "explain this",
+                          reasoning_fallback=True)
+    assert out == "It runs ls and greps for ollama. Read-only."
+
+
+def test_side_completion_does_not_fall_back_to_reasoning_by_default():
+    """R257 — a regression R255 introduced and this pins shut. Where the
+    returned string becomes an ARTIFACT rather than prose (a commit message,
+    a summary injected into history), a thinking model's monologue is worse
+    than the empty result it replaced."""
+    from aurora.providers.base import side_completion
+    assert side_completion(_ThinkingOnlyProvider(), "local", "q") == ""
+
+
+def test_side_completion_prefers_real_content_when_there_is_some():
+    """The reasoning is a FALLBACK, not a preference — a model that answers
+    properly must not have its chain-of-thought shown instead."""
+    from aurora.providers.base import side_completion
+
+    class _Normal(_ThinkingOnlyProvider):
+        def turn(self, model, messages, system, tools, on_text, cancel):
+            if self.on_think:
+                self.on_think("thinking out loud, not the answer")
+            return TurnResult(text="  the actual answer  ")
+
+    assert side_completion(_Normal(), "local", "q") == "the actual answer"
+
+
+def test_side_completion_does_not_stream_into_the_turns_think_row():
+    """`Engine.send` points `provider.on_think` at the frontend for the
+    duration of a turn. A side completion that left it there streamed its
+    reasoning into the RUNNING turn's think row — collapsed by default, so
+    the user saw a think row appear and nothing readable — and into
+    `fe.think_buffer`, which `/copy-last` copies as the turn's raw
+    response."""
+    from aurora.providers.base import side_completion
+    turn_think = []
+    # captured in a variable: `x.append is x.append` is False, each attribute
+    # access builds a new bound method — the same trap R254's lock tests hit
+    turn_sink = turn_think.append
+    prov = _ThinkingOnlyProvider()
+    prov.on_think = turn_sink                  # what send() assigns
+
+    side_completion(prov, "local", "explain this")
+
+    assert turn_think == []                    # the turn's row is untouched
+    assert prov.on_think is turn_sink          # and the callback is restored
+
+
+def test_side_completion_restores_on_think_even_when_the_call_raises():
+    """Left swapped by an exception, every later round of the turn would
+    stream its reasoning into a dead list instead of the screen."""
+    from aurora.providers.base import side_completion
+
+    class _Boom(_ThinkingOnlyProvider):
+        def turn(self, *a, **k):
+            raise RuntimeError("provider down")
+
+    prov, sentinel = _Boom(), (lambda _c: None)
+    prov.on_think = sentinel
+    with pytest.raises(RuntimeError):
+        side_completion(prov, "local", "q")
+    assert prov.on_think is sentinel
+
+
+def test_side_completion_passes_cancellation_through():
+    """R246's rule: a slow local model explaining a command has to be
+    stoppable. This path predated it and hardcoded `lambda: False`."""
+    from aurora.providers.base import side_completion
+    prov = _ThinkingOnlyProvider()
+    stop = lambda: True
+    side_completion(prov, "local", "q", cancel=stop)
+    assert prov.seen_cancel is stop
+
+    prov2 = _ThinkingOnlyProvider()
+    side_completion(prov2, "local", "q")       # default is still a no-op
+    assert prov2.seen_cancel() is False
+
+
+def test_explain_returns_the_reasoning_instead_of_no_explanation():
+    """End to end through the approval gate's helper."""
+    from aurora import agent
+    out = agent._explain_tool_call(_ThinkingOnlyProvider(), "local",
+                                   "run_command", {"command": "ls"})
+    assert out == "It runs ls and greps for ollama. Read-only."
+    assert "no explanation returned" not in out
+
+
+def test_explain_says_what_to_do_when_the_model_returns_nothing_at_all():
+    """A model that produces neither content nor reasoning still has to
+    leave the user somewhere — the old text just said nothing came back."""
+    from aurora import agent
+    prov = _ThinkingOnlyProvider(answer="")
+    out = agent._explain_tool_call(prov, "local", "run_command", {"command": "ls"})
+    assert "no explanation returned" in out and "ask in chat" in out
+
+
+def test_explain_reports_a_provider_failure_rather_than_looking_empty():
+    from aurora import agent
+
+    class _Boom(_ThinkingOnlyProvider):
+        def turn(self, *a, **k):
+            raise RuntimeError("backend unreachable")
+
+    out = agent._explain_tool_call(_Boom(), "local", "run_command", {})
+    assert out.startswith("[explain failed:") and "backend unreachable" in out
+
+
+def test_commit_draft_never_proposes_a_monologue_as_the_message(monkeypatch):
+    """R257, a regression R255 introduced. `/commit` prints the draft and
+    offers a "Yes, commit" key: an EMPTY message is refused outright, a
+    plausible-looking one is not. So a thinking model that answered only in
+    `reasoning_content` must leave the draft empty — the user writes their
+    own — rather than have its monologue proposed as the commit message.
+
+    The R255 test asserted the opposite and passed, which is the failure
+    mode mutation testing cannot catch: it pinned the bug as the intent."""
+    from aurora import gitcommit
+    prov = _ThinkingOnlyProvider(
+        answer="Okay, let me look at this diff. Hmm, what did they change...")
+
+    class _Eng:
+        current = {"model": "local", "provider": "local"}
+        def _provider_for(self, entry, interactive=False):
+            return prov
+
+    assert gitcommit.draft_message(_Eng(), "diff", "recent") == ""
+
+
+def test_commit_draft_still_uses_a_real_reply(monkeypatch):
+    """The guard must not break the normal case."""
+    from aurora import gitcommit
+
+    class _Normal(_ThinkingOnlyProvider):
+        def turn(self, model, messages, system, tools, on_text, cancel):
+            return TurnResult(text="Fix the thing that was broken")
+
+    class _Eng:
+        current = {"model": "local", "provider": "local"}
+        def _provider_for(self, entry, interactive=False):
+            return _Normal()
+
+    assert gitcommit.draft_message(_Eng(), "diff", "recent") == \
+        "Fix the thing that was broken"
+
+
+# ── R256: /copy-last must cover the whole turn, not just its last message ──
+def _tool_turn():
+    """A real back-and-forth turn: narrate → call → narrate → call → answer
+    → short wrap-up. The substantive reply is the SECOND-TO-LAST message,
+    which is the normal shape and the one that used to be dropped."""
+    return [
+        {"role": "user", "content": "earlier question"},
+        {"role": "assistant", "content": "earlier answer"},
+        {"role": "user", "content": "audit the config and fix what's broken"},
+        {"role": "assistant", "content": "I'll start by reading the config.",
+         "tool_calls": [{"id": "1", "type": "function",
+                         "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "content": "x" * 5000},      # a big result
+        {"role": "assistant", "content": "base_url is wrong. Checking the server.",
+         "tool_calls": [{"id": "2", "type": "function",
+                         "function": {"name": "run_command", "arguments": "{}"}}]},
+        {"role": "tool", "content": "connection refused"},
+        {"role": "assistant", "content": "THE ANALYSIS the user actually wants"},
+        {"role": "assistant", "content": "Done."},
+    ]
+
+
+def test_last_turn_messages_starts_at_the_last_prompt(tmp_path, monkeypatch):
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = _tool_turn()
+    got = e.last_turn_messages()
+    assert got[0]["content"] == "I'll start by reading the config."
+    assert got[-1]["content"] == "Done."
+    assert not any(m.get("content") == "earlier answer" for m in got)
+
+
+def test_copy_last_keeps_every_reply_of_the_turn(tmp_path, monkeypatch):
+    """The reported bug: a turn that went back and forth copied as the
+    prompt plus one reply. `last_response()` returns the FINAL assistant
+    message, and on a tool turn that is usually a short wrap-up — so the
+    reply the user wanted ("THE ANALYSIS") was dropped."""
+    from aurora import ui
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = _tool_turn()
+    out = ui._last_turn_answer_text(e)
+
+    for said in ("I'll start by reading the config.",
+                 "base_url is wrong. Checking the server.",
+                 "THE ANALYSIS the user actually wants", "Done."):
+        assert said in out, f"dropped: {said!r}"
+    assert out.index("I'll start") < out.index("THE ANALYSIS") < out.index("Done.")
+
+
+def test_copy_last_names_the_tool_calls_but_not_their_output(tmp_path, monkeypatch):
+    """Calls are kept so the narration still parses — "checking the server
+    next" followed straight by a conclusion reads as a non-sequitur. Results
+    are not: one can be 60KB of machine output (`tools.TOOL_OUTPUT_LIMIT`)."""
+    from aurora import ui
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = _tool_turn()
+    out = ui._last_turn_answer_text(e)
+
+    assert "→ read_file" in out and "→ run_command" in out
+    assert "x" * 5000 not in out and "connection refused" not in out
+
+
+def test_copy_last_does_not_reach_back_into_the_previous_turn(tmp_path, monkeypatch):
+    from aurora import ui
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = _tool_turn()
+    assert "earlier answer" not in ui._last_turn_answer_text(e)
+
+
+def test_copy_last_survives_a_turn_that_never_produced_a_final_reply(tmp_path, monkeypatch):
+    """Stopped at the approval gate or capped on iterations: the turn ends on
+    a tool-call-only message. `last_response()` returned that message's empty
+    text, so /copy-last reported "no such response" for a turn the user had
+    actually watched happen."""
+    from aurora import ui
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = [
+        {"role": "user", "content": "do the thing"},
+        {"role": "assistant", "content": "Starting now.",
+         "tool_calls": [{"id": "1", "type": "function",
+                         "function": {"name": "run_command", "arguments": "{}"}}]},
+    ]
+    out = ui._last_turn_answer_text(e)
+    assert "Starting now." in out and "→ run_command" in out
+    assert e.last_response() == "Starting now."      # unchanged for /copy
+
+
+def test_copy_last_still_includes_the_prompt_and_all_thinking(tmp_path, monkeypatch):
+    """R124's contract is unchanged — this only widens the response half."""
+    from aurora import ui
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = _tool_turn()
+
+    class _FE:
+        think_buffer = "round1… round2… round3…"
+        _tui = None
+
+    out = ui._raw_last_response_text(e, _FE())
+    assert "[prompt]" in out and "audit the config" in out
+    assert "[thinking]" in out and "round2…" in out
+    assert "THE ANALYSIS the user actually wants" in out
+
+
+def test_copy_last_is_empty_when_there_is_nothing_to_copy(tmp_path, monkeypatch):
+    from aurora import ui
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = []
+    assert ui._last_turn_answer_text(e) == ""
+
+
+def test_copy_response_takes_only_the_final_reply(tmp_path, monkeypatch):
+    """R256's narrow counterpart: same "last turn" scope as /copy-last, but
+    only what the model finally said — no prompt, no thinking, no tool
+    markers."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = _tool_turn()
+    out = e.last_turn_final_reply()
+    assert out == "Done."
+    assert "→ read_file" not in out and "I'll start by reading" not in out
+
+
+def test_copy_response_skips_a_trailing_tool_call_with_no_text(tmp_path, monkeypatch):
+    """A turn stopped at the approval gate, or capped on iterations, ends on
+    a tool-call-only assistant message. `last_response()` returns that
+    message's empty text, so plain /copy hands back nothing for a turn the
+    user watched happen."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = [
+        {"role": "user", "content": "do the thing"},
+        {"role": "assistant", "content": "Here is what I found: the answer."},
+        {"role": "tool", "content": "result"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "1", "type": "function",
+                         "function": {"name": "run_command", "arguments": "{}"}}]},
+    ]
+    assert e.last_response() == ""                    # the old, empty answer
+    assert e.last_turn_final_reply() == "Here is what I found: the answer."
+
+
+def test_copy_response_never_reaches_into_the_previous_turn(tmp_path, monkeypatch):
+    """Scoped to the last turn: a turn that produced no text at all must
+    report nothing rather than silently copying an older answer."""
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "an older answer"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "1", "type": "function",
+                         "function": {"name": "run_command", "arguments": "{}"}}]},
+    ]
+    assert e.last_turn_final_reply() == ""
+
+
+def test_the_two_copy_last_commands_are_both_registered():
+    """The pair has to be discoverable: /copy-last is the full turn,
+    /copy-response is just the reply, and the blurbs must say which."""
+    from aurora import ui
+    assert "copy-last" in ui.COMMAND_INFO and "copy-response" in ui.COMMAND_INFO
+    assert "FULL" in ui.COMMAND_INFO["copy-last"]
+    assert "final reply" in ui.COMMAND_INFO["copy-response"]
+
+
+def test_explain_is_the_only_caller_that_opts_into_reasoning(tmp_path, monkeypatch):
+    """R257: the fallback belongs where the reasoning is prose the user
+    reads. Pinning the split so a future edit can't quietly widen it back."""
+    import inspect
+
+    from aurora import agent, engine, gitcommit
+    assert "reasoning_fallback=True" in inspect.getsource(agent._explain_tool_call)
+    for src in (inspect.getsource(gitcommit.draft_message),
+                inspect.getsource(engine.Engine._maybe_auto_compact)
+                if hasattr(engine.Engine, "_maybe_auto_compact") else ""):
+        assert "reasoning_fallback" not in src

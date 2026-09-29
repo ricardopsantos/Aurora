@@ -52,6 +52,9 @@ _RATE_LIMIT_BACKOFF = (1.0, 3.0)
 # silently for minutes on a turn the user is watching.
 _RATE_LIMIT_BACKOFF_CAP = 30.0
 
+# R290: how long a probe failure keeps an endpoint out of rotation.
+_DEAD_URL_BACKOFF_S = 120.0
+
 # same cadence cancellable_sse polls at — short enough that Esc feels
 # immediate, long enough not to spin
 _CANCEL_POLL_S = 0.15
@@ -485,6 +488,8 @@ class OpenAICompatProvider(Provider):
         # worker (turn) and the UI thread (status-render /props probes)
         self._working_url: str | None = None
         self._working_url_at: float = 0.0
+        # R290: url -> time.time() until which a failed probe is trusted
+        self._dead_until: dict[str, float] = {}
 
     @property
     def _client(self) -> httpx.Client:
@@ -549,7 +554,13 @@ class OpenAICompatProvider(Provider):
         base = url.removesuffix("/v1")
         path = "/" if self._is_ollama() else "/props"
         try:
-            h = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            # R245: `_auth_headers`, not a hand-rolled header — it is the one
+            # place that knows `api_key: none` (the keyless-server convention
+            # this config invites) means NO key, not a literal bearer token
+            # called "none". Probing with `Bearer none` gets a 401 from any
+            # server that validates the token, so `pick_endpoint` marks a
+            # perfectly healthy endpoint dead and fails over off it.
+            h = self._auth_headers()
             # R95h: reuse this endpoint's pooled client. A bare `httpx.get`
             # built a fresh client — and so a fresh TCP+TLS handshake — for
             # every probe, which is most of what a probe costs.
@@ -572,12 +583,23 @@ class OpenAICompatProvider(Provider):
                 and time.time() - self._working_url_at < 10):
             self.base_url = self._working_url
             return self._working_url
-        for url in urls:
+        # R290: skip an endpoint that failed its probe recently, while any
+        # other is still a candidate. The list is re-probed IN ORDER every
+        # time the 10s cache expires — i.e. before nearly every agent round —
+        # and a dead first URL (off-LAN, Tailscale down) costs its whole
+        # connect budget each time: measured 6.5s per probe (2s × the
+        # transport's retries), so a 10-round turn paid ~65s just probing.
+        now = time.time()
+        candidates = [u for u in urls if self._dead_until.get(u, 0.0) <= now] \
+            or urls                   # all marked dead: try them all anyway
+        for url in candidates:
             if self._probe(url):
+                self._dead_until.pop(url, None)
                 self._working_url = url
                 self._working_url_at = time.time()
                 self.base_url = url
                 return url
+            self._dead_until[url] = time.time() + _DEAD_URL_BACKOFF_S
         # nothing reachable — pin first URL and let the next request fail
         self._working_url = urls[0]
         self._working_url_at = 0.0
@@ -654,6 +676,38 @@ class OpenAICompatProvider(Provider):
         except Exception:
             return None
 
+    def model_health(self, model: str) -> dict | None:
+        """R254: per-model check for the `/model` picker. Only local/LAN
+        backends get one — a remote paid API's bad-model-id only surfaces as
+        a 4xx on first real use, and probing every entry there on every
+        picker open would mean a real billed-provider request per row.
+
+        Ollama can have a config entry for a model that was never actually
+        `ollama pull`ed (or was later removed) — `/api/tags`, not `/api/show`,
+        is the check: `/api/show` 404s the same way for "server unreachable"
+        and "model not installed", which would mislabel a live server's
+        missing model as a connectivity problem. llama.cpp (the `local`
+        sentinel) has no such per-model concept — whatever's loaded IS
+        "local" — so the only meaningful check there is reachability."""
+        if not _is_lan_host(self.base_url) and not self._is_ollama():
+            return None
+        url = self.pick_endpoint(cache_ok=True)
+        if not self._probe(url):
+            return {"ok": False, "detail": "unreachable"}
+        if not self._is_ollama():
+            return {"ok": True, "detail": ""}
+        try:
+            r = self._client_for(url).get(
+                f"{url.removesuffix('/v1')}/api/tags", timeout=4,
+                headers=self._auth_headers())
+            r.raise_for_status()
+            names = {m.get("name") for m in r.json().get("models", [])}
+        except Exception:
+            return {"ok": False, "detail": "unreachable"}
+        if model not in names:
+            return {"ok": False, "detail": "not pulled"}
+        return {"ok": True, "detail": ""}
+
     def context_limit(self, model: str) -> int:
         listed = REMOTE_CONTEXT_LIMITS.get(model, {}).get("context_size")
         return self.live_context_limit(model) or listed or super().context_limit(model)
@@ -667,9 +721,15 @@ class OpenAICompatProvider(Provider):
         """Whether a real cost estimate is possible — only when the model is
         listed in remote_context_limits.json WITH price fields (local/
         unlisted models have no known $/token, and showing a "$0.00" badge
-        for them would misleadingly imply Aurora knows it's free)."""
-        entry = REMOTE_CONTEXT_LIMITS.get(model, {})
-        return "price_in_per_mtok" in entry and "price_out_per_mtok" in entry
+        for them would misleadingly imply Aurora knows it's free).
+
+        R247: asks `price_for`, which is what `cost_for` actually prices
+        with, instead of testing that the two KEYS exist. A hand-edited
+        entry carrying `"price_in_per_mtok": null` satisfied key-presence
+        while `cost_for` returned None for it — so the badge claimed a real
+        figure and rendered the `0.0` fallback, i.e. "$0.00", for a model
+        whose price is simply unknown. One predicate, one answer."""
+        return price_for(model) is not None
 
     def cost(self, model: str, inp: int, out: int, cached: int = 0) -> float:
         """R192: `cached` is the part of `inp` the provider served from its
@@ -894,6 +954,15 @@ class OpenAICompatProvider(Provider):
                     f"unparseable tool arguments for {slot['name'] or '?'}: {raw[:200]}") from e
             if not slot["name"]:
                 raise MalformedToolCall(f"tool call with no name: {raw[:200]}")
+            # R268: valid JSON is not enough — every consumer (approval,
+            # deny/allow matching, loop detection) treats arguments as a
+            # mapping. A list/string/number here used to raise AttributeError
+            # AFTER the assistant tool_calls message was appended, leaving an
+            # orphaned tool_call that poisoned every later request.
+            if not isinstance(args, dict):
+                raise MalformedToolCall(
+                    f"tool arguments for {slot['name']} are not a JSON object: "
+                    f"{raw[:200]}")
             result.tool_calls.append(
                 ToolCall(slot["id"] or f"call_{i}", slot["name"], args))
         return result

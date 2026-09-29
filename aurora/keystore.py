@@ -144,7 +144,10 @@ def get_key(env_var: str, interactive: bool = True) -> str | None:
     val = _prompter(f"Enter {env_var} (input hidden, empty to skip): ")
     if not val:
         return None
-    store_key(env_var, val)
+    try:
+        store_key(env_var, val)
+    except KeystoreError:
+        pass   # R304: not stored, but still usable for this session
     return val
 
 
@@ -197,6 +200,16 @@ def store_key(env_var: str, value: str) -> str:
                  if not (aurora_home() / _ENC_FILE).exists()
                  else "Aurora key-store passphrase: ")
         pw = _prompter(label).encode()
+        # R304: an empty passphrase used to be accepted when CREATING the
+        # store, but reading treats an empty entry as "skip" — so a store made
+        # with Enter could never be opened again. Refused up front instead.
+        if not pw:
+            raise KeystoreError("an empty passphrase can't protect the key store")
+        # R304: a NEW store's passphrase is typed twice — a typo there made
+        # every key stored under it unrecoverable.
+        if label.startswith("Choose") and \
+                _prompter("Repeat the passphrase: ").encode() != pw:
+            raise KeystoreError("passphrases don't match — key not stored")
         _passphrase_cache["pw"] = pw
     # R201: a decrypt failure here used to be swallowed, leaving `data` as
     # `{}` — and the save below then replaced the WHOLE store with just this
