@@ -1,7 +1,7 @@
 """Happy Eyeballs (RFC 8305) for httpx sync clients.
 
 Why: a host with both A and AAAA records on a machine whose public IPv6 route
-is dead (common when Tailscale is up — public IPv6 blackholes) makes every
+is dead (common when a VPN is up — public IPv6 blackholes) makes every
 connection burn the whole connect timeout stalling on IPv6 before falling back
 to IPv4 (measured 17s vs 0.15s against OpenRouter). The correct fix is not to
 disable IPv6 (that breaks IPv6-only networks) but to race the address families

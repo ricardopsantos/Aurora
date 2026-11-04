@@ -11,7 +11,7 @@ providers:
     type: openai
     # `base_url` can be a single endpoint OR a list; Aurora tries them in
     # order and uses the first one that responds. Useful if your local
-    # llama.cpp server is reachable both over LAN and a VPN/tailnet.
+    # llama.cpp server is reachable both over LAN and a VPN.
     base_url: http://localhost:8080/v1
     api_key_env: LLAMA_API_KEY   # unset/blank if your server needs no key
   # R223: Ollama needs `type: ollama`, not `type: openai` — its chat API is
@@ -29,14 +29,10 @@ models:
     model: local            # whatever your local server currently has loaded
     tools: true
   - provider: ollama
-    # must match `ollama list`'s NAME:TAG exactly. Verified live against a
-    # real Ollama server (2026-08-26): Ollama's model listing can claim
-    # "tools" capability for a model that then never actually emits a
-    # structured tool call — qwen2.5-coder:3b consistently printed the call
-    # as plain JSON text instead (3/3 tries) despite being marked
-    # tools-capable. The Qwen3 family (tested: qwen3:1.7b) reliably emits
-    # real tool calls — prefer it over Qwen2.5 for an Ollama backend Aurora
-    # will actually use tools with.
+    # must match `ollama list`'s NAME:TAG exactly. Ollama can mark a model
+    # tools-capable that never emits a structured tool call (qwen2.5-coder:3b
+    # printed the call as plain JSON text); the Qwen3 family emits real ones,
+    # so prefer it for an Ollama backend Aurora will use tools with.
     model: qwen3:1.7b
     tools: true
   - provider: openrouter
@@ -74,6 +70,20 @@ runtime:
   auto_compact: true
   auto_compact_threshold_pct: 80
   compact_keep_recent_tokens: 20000
+  # Daily spending cap in USD across remote models; 0 = no cap. /budget sets it.
+  daily_budget_usd: 0
+  # Switch to the next model in `models:` when the current one fails.
+  # /fallback on|off toggles + persists here.
+  model_fallback: false
+  # Enter inserts a newline and Alt+Enter submits. /multiline toggles + persists.
+  multiline: false
+  # Render replies as Markdown in the terminal.
+  render_markdown: true
+  # Show the model's reasoning as it streams.
+  show_thinking: false
+  # SHA-256 hashes of secret-scan hits you chose to allow. Managed by
+  # `/redact allowlist [clear]`; never put the secrets themselves here.
+  secret_allowlist: []
 
 # R119: MCP (Model Context Protocol) servers, stdio transport only. Each
 # server's tools are exposed to the model as mcp_<name>_<tool>, gated by the

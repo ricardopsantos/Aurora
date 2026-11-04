@@ -60,11 +60,11 @@ HELP = f"""\
                       to config.yaml and switch to it
 {CYAN}/model remove <name>{RESET}  remove a configured model (URL or exact name; `rm`
                       works too) — removing the current one falls back
-{BOLD}Alt+M{RESET}               toggle multiline mode (Enter inserts a newline;
+{BOLD}Alt+M{RESET}                 toggle multiline mode (Enter inserts a newline;
                       Alt+Enter submits)
 {BOLD}\\n{RESET} / {BOLD}\\br{RESET}              type these in prose to insert a newline
 {BOLD}Ctrl+J{RESET}                insert a newline
-{BOLD}?{RESET}                    open this help menu (on an empty prompt)
+{BOLD}?{RESET}                     open this help menu (on an empty prompt)
 {BOLD}Esc{RESET}                   TUI only — press twice within 2s to open a Yes/No
                       question: cancel busy work · leave bash mode · quit
                       (idle, empty prompt). A single Esc still clears input /
@@ -73,19 +73,20 @@ HELP = f"""\
 {CYAN}/compact  /clear{RESET}      summarize-and-continue · start fresh
 {CYAN}/reset{RESET}                clear history + system prompt; offers to re-run /bootstrap
 {CYAN}/copy [N]{RESET}             copy Nth-last response to the clipboard (SSH-safe)
-{CYAN}/copy-last{RESET}            copy last turn's RAW response, thinking included (SSH-safe)
-{CYAN}/copy-all{RESET}             copy the whole chat, questions included, to the clipboard (SSH-safe)
-{CYAN}/redact on|off{RESET}         secret-in-prompt/tool-output detection (default ON, persisted)
+{CYAN}/copy-last{RESET}            copy last turn: prompt, thinking, every reply (tool calls as markers)
+{CYAN}/copy-turn{RESET}            copy last turn with each tool's command and full output (SSH-safe)
+{CYAN}/copy-all{RESET}             copy the whole session — questions, answers, commands, output (SSH-safe)
+{CYAN}/redact on|off{RESET}        secret-in-prompt/tool-output detection (default ON, persisted)
 {CYAN}/status{RESET}               is the current model's backend up and ready?
 {CYAN}/cost{RESET}                 per-model token + $ breakdown across EVERY session on this
                       machine — for one session's breakdown, {CYAN}/context <id>{RESET}
-{CYAN}/cache on|off{RESET}          prompt caching: mark the system prompt cacheable so the
+{CYAN}/cache on|off{RESET}         prompt caching: mark the system prompt cacheable so the
                       bootstrap preamble isn't re-billed every tool iteration
 {CYAN}/autocompact on|off{RESET}   silently fold older history once context nears the limit
 {CYAN}/fallback on|off{RESET}      retry a failed turn on the next configured model
                       (off by default); recent turns stay raw, /compact
                       still folds everything on demand
-{CYAN}/thinking{RESET}            toggle live dim reasoning stream (TUI: click a
+{CYAN}/thinking{RESET}             toggle live dim reasoning stream (TUI: click a
                       "thought for Ns" row to expand/collapse it any time)
 {CYAN}/markdown{RESET}             toggle pretty rendering (bold/code/bullets) vs raw text
 {CYAN}/allowlist{RESET}            show the persistent approval allowlist
@@ -104,7 +105,7 @@ HELP = f"""\
 {CYAN}/bootstrap{RESET}            run the saved bootstrap prompt (set/show/clear to manage;
                       set accepts a local file OR a URL — startup offers
                       cached vs re-download for a URL-sourced prompt)
-{CYAN}/nano <file>{RESET}           TUI only — open a text file (.txt/.md/.json/.yml/
+{CYAN}/nano <file>{RESET}          TUI only — open a text file (.txt/.md/.json/.yml/
                       .yaml/.xml/.sh, up to 1MB) in the built-in editor;
                       clicking a matching filename in bash-mode output
                       opens it the same way
@@ -244,9 +245,19 @@ class TerminalFrontend:
             print(f"  {BOLD}{V(args.get('path', ''))}{RESET}")
         if diff:
             print(colour_diff(V(diff)))
+        # R335: say how far "always" reaches before it is saved
+        try:
+            _rule, _scope = approve.rule_scope(tool, args)
+        except Exception:
+            _rule, _scope = "", ""
+        _always = "Always allow this (remember)"
+        if _rule:
+            _always += f" — saves `{V(_rule)}` ({_scope})"
         key = select("Approve?", [
             ("y", "Yes, run once"),
-            ("a", "Always allow this (remember)"),
+            ("o", "Yes, and turn auto-approve ON (this session)"),
+            ("t", "Allow for this session only (not saved)"),
+            ("a", _always),
             ("n", "No, skip"),
             ("d", "Always DENY this (blocklist — never ask again)"),
             ("s", "Stop the agent"),
@@ -687,7 +698,7 @@ def _pick_model(engine: Engine, fe: TerminalFrontend,
         lock = threading.Lock()
         threads = []
         for m in models:
-            provider = engine._provider_for(m)
+            provider = engine.probe_provider_for(m)
             fn = getattr(provider, "model_health", None) if provider else None
             if not callable(fn):
                 continue
@@ -745,7 +756,7 @@ def _pick_model(engine: Engine, fe: TerminalFrontend,
                     # 4s timeout against a dead local server, freezing picker
                     # construction before the menu even renders. Serves cache
                     # (or None the first time) and refreshes in the background.
-                    provider = engine._provider_for(m)
+                    provider = engine.probe_provider_for(m)
                     live = engine._live_model_name_nonblocking(provider)
                 if live:
                     name = f"local {DIM}→ {live}{RESET}"
@@ -784,7 +795,12 @@ def _pick_model(engine: Engine, fe: TerminalFrontend,
               f"one{RESET}")
         return
     prompt = "Select model"
-    options = [(str(i), label) for i, (label, _) in enumerate(entries, 1)]
+    # R341: a last row to add a model without leaving the picker. Not offered
+    # for a deferred pick (on_pick): adding switches the model at once, which
+    # must not happen under a running turn.
+    add_row = [] if on_pick is not None else [("add", f"{CYAN}+ add a model…{RESET}"
+                                               f"  {dim('OpenRouter URL or org/model')}")]
+    options = [(str(i), label) for i, (label, _) in enumerate(entries, 1)] + add_row
 
     # feature request, 2026-08-03: the picker's prices used to be whatever was
     # last written to remote_context_limits.json (by `/model add` or the
@@ -798,7 +814,8 @@ def _pick_model(engine: Engine, fe: TerminalFrontend,
     def _relabel():
         fresh, _ = _build_entries()
         fe.update_menu_labels(
-            prompt, [(str(i), label) for i, (label, _) in enumerate(fresh, 1)])
+            prompt, [(str(i), label) for i, (label, _) in enumerate(fresh, 1)]
+            + add_row)
 
     openai_compat.refresh_prices_in_background(
         # same "is this an OpenRouter model" test the labels use above, not
@@ -828,6 +845,11 @@ def _pick_model(engine: Engine, fe: TerminalFrontend,
     chosen = select(prompt, options, default_index=current_index)
     if chosen is None:   # TUI: menu dismissed (e.g. a second click on the
         return            # status bar's model name) — no change
+    if chosen == "add":
+        raw = input(f"{YELLOW}OpenRouter model URL or org/model:{RESET} ").strip()
+        if raw:
+            _add_model_cmd(engine, raw)
+        return
     idx = int(chosen) - 1
     _, payload = entries[idx]
 
@@ -862,6 +884,78 @@ def _parse_openrouter_model(arg: str) -> str | None:
     return model_id
 
 
+def _try_cmd(engine: Engine, fe: TerminalFrontend, arg: str) -> None:
+    """R342: `/try <task>` — the turn runs in a sandbox worktree; afterwards
+    show the diff and ask: apply it to the real tree, keep the sandbox, or
+    discard."""
+    from . import trybox
+    if not arg.strip():
+        print("· usage: /try <task> — runs in a throwaway git worktree")
+        return
+    try:
+        sb = trybox.create(".")
+    except trybox.TryError as e:
+        print(f"{RED}✗ {e}{RESET}")
+        return
+    print(dim(f"· sandbox: {sb.path}"))
+    task = (f"{arg.strip()}\n\n[You are working in an isolated copy of the repository at "
+            f"{sb.cwd}. Use relative paths; changes elsewhere are not part of "
+            "this trial.]")
+    try:
+        trybox.run_in(sb, lambda: _send_turn(engine, fe, task))
+        patch = trybox.diff(sb)
+    except Exception as e:
+        print(f"{RED}✗ {e}{RESET} — sandbox kept at {sb.path}")
+        return
+    if not patch.strip():
+        print("· the trial changed nothing — sandbox removed")
+        trybox.discard(sb)
+        return
+    print(colour_diff(patch if len(patch) < 20000 else
+                      trybox.diff(sb, stat_only=True)))
+    choice = select("Apply this trial to your working tree?", [
+        ("apply", "Apply — copy these changes into the real tree"),
+        ("discard", "Discard — delete the sandbox"),
+        ("keep", "Keep the sandbox for now (cd there, or /try again)"),
+    ], eof_key="keep")
+    try:
+        if choice == "apply":
+            print(f"· {trybox.apply(sb)}")
+        elif choice == "discard":
+            trybox.discard(sb)
+            print("· discarded")
+        else:
+            print(f"· kept: {sb.path}")
+    except trybox.TryError as e:
+        print(f"{RED}✗ {e}{RESET}")
+
+
+def _budget_cmd(engine: Engine, arg: str) -> None:
+    """R340: `/budget` shows; `/budget 2` caps this session at $2;
+    `/budget day 5` caps each day at $5 (persisted); `/budget off` and
+    `/budget day off` clear them."""
+    words = arg.split()
+    try:
+        if words and words[0].lower() == "day" and len(words) == 2:
+            engine.set_daily_budget(0.0 if words[1].lower() == "off" else float(words[1]))
+        elif len(words) == 1:
+            engine.set_session_budget(0.0 if words[0].lower() == "off" else float(words[0]))
+        elif words:
+            raise ValueError
+    except ValueError:
+        print("· usage: /budget [<usd>|off] | /budget day <usd>|off")
+        return
+
+    def line(label, spent, cap):
+        return (f"· {label}: ${spent:.2f} of ${cap:.2f}" if cap > 0
+                else f"· {label}: ${spent:.2f} (no limit)")
+    print(line("this session", engine._cost, engine.session_budget))
+    print(line("today", engine.spent_today(), engine.daily_budget))
+    if not (engine.session_budget or engine.daily_budget):
+        print(dim("· nothing is capped — OpenRouter spend is unlimited until you "
+                  "set one (free/local models cost $0)"))
+
+
 def _add_model_cmd(engine: Engine, arg: str) -> None:
     """`/model add <url-or-id>` (R80): append the model to config.yaml under
     the `openrouter` provider and switch to it. If OPENROUTER_API_KEY isn't
@@ -893,7 +987,12 @@ def _add_model_cmd(engine: Engine, arg: str) -> None:
     if env and not engine.has_key("openrouter"):
         _prompt_and_store_key(engine, env)
         engine.forget_key_check("openrouter")
-    entry, created = engine.add_model(model_id)
+    from . import modelcfg
+    try:
+        entry, created = engine.add_model(model_id)
+    except modelcfg.EditError as e:          # R423: a layout the text editor refuses to touch
+        print(f"· {e}")
+        return
     print(f"· added {model_id} to config.yaml" if created
           else f"· {model_id} is already configured")
     if info and any(info.get(k) for k in
@@ -929,7 +1028,12 @@ def _remove_model_cmd(engine: Engine, arg: str) -> None:
         print("· usage: /model remove <https://openrouter.ai/<org>/<model> "
               "| model name>")
         return
-    removed, new_current = engine.remove_model(model_id)
+    from . import modelcfg
+    try:
+        removed, new_current = engine.remove_model(model_id)
+    except modelcfg.EditError as e:          # R423
+        print(f"· {e}")
+        return
     if not removed:
         print(f"· {model_id} is not in config.yaml — /model lists what is")
         return
@@ -953,18 +1057,22 @@ COMMAND_INFO = {
     "clear":     "start fresh — history cleared",
     "reset":     "clear history + system prompt; offers /bootstrap",
     "copy":      "copy Nth-last response to the clipboard",
-    "copy-last": "copy last turn IN FULL — prompt, thinking, every reply",
+    "copy-last": "copy last turn: prompt, thinking, every reply (tool calls as markers)",
+    "copy-turn": "copy last turn: everything — also each tool's command and full output",
     "copy-response": "copy just the model's final reply from the last turn",
-    "copy-all":  "copy the whole chat (questions + answers) to the clipboard",
+    "copy-all":  "copy the whole session (questions, answers, commands, output)",
     "redact":    "secret detection on|off · allowlist [clear] (persisted)",
     "cost":      "per-model token + $ breakdown across every session on this machine",
     "context":   "cost tree — this session as turns, tokens, tools and $",
     "cache":     "prompt caching on|off — stops re-billing the system prompt",
     "autocompact": "silently fold older history near the context limit on|off",
     "fallback":  "retry a failed turn on the next configured model on|off (persisted)",
+    "try":       "<task> — run it in a throwaway git worktree, then apply or discard the diff",
+    "budget": "[$] [day $] — spend caps: stop a turn at this session / daily USD limit",
+    "plan": "on|off — read-only exploration: gated tools are refused so the model writes a plan first",
     "auto-approve": "on|off — skip the approval prompt for every gated tool "
                     "call (denylist + secrets still apply, not persisted)",
-    "allowlist": "show the persistent approval allowlist",
+    "allowlist": "show the approval allowlist · audit/prune stale rules",
     "denylist":  "show tool calls always denied by policy",
     "rewind":    "restore the working tree to a pre-mutation checkpoint",
     "undo":      "revert just the last mutation, not the whole tree (see /rewind)",
@@ -1004,9 +1112,17 @@ COMMANDS = list(COMMAND_INFO)
 # file and qualifies; it writes a fresh transcript, not shared session state.
 SIDE_SAFE_COMMANDS = frozenset({
     "status", "cost", "context", "diff", "skills", "extensions",
-    "allowlist", "denylist", "copy", "copy-last", "copy-all", "export",
+    "allowlist", "denylist", "plan", "auto-approve", "budget", "try", "copy", "copy-last", "copy-turn", "copy-all", "export",
     "help", "sessions",
 })
+
+
+# R348: settings flipped by `on|off` (or just shown, with no argument). They set
+# a flag the next request reads and never touch history, so they apply
+# instantly mid-turn instead of queueing behind the thing they configure.
+# `/thinking` and `/markdown` are display-only toggles.
+LIVE_TOGGLES = frozenset({"fallback", "multiline", "redact", "cache", "autocompact"})
+LIVE_DISPLAY_TOGGLES = frozenset({"thinking", "markdown"})
 
 
 def side_safe_command(line: str) -> bool:
@@ -1020,6 +1136,10 @@ def side_safe_command(line: str) -> bool:
     cmd, arg = cmd.strip().lower(), arg.strip().lower()
     if arg in ("help", "man") and cmd in COMMAND_INFO:
         return True
+    if cmd in LIVE_DISPLAY_TOGGLES:
+        return True
+    if cmd in LIVE_TOGGLES:
+        return arg in ("", "on", "off")
     return cmd in SIDE_SAFE_COMMANDS
 
 
@@ -1065,14 +1185,20 @@ class SlashCompleter(Completer):
         entries = dict(COMMAND_INFO)
         for name, blurb in self._skill_entries().items():
             entries.setdefault(name, blurb)
-        for name, info in sorted(entries.items(), key=lambda kv: kv[0].lower()):
-            if name.startswith(prefix):
-                if empty:
-                    yield Completion(f"/{name}", start_position=0,
-                                     display=f"/{name}", display_meta=info)
-                else:
-                    yield Completion(name, start_position=-len(prefix),
-                                     display_meta=info)
+        ordered = sorted(entries.items(), key=lambda kv: kv[0].lower())
+        # R318: prefix hits first, then names that merely CONTAIN the typed
+        # text (`/ert` offers `qwertyuio`), so the old top choice stays on top
+        hits = ([kv for kv in ordered if kv[0].startswith(prefix)]
+                + [kv for kv in ordered
+                   if prefix and not kv[0].startswith(prefix)
+                   and prefix.lower() in kv[0].lower()])
+        for name, info in hits:
+            if empty:
+                yield Completion(f"/{name}", start_position=0,
+                                 display=f"/{name}", display_meta=info)
+            else:
+                yield Completion(name, start_position=-len(prefix),
+                                 display_meta=info)
 
 
 # ── /bootstrap ────────────────────────────────────────────────────────────
@@ -1456,7 +1582,32 @@ def _last_turn_answer_text(engine: Engine) -> str:
     return "\n\n".join(parts)
 
 
-def _raw_last_response_text(engine: Engine, fe: TerminalFrontend) -> str:
+def _last_turn_everything_text(engine: Engine) -> str:
+    """`/copy-turn`: `_last_turn_answer_text` plus what the tools did — each
+    call as the command/arguments that ran, then its output in full. No cap:
+    this is the copy to reach for when the output is the point."""
+    parts: list[str] = []
+    for msg in engine.last_turn_messages():
+        if msg.get("role") == "tool":
+            out = msg.get("content")
+            parts.append(f"```\n{out if isinstance(out, str) else ''}\n```")
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        text = _assistant_text(msg).strip()
+        if text:
+            parts.append(text)
+        for call in msg.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            name = fn.get("name") or call.get("name")
+            if name:
+                parts.append(sessions.format_tool_call(
+                    name, fn.get("arguments", call.get("arguments"))))
+    return "\n\n".join(parts)
+
+
+def _raw_last_response_text(engine: Engine, fe: TerminalFrontend,
+                            everything: bool = False) -> str:
     """Last turn's RAW record (R124): the prompt that started it, the
     reasoning (if any), then everything the model said (R256 — the whole
     turn, not just its final message). Unlike `/copy`/`engine.
@@ -1464,7 +1615,8 @@ def _raw_last_response_text(engine: Engine, fe: TerminalFrontend) -> str:
     the one place either is allowed to leave the buffer/history."""
     prompt = engine.last_prompt()
     think = fe.think_buffer
-    answer = _last_turn_answer_text(engine)
+    answer = (_last_turn_everything_text(engine) if everything
+              else _last_turn_answer_text(engine))
     parts = []
     if prompt:
         parts.append(f"[prompt]\n{prompt}")
@@ -1621,6 +1773,13 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
         else:
             suffix = " (thinking included)" if label == "raw response" else ""
             print(f"· {label}{suffix} copied via {clipboard.copy(text)}")
+    elif cmd == "copy-turn":
+        text = _outbound(_raw_last_response_text(engine, fe, everything=True))
+        if not text:
+            print("· no such response")
+        else:
+            print(f"· whole last turn (thinking, commands and output included) "
+                  f"copied via {clipboard.copy(text)}")
     elif cmd == "copy-response":
         # R256: the narrow counterpart to /copy-last. Same "last turn" scope,
         # but only what the model finally said — no prompt, no thinking, no
@@ -1719,6 +1878,19 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
             if engine.auto_approve else "OFF"
         print(f"· auto-approve {state} (this session only — "
               f"denylist rules and secret detection still apply)")
+    elif cmd == "budget":
+        _budget_cmd(engine, arg)
+    elif cmd == "try":
+        _try_cmd(engine, fe, arg)
+    elif cmd == "plan":
+        if arg.lower() in ("on", "off"):
+            engine.plan_mode = arg.lower() == "on"
+        elif arg:
+            print("· usage: /plan on|off")
+            return True
+        print("· plan mode ON — the model can read and explore, but nothing "
+              "that needs approval runs; /plan off to let it act"
+              if engine.plan_mode else "· plan mode OFF")
     elif cmd == "multiline":
         engine.set_multiline(not engine.multiline)
         print(f"· multiline {'ON' if engine.multiline else 'OFF'} "
@@ -1733,8 +1905,28 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
         h = engine.provider_health()
         mark = f"{GREEN}✔{RESET}" if h["ok"] else f"{RED}✘{RESET}"
         print(f"  {mark} {engine.current.get('model')} — {h['detail']}")
+        for line in diagnosis_lines(engine, h):
+            print(line)
+    elif cmd == "allowlist" and arg.strip().lower() in ("audit", "prune"):
+        found = approve.audit()
+        if not found:
+            print("· allowlist is clean — nothing to prune")
+        for tool, rows in found.items():
+            print(f"  {tool}:")
+            for rule, why in rows:
+                print(f"    - {rule}   {dim(why)}")
+        if found and arg.strip().lower() == "prune":
+            if input("remove these rules? [y/N] ").strip().lower() == "y":
+                print(f"· removed {approve.prune()} rule(s)")
+        elif found:
+            print(dim("· /allowlist prune removes them (you will be asked to approve "
+                      "those commands again)"))
     elif cmd == "allowlist":
         data = approve.load()
+        for k, v in approve.session_rules().items():       # R334
+            print(f"  {k} (this session only):")
+            for rule in v:
+                print(f"    - {rule}")
         legacy = set(approve.legacy_rules(data))
         for k, v in data.items():
             print(f"  {k}:")
@@ -1874,6 +2066,10 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
             # the OTHER entry point, a mouse click racing an unrelated
             # command — would always find "itself" busy and self-block.
             tui.open_nano(Path(arg).expanduser(), check_busy=False)
+    elif "/" in cmd:
+        # A skill name never contains "/", so `/Users/x/photo.jpg copy it`
+        # is a pasted absolute path opening a normal prompt, not a command.
+        _run_turn(engine, fe, line)
     else:  # /name args → a skill (R11), or a doc skill (R247)
         base_dir = engine.cfg.get("_base_dir")
         if cmd in skills.discover(base_dir):
@@ -1885,7 +2081,7 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
 
 def _run_doc_skill(engine: Engine, fe: TerminalFrontend, name: str,
                    arg: str) -> None:
-    """R247: `/name` for a Markdown SKILL.md (Claude Code/Hermes-shaped,
+    """R247: `/name` for a Markdown SKILL.md (Claude Code-shaped,
     discovered via `doc_skill_roots`) — unlike an executable skill there is
     nothing to subprocess, so the body is fed to the model as a real,
     tool-enabled turn instead of being printed. Same mechanism `/bootstrap`
@@ -1903,7 +2099,46 @@ def _run_doc_skill(engine: Engine, fe: TerminalFrontend, name: str,
     _run_turn(engine, fe, text, is_bootstrap=False)
 
 
-def _banner(engine: Engine) -> None:
+# R347: commands that Enter on a lone suggestion must only TYPE (then wait):
+# the ones that take parameters, and the ones that destroy or commit something.
+TYPED_ONLY_COMMANDS = frozenset({
+    "redact", "cache", "autocompact", "fallback", "try", "budget", "plan",
+    "auto-approve", "search", "nano", "commit",           # take parameters
+    "clear", "reset", "undo", "rewind", "quit", "exit",   # destroy / leave
+})
+
+
+def _offer_model_picker(engine: Engine, fe, health: dict) -> None:
+    """R345: the default model failed its startup check — open the model picker
+    right away (rows already carry per-model health warnings) so the user can
+    switch; Esc / blank keeps going. Never raises: a broken picker must not
+    stop the session from starting."""
+    if not health or health.get("ok") or not engine.list_models():
+        return
+    try:
+        print(dim("· pick another model to start with, or Esc to keep this one"))
+        _pick_model(engine, fe)
+    except Exception:
+        pass
+
+
+def diagnosis_lines(engine: Engine, health: dict) -> list[str]:
+    """R345: the `cause:` / `fix:` lines under a failed model line (empty when
+    the backend is fine). Shared by the startup header (both front ends) and
+    `/status`, so they always say the same thing."""
+    try:
+        d = engine.diagnosis_for(health)
+    except Exception:
+        return []
+    if d is None:
+        return []
+    from . import diagnose
+    return [line.replace("cause:", f"{YELLOW}cause:{RESET}", 1)
+                .replace("fix:  ", f"{YELLOW}fix:{RESET}  ", 1)
+            for line in diagnose.render(d)]
+
+
+def _banner(engine: Engine) -> dict:
     """Clear the screen and show a compact session card at startup."""
     import os
 
@@ -1922,6 +2157,7 @@ def _banner(engine: Engine) -> None:
                   f"  model    {BOLD}{engine.current.get('model') or '(none)'}"
                   f"{RESET}  "
                   f"{mark} {dim(h['detail'])}",
+                  *diagnosis_lines(engine, h),
                   f"  cwd      {os.getcwd()}",
                   f"  session  {engine.session.id}"
                   + (dim(f"  ({len(engine.messages)} messages resumed)")
@@ -1933,6 +2169,7 @@ def _banner(engine: Engine) -> None:
                           + dim("  (/extensions for details)"))
     print("\n".join(info_lines))
     print()
+    return h
 
 
 # ── main loop ─────────────────────────────────────────────────────────────
@@ -1944,7 +2181,8 @@ def run(engine: Engine) -> None:
 
     # the agent starts with NO project knowledge — only the user's saved
     # bootstrap prompt (below) introduces any init ritual
-    _banner(engine)
+    health = _banner(engine)
+    _offer_model_picker(engine, fe, health)
 
     # startup ask: fires whenever a non-empty bootstrap prompt exists;
     # skipped when resuming (--continue) — the session already has context

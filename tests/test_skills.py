@@ -203,7 +203,7 @@ def test_listing_includes_blurb(tmp_path, monkeypatch):
 
 # ── doc skills (R247) ─────────────────────────────────────────────────────
 # A second skill kind: a Markdown SKILL.md (frontmatter + prose), the same
-# shape Claude Code and Hermes both use. discover_docs()/load_doc() only run
+# shape Claude Code and similar agents use. discover_docs()/load_doc() only run
 # against directories the CALLER names via doc_roots — no path on this
 # machine or any other is ever assumed.
 
@@ -317,3 +317,13 @@ def test_listing_executable_skill_shadows_doc_skill_of_same_name(tmp_path, monke
     assert out.count("/dup") == 1
     assert "the real one" in out
     assert "the doc version" not in out
+
+
+def test_path_like_slash_line_is_a_prompt(monkeypatch):
+    """R312: `/abs/path.jpg do x` goes to the model, not the skill lookup."""
+    from aurora import ui
+    sent = []
+    monkeypatch.setattr(ui, "_run_turn", lambda e, f, text, **k: sent.append(text))
+    line = "/Users/x/Downloads/a.jpg do a copy"
+    assert ui._handle_command(None, None, line) is True
+    assert sent == [line]

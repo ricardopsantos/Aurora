@@ -124,6 +124,14 @@ class _FakeEngine:
     multiline = False
     auto_approve = False    # R262 (read by the status bar)
     _last_resp = ""
+    _steer: list = []
+
+    def add_steer(self, text):          # R348
+        self._steer.append(text)
+
+    def take_steer(self):
+        out, self._steer[:] = list(self._steer), []
+        return out
 
     def context_stats(self):
         return _Stats()
@@ -154,6 +162,7 @@ class _FakeEngine:
 @pytest.fixture
 def t(monkeypatch):
     # Application() builds fine headless; only .run() needs a terminal
+    monkeypatch.setattr(tui.Tui, "_cols", lambda self: 120)   # R331: fixed width
     return tui.Tui(_FakeEngine())
 
 
@@ -1001,7 +1010,7 @@ def test_copy_menu_defaults_to_the_selection_when_there_is_one(t):
     should do it. Order stays fixed so the digit shortcuts don't shift."""
     _focus_input(t)
     t._copy_menu_click()(_mouse_up())
-    assert t._menu_options[t._menu_index][0] == "last"   # no selection
+    assert t._menu_options[t._menu_index][0] in ("response", "last")   # no selection
     t._resolve_menu([k for k, _ in t._menu_options].index("cancel"))
     t.input.buffer.text = "hello"
     _click_input(t)
@@ -1009,8 +1018,9 @@ def test_copy_menu_defaults_to_the_selection_when_there_is_one(t):
     t._copy_menu_click()(_mouse_up())
     assert t._menu_options[t._menu_index][0] == "selected"
     # R256 added the "response" row between "last" and "session"
-    assert [k for k, _ in t._menu_options][:4] == [
-        "last", "response", "session", "id"]
+    # R317 then put "response" first and added "turn"
+    assert [k for k, _ in t._menu_options][:5] == [
+        "response", "last", "turn", "session", "id"]
 
 
 def test_copy_menu_reports_a_selection_that_vanished(t, monkeypatch):
@@ -4013,11 +4023,12 @@ def test_command_help_is_side_safe_for_any_command():
     assert not ui.side_safe_command("/reset")
 
 
-def test_plain_prompt_becomes_a_quick_ask_while_busy(t):
+def test_ask_command_becomes_a_quick_ask_while_busy(t):
     """The screenshot's "are you there?" — answered now, on the side channel,
-    instead of queueing behind the command it is asking about."""
+    instead of queueing behind the command it is asking about (R348: it is
+    `/ask` now; plain Enter queues, Ctrl+Enter injects)."""
     t._busy = True
-    t._route_submitted_line("are you there?")
+    t._route_submitted_line("/ask are you there?")
     assert t._inbox.qsize() == 0
     assert t._side_inbox.get_nowait() == ("ask", "are you there?")
 
@@ -4252,7 +4263,7 @@ def test_a_prompt_is_handed_back_when_the_turn_ended_before_it_ran(t):
     both give a worse answer and drop a real task out of the conversation for
     good, since a side turn is never written to history."""
     t._busy = True
-    t._route_submitted_line("fix the failing test for me")
+    t._route_submitted_line("/ask fix the failing test for me")
     assert t._side_inbox.qsize() == 1
     t._busy = False                       # the turn finished in the meantime
 
@@ -4431,13 +4442,30 @@ def test_the_side_indicator_survives_the_turn_it_started_behind(t):
     assert "side" not in "".join(f[1] for f in _status_frags(t))
 
 
-def test_the_copy_menu_names_both_copy_last_variants(t):
-    """R256: "copy last" was ambiguous in the one way that mattered — it
-    takes the whole turn, and a user who wanted just the answer had no row.
-    Both are named now, and the new row sits next to the one it qualifies."""
-    labels = list(t._COPY_LABELS.values())
-    assert "copy last (full)" in labels and "copy last (response)" in labels
-    assert t._COPY_LABELS["last"] == "copy last (full)"
+def test_the_copy_menu_names_what_each_copy_contains(t):
+    """R256/R317: "copy last (full)" said nothing about what "full" held. Each
+    row now says its contents, and the three last-turn rows run from least to
+    most."""
+    assert list(t._COPY_LABELS.values())[:4] == [
+        "copy last turn: answer only", "copy last turn: prompt + replies",
+        "copy last turn: everything", "copy whole session"]
+
+
+def test_the_copy_menu_turn_row_copies_commands_and_output(t, monkeypatch):
+    from aurora import clipboard
+    copied = []
+    monkeypatch.setattr(clipboard, "copy",
+                        lambda text: copied.append(text) or "test-clipboard")
+    t.engine.last_prompt = lambda: "disk?"
+    t.engine.last_turn_messages = lambda: [
+        {"role": "assistant", "content": "checking",
+         "tool_calls": [{"id": "1", "type": "function", "function": {
+             "name": "run_command", "arguments": '{"command": "df -h /home"}'}}]},
+        {"role": "tool", "content": "/dev/nvme0n1p4 207G"},
+        {"role": "assistant", "content": "152G free"},
+    ]
+    t._resolve_copy_menu("turn")
+    assert "df -h /home" in copied[0] and "/dev/nvme0n1p4 207G" in copied[0]
 
 
 def test_the_copy_menu_response_row_copies_only_the_final_reply(t, monkeypatch):
@@ -4483,7 +4511,7 @@ def test_a_prompt_keeps_its_place_when_the_side_channel_is_busy(t):
 def test_a_prompt_still_rides_the_side_channel_when_it_is_free(t):
     """The fix must not disable the feature: a free channel still answers."""
     t._busy, t._side_busy = True, False
-    t._route_submitted_line("are you there?")
+    t._route_submitted_line("/ask are you there?")
     assert t._inbox.qsize() == 0
     assert t._side_inbox.get_nowait() == ("ask", "are you there?")
 
@@ -4569,3 +4597,116 @@ def test_alt_enter_still_submits_in_multiline_with_short_timeout():
     t_._route_submitted_line = got.append
     _run_with_keys(t_, [(0, "hello"), (0.05, "\x1b\r")])
     assert got == ["hello"]
+
+
+def test_fmt_secs():
+    assert [tui._fmt_secs(n) for n in (0, 59, 60, 61, 709, 3600)] == [
+        "0s", "59s", "1:00", "1:01", "11:49", "60:00"]
+
+
+# ── R347: Enter with ONE suggestion chooses it ─────────────────────────────
+def _type_cmd(t, text):
+    t.input.buffer.text = text
+    t.input.buffer.cursor_position = len(text)
+
+
+def test_enter_on_a_lone_paramless_suggestion_runs_it(t):
+    sent = []
+    t._route_submitted_line = sent.append
+    _type_cmd(t, "/mod")
+    _press(t, Keys.Enter)
+    assert sent == ["/model"]
+    assert t.input.buffer.text == ""
+
+
+def test_enter_on_a_lone_suggestion_that_takes_params_only_types_it(t):
+    sent = []
+    t._route_submitted_line = sent.append
+    _type_cmd(t, "/auto-a")
+    _press(t, Keys.Enter)
+    assert sent == []                                  # waits for the params
+    assert t.input.buffer.text == "/auto-approve "
+    assert t.input.buffer.cursor_position == len("/auto-approve ")
+
+
+def test_destructive_commands_are_only_typed_never_run(t):
+    sent = []
+    t._route_submitted_line = sent.append
+    _type_cmd(t, "/rese")
+    _press(t, Keys.Enter)
+    assert sent == [] and t.input.buffer.text == "/reset "
+
+
+def test_a_complete_command_name_is_not_a_fragment(t):
+    _type_cmd(t, "/model")
+    assert t._sole_command_completion() is None
+
+
+def test_several_suggestions_do_not_pick_one(t):
+    _type_cmd(t, "/co")
+    assert t._sole_command_completion() is None
+
+
+def test_no_help_in_bash_mode_args_or_plain_text(t):
+    _type_cmd(t, "/mod")
+    t._bash_mode = True
+    assert t._sole_command_completion() is None
+    t._bash_mode = False
+    _type_cmd(t, "hello")
+    assert t._sole_command_completion() is None
+    _type_cmd(t, "/model add x")
+    assert t._sole_command_completion() is None
+
+
+def test_every_typed_only_name_is_a_real_command():
+    from aurora import ui
+    assert ui.TYPED_ONLY_COMMANDS <= set(ui.COMMAND_INFO)
+
+
+# ── R348: Enter queues, Ctrl+Enter injects ─────────────────────────────────
+
+def test_plain_enter_queues_while_busy_and_ctrl_enter_injects(t):
+    t._busy = True
+    t._route_submitted_line("run it after")
+    assert t._inbox.get_nowait() == "run it after"
+    assert t.engine.take_steer() == []
+    t._route_submitted_line("use rg, not grep", force=True)
+    assert t._inbox.qsize() == 0
+    assert t.engine.take_steer() == ["use rg, not grep"]
+
+
+def test_stop_typed_while_busy_cancels_instead_of_queueing(t):
+    t._busy = True
+    for word in ("stop", " Stop ", "/stop"):
+        t.fe.cancel_event.clear()
+        t._route_submitted_line(word)
+        assert t.fe.cancel_event.is_set()
+        assert t._inbox.qsize() == 0
+
+
+def test_ctrl_enter_on_empty_line_injects_queued_prompts(t):
+    t._busy = True
+    t._route_submitted_line("first")
+    t._route_submitted_line("second")
+    assert t._inject_queued() is True
+    assert t.engine.take_steer() == ["first", "second"]
+    assert t._inbox.qsize() == 0
+    assert t._inject_queued() is False
+
+
+def test_ctrl_enter_on_empty_line_runs_queued_commands_now(t):
+    t._busy = True
+    t._route_submitted_line("/clear")
+    t._route_submitted_line("then this")
+    t.fe.cancel_event.clear()
+    assert t._inject_queued() is True
+    assert t.fe.cancel_event.is_set()              # /clear can't run beside the turn
+    assert [t._inbox.get_nowait(), t._inbox.get_nowait()] == ["/clear", "then this"]
+    assert t.engine.take_steer() == []
+
+
+def test_ctrl_enter_sequences_are_bound_to_one_key():
+    from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+
+    from aurora import tui
+    assert ANSI_SEQUENCES["\x1b[13;5u"] == ANSI_SEQUENCES["\x1b[27;5;13~"] == tui._CTRL_ENTER_KEY

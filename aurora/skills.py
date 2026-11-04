@@ -7,7 +7,7 @@ venv's python. The first line's trailing comment (after `#`) is its blurb.
 
 R247: a SECOND kind of skill, alongside the executable one above — a plain
 Markdown "doc skill" (frontmatter `name:`/`description:` + prose body, the
-same SKILL.md shape Claude Code and Hermes both already use). It has no
+same SKILL.md shape Claude Code and similar agents already use). It has no
 interpreter to run, so `/name` for one of these does not subprocess — see
 `ui._handle_command`'s fallback, which loads the body and feeds it to the
 model as a real turn via `_run_turn`, the same mechanism `/bootstrap`
@@ -156,7 +156,7 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 def discover_docs(doc_roots: list[str] | None = None) -> dict[str, Path]:
     """name -> path to its SKILL.md, found recursively under each root
     (Claude Code's are nested by category, e.g. SKILLS/meta/plan/SKILL.md;
-    Hermes' are flat). Earlier roots shadow later ones; same
+    other agents' are flat). Earlier roots shadow later ones; same
     permission/TOCTOU tolerance as discover() — an unreadable root
     contributes nothing rather than raising.
 
@@ -256,5 +256,6 @@ def run(name: str, args: str, config_base: str | None = None) -> str:
         return f"[skill error: {e}]"
     if code is None:
         msg = f"[skill timeout after {_SKILL_TIMEOUT}s]"
-        return f"{out}\n{msg}" if out else msg
-    return (out.strip() or "[no output]") + (f"\n[exit {code}]" if code else "")
+        return f"{tools._squeeze(out)}\n{msg}" if out else msg      # R310
+    return (tools._squeeze(out.strip()) or "[no output]") + (
+        f"\n[exit {code}]" if code else "")

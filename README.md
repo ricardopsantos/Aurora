@@ -2,14 +2,12 @@
 
 <img src="images/base_logo.png" alt="Aurora logo" width="120" align="right">
 
-Micro terminal coding agent — OpenRouter / a local llama.cpp server / a
-local Ollama server, with a tool loop, approval gates, session logs, and
-support for the
-[`.agentic_context`](https://github.com/ricardopsantos/AgenticContext)
-protocol via its MCP server (`agentic_context_mcp`, configured in
-`config.yaml`'s `mcp_servers:`).
+Aurora is a micro terminal coding agent. It talks to OpenRouter, a local
+llama.cpp server or a local Ollama server, and has a tool loop, approval
+prompts, session logs and MCP servers (set in `config.yaml` under
+`mcp_servers:`).
 
-> A micro terminal coding agent — small enough to read, complete enough to
+> A micro terminal coding agent, small enough to read and complete enough to
 > use every day. Named after my beautiful two-year-old daughter Aurora,
 > always with her hair bow.
 
@@ -21,6 +19,7 @@ protocol via its MCP server (`agentic_context_mcp`, configured in
 - [Install](#install-macos-or-linux)
 - [Keys](#keys)
 - [Run](#run)
+- [Web version](#web-version-aurora-lite)
 - [Daily use](#daily-use)
 - [Layout](#layout)
 - [Tests](#tests)
@@ -28,50 +27,57 @@ protocol via its MCP server (`agentic_context_mcp`, configured in
 
 ## Quick orientation
 
-**Start every session oriented** — save a bootstrap prompt once and Aurora
-offers to run it at every boot (a good default ships in
-[`documents/bootstrap.example.md`](documents/bootstrap.example.md)); see
-**[documents/FEATURES.md](documents/FEATURES.md#session-bootstrap)** for how.
+Save a bootstrap prompt once and Aurora offers to run it every time it
+starts, so each session begins already knowing the project. A good default
+is in [`documents/bootstrap.example.md`](documents/bootstrap.example.md);
+[documents/FEATURES.md](documents/FEATURES.md#session-bootstrap) explains how
+to set it up.
 
-**What Aurora gives you, in short:** secret scanning on every prompt and
-tool output before it ever reaches the model or a log; every write/edit/
-command previewed and approval-gated, with a shadow-git snapshot before
-each so `/rewind` can undo any step; one `/model` menu across OpenRouter and
-a local llama.cpp or Ollama server, models added by pasting a URL; prompt caching and
-concurrent read-only tool calls so a multi-step task doesn't quietly burn
-tokens; a full-screen TUI with streaming markdown, collapsible thinking
-blocks and mouse support; resumable/exportable sessions, `/compact`; and a
-plain-`.py` extension API (MCP client + lint checker bundled).
+In short, Aurora:
 
-Full detail, screenshots and the reasoning behind each — see
-**[documents/FEATURES.md](documents/FEATURES.md)**.
+- scans every prompt and tool output for secrets before it reaches the model
+  or a log;
+- shows a preview of every write, edit or command and asks before running it,
+  and takes a shadow git snapshot first, so `/rewind` can undo any step;
+- has one `/model` menu for OpenRouter and a local llama.cpp or Ollama server;
+  you add a model by pasting its URL;
+- uses prompt caching and runs read-only tool calls in parallel, so a
+  multi-step task doesn't burn tokens;
+- runs as a full-screen TUI with streaming Markdown, collapsible thinking
+  blocks and mouse support;
+- can resume, export and `/compact` sessions;
+- loads extensions from plain `.py` files (an MCP client and a lint checker
+  are included).
+
+[documents/FEATURES.md](documents/FEATURES.md) has the full details, the
+screenshots and the reasons behind each feature.
 
 ## Install (macOS or Linux)
 
-Recommended — one line, runs from anywhere, no manual `cd` into a checkout:
+The easiest way is one line, from any folder:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ricardopsantos/Aurora/main/bootstrap-install.sh | bash
 ```
 
-Clones into `~/Aurora` (override with `AURORA_DIR=/path ...`), then runs
-`install.sh` for you — including, on first install, offering to set up an
-API key interactively if none is configured yet. Or do it by hand:
+It clones into `~/Aurora` (change it with `AURORA_DIR=/path ...`) and runs
+`install.sh`. On a first install it also offers to set up an API key if you
+don't have one yet. To do it by hand:
 
 ```bash
 git clone https://github.com/ricardopsantos/Aurora.git Aurora
-cd Aurora && ./install.sh     # prompts for the data dir (default ~/.aurora)
-                               # first run also creates config.yaml from
-                               # config.yaml.example if you don't have one yet,
+cd Aurora && ./install.sh     # asks for the data folder (default ~/.aurora)
+                               # the first run also creates config.yaml from
+                               # config.yaml.example if you don't have one,
                                # and offers to set up an API key if none is set
 ```
 
-Machine sync is just `git pull` (then re-run
-`./.venv/bin/pip install -e . -q` if dependencies changed). `config.yaml`
-holds providers/models/endpoints — some checkouts commit a shared one,
-others gitignore it as machine-specific; either way, `./install.sh` creates
-it from `config.yaml.example` if it's missing. Keys never live in config at
-all — always env/keyring, via `aurora key set`.
+To update, run `git pull`, then `./.venv/bin/pip install -e . -q` if the
+dependencies changed. `config.yaml` holds providers, models and endpoints.
+Some checkouts commit a shared one and others ignore it as machine-specific;
+either way, `./install.sh` creates it from `config.yaml.example` if it's
+missing. Keys are never stored in the config. They live in environment
+variables or the OS keyring, set with `aurora key set`.
 
 ## Keys
 
@@ -81,11 +87,11 @@ aurora key set OPENROUTER_API_KEY  # openrouter.ai/keys
 aurora key status                 # is a key set, and where from?
 ```
 
-No OpenRouter key? Aurora still works — only the paid remote models are
-unusable; pick your local model with `/model`. A local llama.cpp or Ollama
-server needs no key either — see `config.yaml.example`'s `ollama:` entry
-(`type: ollama`). Full key table, `key_fetch:` and `aurora wipe` — see
-**[documents/KEYS.md](documents/KEYS.md)**.
+Without an OpenRouter key Aurora still works, but you can't use the paid
+remote models; pick your local model with `/model`. A local llama.cpp or
+Ollama server needs no key either (see the `ollama:` entry, `type: ollama`,
+in `config.yaml.example`). The full key table, `key_fetch:` and `aurora wipe`
+are in [documents/KEYS.md](documents/KEYS.md).
 
 ## Run
 
@@ -94,34 +100,89 @@ aurora                # start in the current project (knows nothing until you /b
 aurora --continue     # resume the last session
 aurora --resume ID    # resume a specific session
 aurora --classic      # inline REPL instead of the full-screen TUI
+aurora -t "task"      # one-shot, no prompts; exit 0 ok / 1 incomplete / 2 usage error (see --man)
 aurora my-config.yaml # alternate config
 aurora --man          # full man-style manual
 ```
 
+## Web version (Aurora Lite)
+
+The same agent runs in a browser, on a desktop or a phone.
+
+![Aurora Lite in a desktop browser: chats, Notes, Files and search in the sidebar, a finished turn on the local model](images/Features/aurora.web.chat.png)
+
+### Start it
+
+```bash
+export AURORA_WEB_TOKEN=$(openssl rand -hex 16)   # required; paste it into the page once
+aurora --web                                      # http://127.0.0.1:9592
+```
+
+Options: `--bind ADDR`, `--port N`, `--workspace DIR` (default: the current
+folder). Keep the loopback bind and put a TLS proxy in front. The page can
+run tools, so read [SECURITY.md](SECURITY.md) first.
+
+### What you get
+
+- A sidebar of chats with search, rename, delete and drag-and-drop folders.
+  You can download any chat as one HTML file.
+- Markdown notes in Personal, Work and Skills tabs, with tickable `- [ ]`
+  tasks. Type `#` in the message box to send a note to Aurora.
+- Attach or drop files, including music and video up to 200 MB, and browse
+  them under Input and Outputs with a preview.
+- A Commands menu to resume a session, see the diff of the last turn, or
+  undo it.
+- Tap the model name to switch models, refresh prices or edit the model list.
+  Aurora checks the list before saving and keeps the last 5 versions.
+- A meter shows how full the context is, and the session clears itself at
+  90%.
+- Tool calls run without asking by default (auto-approve; the denylist still
+  blocks). Turn it off in Settings > Chat and each call asks yes, no or stop.
+
+### Three layouts
+
+| URL | Style |
+|---|---|
+| `/` | Chat (default, like Open WebUI) |
+| `/paper` | One narrow column with a menu drawer |
+| `/v1` | The original desktop layout |
+
+### Running it as a service
+
+There is an example unit in `deploy/aurora-web.service.example`. After an
+update, run `deploy/restart-web.sh`, or `deploy/install-hooks.sh` to restart
+on every pull.
+
+Optional extras switch themselves off when something is missing. Voice input
+needs `ffmpeg` and a whisper server at `AURORA_WEB_STT_URL`. Skill folders
+and MCP servers come only from your own `config.yaml`.
+
+Details and requirement numbers are in [REQUIREMENTS.md](REQUIREMENTS.md).
+
 ## Daily use
 
-The essentials — full command table, the status bar layout, and the Esc
-double-tap control rule are in
-**[documents/COMMANDS.md](documents/COMMANDS.md)**.
+[documents/COMMANDS.md](documents/COMMANDS.md) has the full command table,
+the status bar layout and the rule for the Esc key (press it twice).
 
 | Input | Action |
 |---|---|
-| plain text | talk to the model; writes/commands ask approval first |
+| plain text | talk to the model; writes and commands ask first |
 | `/model` | switch between OpenRouter and local models |
 | `/cost` · `/context [id]` | spend across all sessions · this session's cost tree |
-| `/compact` · `/clear` · `/reset` | summarize-and-continue · start fresh · full reset |
-| `/rewind [id]` | list/restore a pre-edit checkpoint |
-| `/resume` · `/search <text>` | pick a past session · find one by content |
-| **Esc** (twice) | the control key — cancel/leave-mode/quit, see below |
-| **?** or `/help` | open the help menu |
+| `/compact` · `/clear` · `/reset` | summarize and continue · start fresh · full reset |
+| `/rewind [id]` | list or restore a checkpoint taken before an edit |
+| `/resume` · `/search <text>` | pick a past session · find one by its content |
+| Esc (twice) | cancel, leave a mode or quit |
+| `?` or `/help` | open the help menu |
 
 ## Layout
 
-Engine (state, providers, tools, agent loop) and UI (prompt_toolkit REPL) are
-strictly split — the only contract is `aurora/frontend.py`'s `Frontend`
-protocol, and `tests/test_architecture.py` enforces the boundary. Swap the UI
-(HTML, websocket) by implementing `Frontend`; the engine is untouched. Full
-writeup: **[documents/ARCHITECTURE.md](documents/ARCHITECTURE.md)**.
+The engine (state, providers, tools, agent loop) and the UI (a
+prompt_toolkit REPL) are kept apart. The only contract between them is the
+`Frontend` protocol in `aurora/frontend.py`, and `tests/test_architecture.py`
+enforces the boundary. To swap the UI (HTML, websocket), implement
+`Frontend`; the engine doesn't change. The full write-up is in
+[documents/ARCHITECTURE.md](documents/ARCHITECTURE.md).
 
 ## Tests
 
@@ -131,38 +192,31 @@ writeup: **[documents/ARCHITECTURE.md](documents/ARCHITECTURE.md)**.
 
 ## Other documents
 
-Everything below `README.md` lives in **[documents/](documents/)**:
+Everything except this README is in [documents/](documents/):
 
-- **[CHANGELOG_TECHNICAL.md](documents/CHANGELOG_TECHNICAL.md)** — the
-  canonical spec: every numbered requirement (R1+, currently through R306),
-  build plan and test plan, written before the code and kept in sync with
-  behaviour. When any doc disagrees with it, this one wins. (Formerly
-  `AURORA.md`.)
-- **[ARCHITECTURE.md](documents/ARCHITECTURE.md)** — the *how*: engine/UI
-  boundary, module map, data flow, threading, persistence.
-- **[FEATURES.md](documents/FEATURES.md)** — full feature writeups with
+- [CHANGELOG_TECHNICAL.md](documents/CHANGELOG_TECHNICAL.md): the original
+  spec, with requirements R1 to R293, the build plan and the test plan. It's
+  kept as a record.
+- [ARCHITECTURE.md](documents/ARCHITECTURE.md): how it's built. The
+  engine/UI boundary, module map, data flow, threads and storage.
+- [FEATURES.md](documents/FEATURES.md): every feature in detail, with
   screenshots.
-- **[COMMANDS.md](documents/COMMANDS.md)** — the full daily-use command
-  table, status bar layout, and the Esc double-tap rule.
-- **[KEYS.md](documents/KEYS.md)** — the full key table and `key_fetch:`.
-- **[LOCAL_MODEL_NOTES.md](documents/LOCAL_MODEL_NOTES.md)** — running
-  against a local llama.cpp server.
-- **[EXTENSIONS.md](documents/EXTENSIONS.md)** — writing a `.py` tool
-  extension.
-- **[REQUIREMENTS_OVERVIEW.md](documents/REQUIREMENTS_OVERVIEW.md)** — a
-  short, stable high-level index into `CHANGELOG_TECHNICAL.md`'s requirement
-  groups. (Formerly `REQUIREMENTS.md`.)
-- **[CHANGELOG.md](documents/CHANGELOG.md)** — human-readable release notes
-  (not to be confused with `CHANGELOG_TECHNICAL.md` above).
-- **[bootstrap.example.md](documents/bootstrap.example.md)** — the default
-  session-start bootstrap prompt.
+- [COMMANDS.md](documents/COMMANDS.md): the full command table, the status
+  bar and the Esc rule.
+- [KEYS.md](documents/KEYS.md): the full key table and `key_fetch:`.
+- [LOCAL_MODEL_NOTES.md](documents/LOCAL_MODEL_NOTES.md): using a local
+  llama.cpp server.
+- [EXTENSIONS.md](documents/EXTENSIONS.md): writing a `.py` tool extension.
+- [MCP_SERVERS.md](documents/MCP_SERVERS.md): adding MCP servers to
+  `config.yaml`.
+- [REQUIREMENTS_OVERVIEW.md](documents/REQUIREMENTS_OVERVIEW.md): a short
+  map of the requirement groups.
+- [CHANGELOG.md](documents/CHANGELOG.md): release notes for people.
+- [bootstrap.example.md](documents/bootstrap.example.md): the default
+  bootstrap prompt.
 
-Plus, at the repo root, **[REQUIREMENTS.md](REQUIREMENTS.md)** — the newest
-requirements stated as testable rules, written alongside the
-`CHANGELOG_TECHNICAL.md` entry rather than instead of it. Not to be confused
-with `documents/REQUIREMENTS_OVERVIEW.md`, which is the high-level index and
-was itself once named `REQUIREMENTS.md`.
+At the repo root, [REQUIREMENTS.md](REQUIREMENTS.md) and the files under
+[requirements/](requirements/) hold the current requirements (up to R440) as
+testable rules. New requirements go there.
 
-**Rule: README, `CHANGELOG_TECHNICAL.md` and `ARCHITECTURE.md` must stay in
-sync with the code — any behaviour change ships with its doc update in the
-same commit.**
+The README, the requirements and `ARCHITECTURE.md` must match the code. Any change in behaviour ships with its doc update in the same commit.

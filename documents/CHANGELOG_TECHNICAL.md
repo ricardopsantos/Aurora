@@ -1,13 +1,14 @@
-# Aurora — micro terminal coding agent
+# Aurora: technical changelog and original spec
 
-> **Repo = source of truth.** Runs on macOS and Linux; synced between
-> machines via git. This document is the full specification: agreed
-> requirements, build plan, test plan, and usage — written **before** the
-> first line of code, and updated as the build progresses.
+> This is the original specification of Aurora: the agreed requirements,
+> build plan and test plan, written before the code, then extended as it was
+> built. It covers R1 to R293 and is kept as a record.
 >
-> **STATUS (2026-07-10): v0.1.0 — all seven phases built, tested, and live.**
-> Everything added beyond the original R1–R24 is specified in
-> **§5 As-built additions**. Quick-start lives in README.md.
+> Requirements from R294 on (and R223 to R293 restated as testable rules)
+> are in [`REQUIREMENTS.md`](../REQUIREMENTS.md) and the files under
+> [`requirements/`](../requirements/). Add new requirements there, not here.
+> The README has the quick start, and [`ARCHITECTURE.md`](ARCHITECTURE.md)
+> explains how the code fits together.
 
 ---
 
@@ -31,16 +32,16 @@
   its OpenAI-compatible API, optionally over TLS with a bearer key (see R23).
   Aurora consumes **whatever model is currently loaded**; it never launches
   or manages `llama-server` itself.
-- **R3.** *(Removed 2026-07-23 — LlamaDesk integration torn out; the
+- **R3.** *(Removed 2026-07-23 — the model manager integration torn out; the
   picker no longer has a "library" section, only configured models.)*
-  ~~Optional local model **library switching via LlamaDesk** (a companion
+  ~~Optional local model **library switching via the model manager** (a companion
   loading agent, `/api/models`, `/api/status`, `/api/switch`): the picker
   shows Anthropic models ($), the currently-loaded local model (free,
-  ready), and the LlamaDesk library (free, needs a ~1–2 min load). Loading a
+  ready), and the model manager library (free, needs a ~1–2 min load). Loading a
   library model requires an explicit **eviction confirm** (a switch is
   global — it unloads the model for every other consumer of that server) and
   checks for in-flight work first. Not configured? The picker just shows the
-  local/Anthropic/OpenRouter models from `config.yaml` — LlamaDesk is
+  local/Anthropic/OpenRouter models from `config.yaml` — the model manager is
   entirely optional (see the commented block in `config.yaml`).~~
 - **R4.** Fast switching: `/model` picker. Cross-provider switches flatten
   history to a plain-text transcript (tool blocks don't translate 1:1 between
@@ -71,7 +72,7 @@
   `/agentic_report` — was replaced by the `agentic_context_mcp` MCP server,
   which exposes the same operations as regular approval-gated MCP tools
   instead of hardcoded Aurora code. See `config.yaml`'s `mcp_servers:`.)*
-  ~~**agentic_context protocol** (see `~/repositories/AgenticContext`): when
+  ~~**agentic_context protocol** (an external context-folder project): when
   the cwd has `.agentic_context/`, Aurora bootstraps it at start —
   `AGENTS.md` (rules AND personality; the user shapes who Aurora is through
   the context system, not code), the three `INDEX.md`s, `[CORE]` docs,
@@ -139,8 +140,8 @@
   with startup passphrase ④ prompt once and offer to store. Never plaintext
   on disk.
 - **R23.** Requests to a local model should be encrypted **in transit** if
-  the server is reachable over a network at all — a VPN/tailnet
-  (e.g. Tailscale/WireGuard) end-to-end, TLS via a reverse proxy in front of
+  the server is reachable over a network at all — a VPN/VPN
+  (e.g. VPN) end-to-end, TLS via a reverse proxy in front of
   it, and llama-server's own native `--api-key` bearer auth are the
   recommended layers. No hand-rolled crypto, ever. (How you wire this up is
   specific to your own server setup — Aurora only needs a `base_url` and,
@@ -206,7 +207,7 @@ Phases (each ended runnable) — **all seven DONE**:
 1. ✅ **Scaffold + V2 port** — config, providers (chat only), session logging, REPL echo loop.
 2. ✅ **Agent loop** — tools, approval+allowlist+diff, 5-iteration gate, Esc cancel. Anthropic only.
 3. ✅ **Local provider** — llama.cpp tool calling, malformed-call degrade, `/props` ctx.
-4. ✅ **Local-server auth wiring** (2026-07-10) — llama-server `--api-key`, a bearer-token gate added to the optional LlamaDesk integration's `/api/switch` (it had none; fine for a browser UI, not for a programmatic client that can flip the GPU's model).
+4. ✅ **Local-server auth wiring** (2026-07-10) — llama-server `--api-key`, a bearer-token gate added to the optional the model manager integration's `/api/switch` (it had none; fine for a browser UI, not for a programmatic client that can flip the GPU's model).
 5. ✅ **UI polish** — footer, `/model` picker w/ library + eviction confirm, multiline, `/copy`, `?` help overlay.
 6. ✅ **Context** — bootstrap, `open_context_doc`, `/compact`, `/clear`, 80% warning, prompt caching.
 7. ✅ **Keystore + install.sh + web search + `/export`/`--continue` + README.**
@@ -235,10 +236,10 @@ Manual/integration — local path, switching, and security items verified
 2026-07-10; the full Anthropic coding task awaits API credits:
 - **Anthropic path:** real coding task (edit a file in a scratch repo, run tests) end-to-end with approvals; footer shows tokens+cost; `/compact` mid-session and continue.
 - **Local path:** same task against a loaded local model (TLS+key); confirm a degrade-to-chat model (e.g. one without tool-calling support) degrades gracefully.
-- **Switching:** `/model` mid-conversation; library model → eviction confirm → LlamaDesk load → conversation continues.
+- **Switching:** `/model` mid-conversation; library model → eviction confirm → the model manager load → conversation continues.
 - **agentic_context:** start in a repo with `.agentic_context/` — verify bootstrap loads CORE docs, MEMORY consulted, finding written via approval gate, index rebuilt.
 - **UX:** Esc during generation and mid-tool-loop; multi-line paste of a code block; `/copy` through SSH lands on the local clipboard; `--continue` restores yesterday's session; `/export` markdown is readable.
-- **Security:** curl the local server's inference port without a key → 401; without TLS → refused; grep repo for the key → absent; LlamaDesk switch without token → 401.
+- **Security:** curl the local server's inference port without a key → 401; without TLS → refused; grep repo for the key → absent; the model manager switch without token → 401.
 
 ## 4. Install & use
 
@@ -272,9 +273,9 @@ keys incl. the optional `key_fetch` flow, daily-use table, local-model notes).
 ### Model & context awareness
 - **R28. Picker shows name · file size · max context** for every entry
   ($ = paid). `local` resolves to the actually-loaded gguf. Data comes from
-  LlamaDesk's `/api/models/detail` (native ctx via header-only `gguf-ctx.py`
+  the model manager's `/api/models/detail` (native ctx via header-only `gguf-ctx.py`
   + `size_bytes`); library loads request `min(native ctx, configured
-  llamadesk.ctx)` — never the API's 8192 default, never rope-extended.
+  model-manager.ctx)` — never the API's 8192 default, never rope-extended.
 - **R29. `/status`** — live backend health: local shows the real loaded gguf
   + running `n_ctx` from `/props`; Anthropic shows key presence; OpenRouter
   reports "remote API". Startup **banner** (clears screen) shows model +
@@ -336,9 +337,9 @@ keys incl. the optional `key_fetch` flow, daily-use table, local-model notes).
 - **R39. Status bar** = `model │ ctx used/limit (%) │ cost │ session` +
   hint line, always visible; while the worker is busy it animates
   `⠹ thinking…/generating…/working… Ns (Esc cancels)`. The context
-  limit is the LIVE server `n_ctx` (`/props`), cached 120s so a LlamaDesk
+  limit is the LIVE server `n_ctx` (`/props`), cached 120s so a model manager
   reload of the same model at a different ctx shows up within 2 minutes.
-  **`/props` is only probed for a local/tailnet llama.cpp server** — remote
+  **`/props` is only probed for a local/VPN llama.cpp server** — remote
   APIs (OpenRouter, …) have no such endpoint, so on those `live_context_limit`
   returns None immediately without a request. Probing it on a remote provider
   wasted a ~6s doomed request on the UI thread at the first status render,
@@ -374,7 +375,7 @@ keys incl. the optional `key_fetch` flow, daily-use table, local-model notes).
 - **R46. `/compact` really compacts**: the current model summarizes the
   transcript (decisions, paths/commands, open tasks, constraints) and only
   the summary is carried; plain flatten is the fallback when the model is
-  unreachable. LlamaDesk in-flight checks use `/api/switch/progress`
+  unreachable. the model manager in-flight checks use `/api/switch/progress`
   (`/api/status` has no busy flag).
 - **Performance**: TUI renders from per-entry parsed-fragment caches
   (appends no longer re-parse the whole transcript — O(n²)→O(n) over a
@@ -420,17 +421,17 @@ keys incl. the optional `key_fetch` flow, daily-use table, local-model notes).
 
 ### Upgrade surfaces (things a dependency bump can silently break)
 Incidental integration points that fail as *blank features, not errors* —
-check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
-- **llama-server `/props`**: Aurora (and LlamaDesk) read
+check these first after upgrading llama.cpp / the model manager / prompt_toolkit:
+- **llama-server `/props`**: Aurora (and the model manager) read
   `default_generation_settings.n_ctx` + `model_path` for the footer gauge
   and `/status`. `provider_health` now degrades loudly ("/props schema
   changed?") instead of showing a blank ctx. The n_ctx cache is 120s TTL —
-  LlamaDesk can reload the same gguf at a different ctx.
-- **LlamaDesk `/api/requests`** parses llama-server `print_timing` log
+  the model manager can reload the same gguf at a different ctx.
+- **the model manager `/api/requests`** parses llama-server `print_timing` log
   lines; a llama.cpp upgrade can change the format → the table goes empty.
-  Re-check the regex in llamadesk `server.py` (see memory note
-  `llama-server-contention-and-llamadesk-api-contract`).
-- **LlamaDesk `/api/metrics`** assumes current Prometheus metric names
+  Re-check the regex in model-manager `server.py` (see memory note
+  `llama-server-contention-and-model-manager-api-contract`).
+- **the model manager `/api/metrics`** assumes current Prometheus metric names
   (needs `--metrics` at launch).
 - **prompt_toolkit**: the TUI leans on 3.x internals (fragment mouse
   handlers, cursor-anchored scrolling) — pinned `<4` in pyproject; vet any
@@ -476,7 +477,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
 
 ### Last model remembered (2026-07-10, R51)
 - **R51. The selected model survives restarts.** Every `switch_model`
-  (picker, LlamaDesk library load) writes `last_model`/`last_provider` to
+  (picker, the model manager library load) writes `last_model`/`last_provider` to
   `AURORA_HOME/state.yaml` — per-machine state, deliberately NOT
   config.yaml, which is committed and synced between machines. On startup
   the entry is restored by exact config match, or (library model with no
@@ -542,7 +543,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
     as a stray grey box against the dark UI.
   - **EVERY choice challenge is a menu — never a bare text prompt.** All
     yes/no questions route through `ui.confirm(prompt, default_yes=…)` (built
-    on `select`): the bootstrap "run it?", `/reset`'s re-run, the LlamaDesk
+    on `select`): the bootstrap "run it?", `/reset`'s re-run, the model manager
     evict confirm, `/rewind`'s restore confirm, and the `key set` fetch
     confirm. The default option is listed first so it is highlighted and
     Enter picks it — preserving the old `[Y/n]` / `[y/N]` default-on-empty
@@ -676,7 +677,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
 ### `/model` picker uses the menu, marks + pre-selects the current model (2026-07-12, R59)
 - **R59. `/model` is a `select()` menu**, not raw numbered print+`input()` —
   same primitive as approvals/R58 challenges, so it gets the TUI's arrow-key
-  render for free. Every configured model + the LlamaDesk library (if
+  render for free. Every configured model + the model manager library (if
   configured) is listed alphabetically with its price tag (`[$]`/`[free]`)
   and info (context size /
   GB); the currently-active entry is marked `✔` and is what a blank Enter
@@ -706,11 +707,11 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
     review — the original `_pick_model` had the same identity check before
     R59, just with lower consequence since it only skipped a cosmetic label).
 - **`/model` must feel as instant as `/exit` (2026-07-12 bugfix).** It's a
-  local menu, not an LLM call — but it PROBES LlamaDesk (`/api/status`) first
-  to show its library, and an unreachable LlamaDesk previously blocked the
+  local menu, not an LLM call — but it PROBES the model manager (`/api/status`) first
+  to show its library, and an unreachable the model manager previously blocked the
   whole command for its full ~5s timeout (measured), reading as an
   unexplained "thinking" delay before anything a menu button. Fixed two ways:
-  a short-TTL failure cache (`_llamadesk_last_fail`, 30s) so a recently-failed
+  a short-TTL failure cache (`_model-manager_last_fail`, 30s) so a recently-failed
   probe is skipped entirely on the next `/model` — no network call, no wait
   — while still automatically retrying once the TTL expires in case the box
   came back.
@@ -836,7 +837,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   encrypted file) — an env var can't be unset from outside the shell, so
   that case just tells the user to do it themselves. `--all` iterates every
   ENV_VAR name THIS config.yaml actually uses (`_known_key_names()`: each
-  provider's `api_key_env` plus llamadesk's `token_env`), not a hardcoded
+  provider's `api_key_env` plus model-manager's `token_env`), not a hardcoded
   list, so it stays correct for whatever providers are configured.
 - **`aurora wipe`** deletes `AURORA_HOME` entirely (sessions, allowlist,
   encrypted keys, bootstrap prompt, last-model state) — logging out of every
@@ -853,27 +854,27 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
     SAME command for any check of this code.
 
 ### Standalone operation (agreed 2026-07-10)
-- **Aurora MUST work with no local server/LlamaDesk reachable** (installed
-  anywhere, off LAN and off any VPN/tailnet, e.g. running only OpenRouter
+- **Aurora MUST work with no local server/the model manager reachable** (installed
+  anywhere, off LAN and off any VPN/VPN, e.g. running only OpenRouter
   models). Verified: every backend probe is bounded (health probes capped at
-  ~5s, LlamaDesk client 5s) and degrades to a message, never a crash or a
+  ~5s, the model manager client 5s) and degrades to a message, never a crash or a
   minutes-long hang; the `/model` picker lists config models without
-  LlamaDesk; the unreachable-on-send notice **classifies local vs. remote
+  the model manager; the unreachable-on-send notice **classifies local vs. remote
   generically, never echoing the raw config-key name or a personal
   hostname** (2026-07-12 revision) — "local backend unreachable" or
   "`<public hostname>` unreachable — check your connection, or /model to
   switch," plus a `curl`-based connectivity hint the user can run themselves
   (concrete for a public remote host, since its domain isn't personal;
-  generic — no hostname — for local/LAN, since a VPN/tailnet MagicDNS name
+  generic — no hostname — for local/LAN, since a VPN/VPN MagicDNS name
   or a user's own provider-key label can itself be something personal, e.g.
   their machine's name). This matters for an open-source project: config is
   user data, never echoed back verbatim. A connectivity error is also never
   assumed to be the local backend specifically — it can be any provider. The
-  only LlamaDesk-specific conveniences lost when it's not configured are the
+  only the model manager-specific conveniences lost when it's not configured are the
   model library and live n_ctx; `key_fetch` (if configured) falls back to
   the hidden prompt.
 - **Connect timeout (TCP + TLS) is provider-aware, not a flat 5s.** A
-  self-hosted/LAN/tailnet server that's off must fail fast (5s, so an
+  self-hosted/LAN/VPN server that's off must fail fast (5s, so an
   off-grid send isn't a ~2min hang), but a PUBLIC API's TLS handshake can be
   slow over a poor link — a 5s budget there causes false
   handshake-timeouts/"unreachable". Remote (non-private host) gets 20s;
@@ -891,7 +892,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   duplicate streamed output). Non-connection errors (HTTP 4xx/5xx,
   MalformedToolCall) are never retried.
 - **Happy Eyeballs (RFC 8305) for openai-compat connects.** A host with A+AAAA
-  records on a machine whose public IPv6 route is dead (common with Tailscale
+  records on a machine whose public IPv6 route is dead (common with a VPN
   up — public IPv6 blackholes) otherwise burns the whole connect timeout
   stalling on IPv6 before falling back to IPv4 (measured 17s → 0.15s vs
   OpenRouter). `providers/happy_eyeballs.py` plugs a custom httpcore network
@@ -905,9 +906,9 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
 - No Aurora code changed for this — `openai_compat.py` already supported a
   `base_url` list with try-each-in-order failover for any `type: openai`
   provider (not special-cased to a "local" config key). What changed is
-  **how `config.yaml` is deployed**: on m7, `~/scripts/llama/aurora-gateway.py`
-  (a small Flask service, systemd unit `aurora-gateway`, run behind Caddy on
-  the existing `:18182` LAN/Tailscale endpoints) now sits in front of
+  **how `config.yaml` is deployed**: on the server, `~/scripts/llama/a gateway script`
+  (a small Flask service, systemd unit, run behind Caddy on
+  the existing `:18182` LAN/a VPN endpoints) now sits in front of
   llama-server. It inspects the `model` field of each `/v1/chat/completions`
   request: `"local"` (or unset) routes to llama-server; anything else (an
   OpenRouter model id, e.g. `moonshotai/kimi-k2.7-code`) is proxied to the
@@ -915,11 +916,11 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   never sent by or visible to the Aurora client.
 - **Result:** `config.yaml`'s `providers:` needs only one OpenAI-compatible
   entry (named `openrouter:` in this repo's committed config) whose
-  `base_url` is the two m7 URLs and `api_key_env: LLAMA_API_KEY` — that
+  `base_url` is the two the server URLs and `api_key_env: LLAMA_API_KEY` — that
   single key authenticates every request Aurora makes, local or
-  OpenRouter-routed. Trade-off, accepted deliberately: if m7 itself is
+  OpenRouter-routed. Trade-off, accepted deliberately: if the server itself is
   unreachable, ALL models are unavailable (no direct-to-OpenRouter fallback
-  path) — simplicity over redundancy, since m7 uptime is otherwise good.
+  path) — simplicity over redundancy, since the server uptime is otherwise good.
 - **Gotcha for anyone touching the gateway:** it must implement `/props`
   (see ARCHITECTURE.md §3, networking hardening) as a llama-server
   passthrough — `pick_endpoint()`'s reachability probe hits that path, and
@@ -938,7 +939,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
 ### LAN TLS for a self-signed local server (2026-07-13, R64)
 - **R64. A local/LAN `base_url` reachable by bare IP skips TLS verification
   for that connection only.** A reverse proxy in front of llama.cpp (e.g.
-  Caddy) commonly serves a cert issued for a single hostname (its Tailscale
+  Caddy) commonly serves a cert issued for a single hostname (its VPN
   MagicDNS name) — hitting the same listener by LAN IP always fails
   certificate verification (`IP address mismatch`), even though the
   connection itself is trusted (same LAN, same box). `providers/openai_compat.py`'s
@@ -997,8 +998,8 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   pruning) excludes `SAFE_COMMANDS` single-token entries — a bare `find` is
   intentional here, not a pre-R43 leftover.
 
-### Context-size picker on a LlamaDesk library load (2026-07-13, R68; actually implemented 2026-07-15; removed 2026-07-23)
-- **R68.** *(Removed 2026-07-23 along with R3/LlamaDesk — `_pick_ctx`,
+### Context-size picker on a model manager library load (2026-07-13, R68; actually implemented 2026-07-15; removed 2026-07-23)
+- **R68.** *(Removed 2026-07-23 along with R3/the model manager — `_pick_ctx`,
   `_CTX_OPTIONS`, and the library-load branch in `_pick_model` are gone;
   there is no longer a "load at ctx N" step to prompt for.)* ~~Spec'd
   2026-07-13 and fully tested in `test_core.py` — a 7-rung ladder, `native`
@@ -1007,20 +1008,20 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   `ctx = min(config, native)` with no prompt at all until this was noticed
   and fixed 2026-07-15 — see git history for the original spec text.
   Simplified and actually implemented 2026-07-15, local models only
-  (LlamaDesk library loads — remote/OpenRouter models have no "load at ctx
-  N" step, their limit is fixed by the provider): loading a LlamaDesk
+  (the model manager library loads — remote/OpenRouter models have no "load at ctx
+  N" step, their limit is fixed by the provider): loading a model manager
   library model (R3) now genuinely asks which context size to load it at,
   instead of silently picking one. `ui._pick_ctx(default_ctx, native)` —
   called from `_pick_model`'s library-load branch, after the eviction
   confirm, before `desk.switch()` — offers just **64k / 128k / 256k**
   (`_CTX_OPTIONS`), not the original 7-rung ladder: small enough to glance
   at, big enough range for daily use. Options above `native` (the gguf's
-  `ctx_native`, from `LlamaDesk.models_detail()`) are dropped entirely,
+  `ctx_native`, from `the model manager.models_detail()`) are dropped entirely,
   never just disabled — Aurora never rope-extends a model past what it was
   trained for. If `native` itself is under 64k (a tiny model), it's offered
   alone instead of an empty menu. No free-text custom entry — three
   options is exactly the point. Pre-selects the largest offered size
-  `<= default_ctx` (`config.yaml`'s `llamadesk.ctx`); the chosen value is
+  `<= default_ctx` (`config.yaml`'s `model-manager.ctx`); the chosen value is
   used for that one load only, never written back to config (RAM headroom
   is per-machine, per-model — not something to sync).~~
 
@@ -1059,7 +1060,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   openai_compat.py`) and `Engine._provider_health_uncached()`
   (`engine.py`) both hit llama.cpp's `/props` endpoint keyed only on
   `_is_lan_host(base_url)` — correct when a LAN host always meant "the
-  local llama.cpp model", but aurora-gateway (R-unify, `b9f80d3`) now
+  local llama.cpp model", but a gateway (R-unify, `b9f80d3`) now
   routes BOTH the local model and real remote models (e.g. an OpenRouter
   model like `moonshotai/kimi-k2.7-code`) through the same LAN base_url.
   Selecting a remote model was silently reporting the LOCAL model's loaded
@@ -1098,7 +1099,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   $3.69 out per 1M) and `z-ai/glm-5.2` ($0.367 in / $3.60 out per 1M, 1M
   context) — prices are OpenRouter's usage-weighted average across
   providers, not the headline listed price, since that's closer to what
-  aurora-gateway actually pays. The `/model` picker (`ui.py`'s
+  a gateway actually pays. The `/model` picker (`ui.py`'s
   `_pick_model`) shows the same per-M pricing next to context size for any
   model with known pricing — read from this same JSON table — so cost
   awareness isn't limited to the footer badge.
@@ -1123,8 +1124,8 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   stays — it was never Anthropic-specific, just the only thing that used
   it, and it's exercised by a provider-agnostic test.
 - **R74b. `config.yaml`'s single `openrouter` provider (routing BOTH local
-  and remote models through the m7 gateway) is split into two providers**:
-  `local` (the m7 gateway, LAN/Tailscale — this user's own infrastructure,
+  and remote models through the the server gateway) is split into two providers**:
+  `local` (the the server gateway, LAN/a VPN — this user's own infrastructure,
   not something a fresh clone has access to) and `openrouter` (the real
   `https://openrouter.ai/api/v1`, direct, with its own `OPENROUTER_API_KEY`
   — works for anyone with their own OpenRouter key, no dependency on this
@@ -1147,19 +1148,19 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
 
 ### Version is pinned on GitHub deploy, not computed there (2026-07-15, R75)
 - **R75. `aurora.__version__` is `1.0.<commit-count>`, computed live from
-  `git rev-list --count HEAD` — but that's only meaningful in GitTea, the
+  `git rev-list --count HEAD` — but that's only meaningful in the dev repo, the
   dev repo the numbering was designed around.** GitHub/Aurora (the public
   mirror, see "Deployment note") is a SEPARATE git repo with its own
   unrelated commit history — computing its own commit count there (or in
   any downstream clone/production install) would silently report a
   plausible-looking but WRONG version. `aurora/__init__.py` now has a
-  `_PINNED_VERSION` constant (empty in GitTea — empty means "compute
+  `_PINNED_VERSION` constant (empty in the dev repo — empty means "compute
   live"); `scripts/github-deploy.sh` overwrites that exact line on every
-  deploy to GitTea's real version at that moment (`sed` after the rsync),
+  deploy to the dev repo's real version at that moment (`sed` after the rsync),
   so GitHub/Aurora and everything downstream of it reports a frozen,
   correct version instead of a meaningless local commit count. Every
   GitHub deploy MUST re-run this step — an old pin left in place after
-  GitTea moves on would report a stale version forever.
+  the dev repo moves on would report a stale version forever.
 
 ### Rate-limit errors get an actionable hint, not a raw JSON dump (2026-07-15, R76)
 - **R76. A `429`/rate-limit `ProviderError` (common on a free-tier
@@ -1366,7 +1367,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   until then. Installed with `/bootstrap set bootstrap.example.md`
   (optionally `project`). Documented in README ("Start every session
   oriented"). The hero image (`images/aurora.png`, used by both the README
-  and ricardopsantos.org/aurora) now shows Aurora at boot offering to run
+  and the project site) now shows Aurora at boot offering to run
   this prompt — banner, bootstrap ask menu, collapsed input, two-line
   status bar, rendered in the TUI's real colors/layout.
 
@@ -1419,7 +1420,7 @@ check these first after upgrading llama.cpp / LlamaDesk / prompt_toolkit:
   `tests/test_bootstrap_network.py` is the one deliberate exception to the
   rest of the suite's no-network rule — it downloads the AgenticContext
   repo's `MAIN_PROMPT.md`
-  (`https://raw.githubusercontent.com/ricardopsantos/AgenticContext/refs/heads/main/MAIN_PROMPT.md`)
+  (`a hosted prompt URL`)
   for real via `set`/`refresh_from_source`, skipping (not failing) if the
   network isn't reachable.
 
@@ -1766,7 +1767,7 @@ runs far more often than the thing it is recomputing changes.
 - **R95h. The endpoint probe respects its own cache.** `turn()` called
   `pick_endpoint(cache_ok=False)`, forcing a probe. But `turn()` runs once per
   agent ITERATION, not once per user message, so a 10-round tool turn paid ten
-  extra probe round trips — invisible on localhost, real over a tailnet. It now
+  extra probe round trips — invisible on localhost, real over a VPN. It now
   honours the 10s TTL: a human turnaround exceeds it, so failover between
   messages is unchanged, and a connection failure still expires the cache
   explicitly (`_working_url_at = 0.0`). `_probe` also reuses the endpoint's
@@ -1785,7 +1786,7 @@ runs far more often than the thing it is recomputing changes.
   - A failed refresh caches the static fallback, so a down backend backs off
     for the TTL instead of spawning a probe thread per frame; `_limit_pending`
     keeps a burst of renders to one in-flight probe.
-  - The 120s TTL itself is unchanged — LlamaDesk can reload the same model at
+  - The 120s TTL itself is unchanged — the model manager can reload the same model at
     a different ctx, so a live `n_ctx` must not be cached forever. Only the
     *waiting* moved off the render path.
 - **R95j. A live think row invalidates once per second, not once per render.**
@@ -2271,7 +2272,7 @@ produces this file" today force the model to guess a single `sleep N`
 duration inside `run_command` and hope it was long enough — too short and
 the next step fails spuriously, too long and the turn wastes time waiting
 past when the condition was already true. `wait_until` reuses the "poll
-until true or give up" shape `llamadesk.LlamaDesk.wait_ready` already uses
+until true or give up" shape `model-manager.the model manager.wait_ready` already uses
 internally for a model load, exposed as a general tool.
 
 - **Refactored `run_command`** to extract `_run_command_once(command,
@@ -2881,19 +2882,19 @@ why it isn't run — the phrase was explaining an absence, not reporting a
 fact). `Engine._provider_health_uncached()`'s early-return `detail` for
 any non-`local` model is now just `"remote API"`.
 
-### R115. LlamaDesk integration removed (R3, R68 marked removed above)
-Not in use — no `llamadesk:` block was configured. Removed rather than
-carried as dead weight: `aurora/llamadesk.py` deleted; `ui.py` lost
-`_llamadesk`/`_llamadesk_mark_failed`/`_llamadesk_mark_ok`, the
-`_LLAMADESK_RECHECK_S` failure-cache, `_pick_ctx`/`_CTX_OPTIONS` (the R68
+### R115. the model manager integration removed (R3, R68 marked removed above)
+Not in use — no `model-manager:` block was configured. Removed rather than
+carried as dead weight: `aurora/model-manager.py` deleted; `ui.py` lost
+`_model-manager`/`_model-manager_mark_failed`/`_model-manager_mark_ok`, the
+`_MODELMGR_RECHECK_S` failure-cache, `_pick_ctx`/`_CTX_OPTIONS` (the R68
 context-size picker, which only existed for library loads), and the
 library-load branch + "library" entries in `_pick_model` — the picker now
 only shows configured models. `__main__.py`'s `_known_key_names()` no
-longer folds in `llamadesk.token_env`; `man.py` dropped the
-`LLAMADESK_TOKEN` env-var line. `config.yaml.example`'s commented
-`llamadesk:` block removed. Tests removed:
-`test_llamadesk_unreachable_is_cached_briefly`,
-`test_llamadesk_parses_model_shapes`, the four `test_pick_ctx_*` cases, and
+longer folds in `model-manager.token_env`; `man.py` dropped the
+`MODELMGR_TOKEN` env-var line. `config.yaml.example`'s commented
+`model-manager:` block removed. Tests removed:
+`test_model-manager_unreachable_is_cached_briefly`,
+`test_model-manager_parses_model_shapes`, the four `test_pick_ctx_*` cases, and
 `test_pick_model_library_load_prompts_for_ctx_and_passes_it_through`
 (`tests/test_core.py`, `tests/test_finish.py`). No replacement mechanism —
 Aurora's `local` provider talks to whatever `llama-server` already has
@@ -3042,7 +3043,7 @@ Two pieces, designed together:
     as key: value instead, same shape as `on_tool_start`'s own rendering).
 
 **Scoped down from the comparison that prompted this** (Pi's own
-`pi-subagents`/`pi-hermes-memory` extensions, and its TypeScript extension
+its sub-agent and memory extensions, and its TypeScript extension
 API): no lifecycle-hook system, no custom `/commands` from an extension, no
 custom TUI rendering, no project-local extensions/trust prompt yet (global
 `AURORA_HOME/extensions/` only) — Phase 1 of a larger plan, not the whole
@@ -3619,7 +3620,7 @@ a gap in its own right, so they land here, before and independent of any UI.
   additive** — summing the two double-counts every thinking turn, and any
   display putting them side by side has to say so.
   Local llama.cpp streams `reasoning_content` but reports no
-  `reasoning_tokens`, which would leave m7 turns showing zero thinking. So
+  `reasoning_tokens`, which would leave the server turns showing zero thinking. So
   `reasoning_chars` counts the streamed reasoning text as a fallback —
   exact as characters, an ESTIMATE as tokens, and counted even when no
   `on_think` listener is attached, because the count is accounting, not
@@ -8142,7 +8143,7 @@ and chat turns need no Ollama-specific branch in `turn()`, since its
 OpenAI-compatible endpoint is handled by the existing streaming/delta
 parsing. A provider with no `type:` uses `/props` exactly as before.
 
-Verified live against a real Ollama server on m7 rather than mocked HTTP —
+Verified live against a real Ollama server on the server rather than mocked HTTP —
 see the full entry, including the "capabilities says tools but the model
 never emits one" caveat, in the repo-root `REQUIREMENTS.md`.
 

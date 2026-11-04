@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aurora</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="/favicon.png">
+<style>
+/* Web App Design Language v1.13, flavour 1 (Desktop), layout page */
+:root{
+  color-scheme: light dark;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "DejaVu Sans", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --bg:#edeef0; --panel:#f6f7f8; --view:#fff; --fg:#1f2328; --dim:#5d6675; --line:#c9ccd1;
+  --hover:#dfe6ee; --btn:#fbfbfc; --accent:#2c68a6; --accent-fg:#fff; --sel:#2c68a6; --sel-fg:#fff;
+  --ok:#2a7347; --warn:#9c4d00; --bad:#b3261e;
+  --shadow:0 6px 24px rgba(0,0,0,.25);
+  --sp-half:8px; --sp:16px; --sp-2x:32px; --sp-4x:64px;
+  --fs-body:13px; --fs-secondary:12px; --fs-caption:11px; --fs-title:16px; --fs-mono:12px;
+  --r-sm:3px; --r-md:4px; --r-lg:6px; --cat-1:#2a66b0; --cat-2:#6f42b5; --cat-3:#0b6e6e; --cat-4:#a3327e; --cat-5:#6b6100; --cat-6:#7a4f3a;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:#2b2d31; --panel:#303338; --view:#1f2124; --fg:#e4e6ea; --dim:#a6aebb; --line:#45484e;
+    --hover:#3a3f47; --btn:#3a3d43; --accent:#6aa6e0; --accent-fg:#10151b; --sel:#2c5f96; --sel-fg:#fff;
+    --ok:#8fd08f; --warn:#e6a55a; --bad:#ef8b84; --cat-1:#7fb2ee; --cat-2:#b79df0; --cat-3:#5fd0d0; --cat-4:#f08fc8; --cat-5:#cfc35a; --cat-6:#d9a58a;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg:#2b2d31; --panel:#303338; --view:#1f2124; --fg:#e4e6ea; --dim:#a6aebb; --line:#45484e;
+  --hover:#3a3f47; --btn:#3a3d43; --accent:#6aa6e0; --accent-fg:#10151b; --sel:#2c5f96; --sel-fg:#fff;
+  --ok:#8fd08f; --warn:#e6a55a; --bad:#ef8b84; --cat-1:#7fb2ee; --cat-2:#b79df0; --cat-3:#5fd0d0; --cat-4:#f08fc8; --cat-5:#cfc35a; --cat-6:#d9a58a;
+}
+:root[data-theme="light"] { color-scheme: light; }
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--fg);font:400 var(--fs-body)/1.35 var(--font-sans)}
+button,input,select{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+code,pre{font-family:var(--font-mono);font-size:var(--fs-mono)}
+:where(p){margin:0}
+.dim,.audit-empty{color:var(--dim)}.sec{color:var(--dim);font-size:var(--fs-secondary)}
+.cap,.card-label{font-size:var(--fs-caption);font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--dim)}
+.grow{flex:1 1 auto;min-width:0}
+
+
+header{position:sticky;top:0;z-index:10;background:var(--panel);border-bottom:1px solid var(--line);padding:var(--sp-half) var(--sp);display:flex;flex-wrap:wrap;align-items:center;gap:var(--sp-half)}
+header h1{margin:0;font-size:var(--fs-title);font-weight:600;display:flex;align-items:center;gap:var(--sp-half)}
+header h1::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--accent)}
+.token-row{display:flex;gap:var(--sp-half);align-items:stretch}
+.secret{-webkit-text-security:disc}
+.token-row input,input[type=password]{flex:1 1 auto;min-width:0;background:var(--view);border:1px solid var(--line);border-radius:var(--r-sm);padding:4px 8px;font-family:var(--font-mono);font-size:var(--fs-mono)}
+.btn{display:inline-flex;align-items:center;justify-content:center;background:var(--btn);border:1px solid var(--line);border-radius:var(--r-md);padding:4px 12px;min-width:72px;color:var(--fg);cursor:pointer;flex:none}
+.btn:hover{background:var(--hover)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg);font-weight:600}
+.btn:disabled,.btn.primary:disabled{background:var(--btn);border-color:var(--line);color:var(--dim);font-weight:400;cursor:not-allowed}
+.tag{max-width:100%;overflow:hidden;text-overflow:ellipsis;border:1px solid var(--line);border-radius:var(--r-sm);padding:4px 8px;font-size:var(--fs-secondary);color:var(--dim);white-space:nowrap}
+.tag.busy{color:var(--warn)}
+.tag.ok{color:var(--ok)}.tag.bad{color:var(--bad)}
+.tag:empty{display:none}
+label.tag{display:inline-flex;align-items:center;gap:var(--sp-half);cursor:pointer}
+#auto-tag.on{color:var(--warn);border-color:var(--warn)}
+label.tag input{flex:none;min-height:0;width:auto;margin:0}
+header label.tag{margin-left:auto}
+main{width:100%;max-width:1040px;margin-inline:auto;padding:var(--sp);display:flex;flex-direction:column;gap:var(--sp-half);flex:1 1 auto}
+#log{display:flex;flex-direction:column;gap:var(--sp-half);flex:1 1 auto}
+.msg{border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--sp-half) var(--sp);background:var(--view);overflow-wrap:anywhere;white-space:pre-wrap}
+.msg.user{background:var(--panel)}
+.msg.md{white-space:normal}
+.msg.md>:first-child{margin-top:0}.msg.md>:last-child{margin-bottom:0}
+.msg.md h1,.msg.md h2,.msg.md h3,.msg.md h4{margin:var(--sp-half) 0 4px;line-height:1.25;font-weight:600}
+.msg.md h1{font-size:var(--fs-title)}.msg.md h2{font-size:14px}.msg.md h3,.msg.md h4{font-size:var(--fs-body)}
+.msg.md p,.msg.md ul,.msg.md ol,.msg.md blockquote,.msg.md table{margin:0 0 var(--sp-half)}
+.msg.md ul,.msg.md ol{padding-left:var(--sp)}
+.msg.md blockquote{border-left:3px solid var(--line);padding-left:var(--sp-half);color:var(--dim)}
+.msg.md hr{border:0;border-top:1px solid var(--line);margin:var(--sp-half) 0}
+.msg.md a{color:var(--accent)}
+.msg.md code{background:var(--panel);border-radius:var(--r-sm);padding:0 4px}
+.msg.md pre code{background:none;padding:0}
+.msg.md table{border-collapse:collapse;display:block;overflow-x:auto}
+.msg.md th,.msg.md td{border:1px solid var(--line);padding:4px 8px;text-align:left}
+.msg.md th{background:var(--panel)}
+.msg.note{color:var(--dim);font-size:var(--fs-secondary);background:none;border-style:dashed}
+.msg.err{color:var(--bad)}
+.msg pre{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-sm);padding:var(--sp-half);overflow-x:auto;white-space:pre;margin:var(--sp-half) 0 0}
+.msg code{font-family:var(--font-mono);font-size:var(--fs-mono)}
+#queue{display:flex;flex-direction:column;gap:var(--sp-half);border:1px dashed var(--line);border-radius:var(--r-md);padding:var(--sp-half) var(--sp);color:var(--dim);font-size:var(--fs-secondary)}
+#queue .q-item{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+body.hide-tools details.tool{display:none}
+#live{display:flex;flex-direction:column;gap:var(--sp-half);color:var(--warn);border-style:solid}
+#live-line{display:flex;align-items:center;gap:var(--sp-half);cursor:pointer}
+#live-line::after{content:"";margin-left:auto;border:5px solid transparent;border-top:6px solid currentColor;border-bottom:0}
+#live-line[aria-expanded=true]::after{transform:rotate(180deg)}
+#live-think{margin:0;max-height:40vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--fg);background:var(--panel);border:1px solid var(--line);border-radius:var(--r-sm);padding:var(--sp-half);font-family:var(--font-mono);font-size:var(--fs-mono)}
+#live-line::before{content:"";flex:none;width:8px;height:8px;border-radius:50%;background:var(--warn);animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
+@media (prefers-reduced-motion:reduce){#live::before{animation:none}}
+details{border:1px solid var(--line);border-radius:var(--r-md);background:var(--panel);padding:4px 8px;font-size:var(--fs-secondary)}
+details summary{cursor:pointer;color:var(--dim);overflow-wrap:anywhere}
+details pre{margin:var(--sp-half) 0 0;white-space:pre-wrap;overflow-wrap:anywhere;max-height:40vh;overflow:auto}
+form#send{position:sticky;bottom:0;background:var(--bg);padding:var(--sp-half) 0;display:flex;gap:var(--sp-half);align-items:flex-end}
+form#send textarea{flex:1 1 auto;min-width:0;resize:none;background:var(--view);border:1px solid var(--line);border-radius:var(--r-sm);padding:4px 8px;font-size:16px;line-height:1.35;max-height:40vh}
+dialog{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--sp);max-width:min(640px,calc(100vw - 2*var(--sp)));box-shadow:var(--shadow)}
+dialog::backdrop{background:rgba(0,0,0,.4)}
+dialog h3{margin:0 0 var(--sp-half);font-size:var(--fs-title)}
+dialog pre{background:var(--view);border:1px solid var(--line);border-radius:var(--r-sm);padding:var(--sp-half);max-height:45vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 var(--sp)}
+dialog .btns{display:grid;grid-template-columns:1fr 1fr 1fr;gap:var(--sp-half)}
+dialog .btns .btn{min-width:0}
+.layout{display:flex;flex:1 1 auto;align-items:stretch}
+.layout main{min-width:0}
+aside{flex:none;width:240px;position:sticky;top:var(--hh,45px);height:calc(100dvh - var(--hh,45px));overflow-y:auto;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column}
+body.sb-closed aside{display:none}
+aside section{border-bottom:1px solid var(--line);display:flex;flex-direction:column}
+aside h2.cap{margin:0;padding:var(--sp-half) var(--sp);display:flex;align-items:center;gap:var(--sp-half);cursor:pointer;user-select:none;min-height:32px}
+aside h2.cap::before{content:"";flex:none;border:5px solid transparent;border-top:6px solid currentColor;border-bottom:0;transition:transform .12s}
+aside h2.cap[aria-expanded=false]::before{transform:rotate(-90deg)}
+aside h2.cap:hover{color:var(--fg)}
+aside .fold-body{display:flex;flex-direction:column;gap:var(--sp-half);padding:0 var(--sp) var(--sp)}
+aside section.folded .fold-body{display:none}
+aside .cmds{flex-direction:row}
+aside .cmds .btn{flex:1 1 0;min-width:0;padding-inline:var(--sp-half)}
+.opt{display:flex;align-items:center;gap:var(--sp-half);cursor:pointer;padding:4px 0}
+.opt input{flex:none;margin:0;width:16px;height:16px;min-height:0;accent-color:var(--accent)}
+.token-row input{flex:1 1 auto;min-width:0;width:100%}
+.meter{height:8px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--view);overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:var(--ok)}
+.meter.warn i{background:var(--warn)}.meter.bad i{background:var(--bad)}
+.tag.warn{color:var(--warn)}
+#hint{color:var(--warn);font-size:var(--fs-secondary)}
+#sessions{display:flex;flex-direction:column;gap:var(--sp-half);font-size:var(--fs-secondary)}
+#sessions div{display:flex;gap:var(--sp-half);overflow:hidden;white-space:nowrap}
+#sessions code{flex:none}
+#sessions .first{color:var(--dim);overflow:hidden;text-overflow:ellipsis}
+#sessions div[role=button]{cursor:pointer;border-radius:var(--r-sm);padding:4px 0}
+#sessions div[role=button]:hover{background:var(--hover)}
+#view{width:min(820px,calc(100vw - 2*var(--sp)));max-height:calc(100dvh - 2*var(--sp));display:flex;flex-direction:column;gap:var(--sp-half)}
+#view:not([open]){display:none}
+#view[open]{display:flex}
+#view .bar{display:flex;align-items:center;gap:var(--sp-half)}
+#view-body{overflow:auto;background:var(--view);border:1px solid var(--line);border-radius:var(--r-sm);padding:var(--sp-half) var(--sp);flex:1 1 auto;min-height:0}
+#sessions .cur code{color:var(--accent);font-weight:600}
+@media (max-width:768px),(pointer:coarse){.btn,input,textarea{min-height:44px}main{padding:var(--sp-half)}.token-row{max-width:none}}
+@media (max-width:768px){aside{position:fixed;top:0;bottom:0;left:0;height:auto;z-index:20;box-shadow:var(--shadow);overflow-y:auto}}
+@media (max-width:768px){header>*{order:2}header h1,header #auto-tag{order:1}}
+@media (max-width:768px),(pointer:coarse){#live-line,#status{min-height:44px}label.tag,#sid,details summary{min-height:44px;display:flex;align-items:center}label.tag input,.tag input{width:20px;height:20px}.token-row input{font-size:16px}#sessions div[role=button]{min-height:44px;align-items:center}aside h2.cap,.opt{min-height:44px}.opt input{width:20px;height:20px}}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}aside h2.cap::before{transition:none}}
+</style>
+</head>
+<body style="display:flex;flex-direction:column;min-height:100dvh">
+<!-- Web App Design Language, flavour 1 (Desktop), layout page. Aurora Lite R353. -->
+<header>
+  <h1>Aurora</h1>
+  <span class="tag" id="model">…</span>
+  <button class="btn" type="button" id="sb-toggle" aria-controls="side" aria-expanded="true">Sidebar</button>
+  <span class="tag" id="ctx"></span>
+  <span class="tag" id="sid" title="session id (click to copy)" role="button" tabindex="0" hidden></span>
+  <span class="tag" id="status">idle</span>
+  <label class="tag" id="auto-tag"><input type="checkbox" id="auto-on"> Auto-approve</label>
+</header>
+<div class="layout">
+<aside id="side" aria-label="Sidebar">
+  <section data-fold="context">
+    <h2 class="cap fold" role="button" tabindex="0" aria-expanded="true">Context</h2>
+    <div class="fold-body">
+      <div class="meter" id="meter"><i></i></div>
+      <span class="sec" id="ctx-detail">no data yet</span>
+      <span id="hint" hidden></span>
+    </div>
+  </section>
+  <section data-fold="commands">
+    <h2 class="cap fold" role="button" tabindex="0" aria-expanded="true">Commands</h2>
+    <div class="fold-body cmds">
+      <button class="btn cmd" type="button" data-cmd="clear" title="Wipe the history and start fresh">Clear</button>
+      <button class="btn cmd" type="button" data-cmd="compact" title="Fold older messages into a summary">Compact</button>
+      <button class="btn cmd" type="button" data-cmd="context" title="Show the context used">Context</button>
+    </div>
+      <div class="cmds">
+        <button class="btn cmd" type="button" id="diff-btn" title="Show what the last turn changed">Diff</button>
+        <button class="btn cmd" type="button" id="undo-btn" title="Revert just the last change (asks first)">Undo</button>
+      </div>
+  </section>
+  <section data-fold="options">
+    <h2 class="cap fold" role="button" tabindex="0" aria-expanded="true">Options</h2>
+    <div class="fold-body">
+      <label class="opt"><input type="checkbox" id="clear-open"> New chat on open (off: continue the last chat)</label>
+      <label class="opt"><input type="checkbox" id="md-on"> Markdown</label>
+      <label class="opt"><input type="checkbox" id="hide-tools"> Hide tool calls</label>
+    </div>
+  </section>
+  <section data-fold="sessions">
+    <h2 class="cap fold" role="button" tabindex="0" aria-expanded="true">Recent sessions</h2>
+    <div class="fold-body"><div id="sessions"><span class="sec">…</span></div></div>
+  </section>
+  <section data-fold="token" data-folded-by-default>
+    <h2 class="cap fold" role="button" tabindex="0" aria-expanded="false">Access token</h2>
+    <div class="fold-body">
+      <div class="token-row">
+        <input type="text" id="token" class="secret" aria-label="Access token" placeholder="bearer token" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-form-type="other">
+        <button class="btn" type="button" id="token-save">Save</button>
+      </div>
+    </div>
+  </section>
+</aside>
+<main>
+  <div id="log" aria-live="polite"></div>
+  <div id="queue" hidden></div>
+  <div id="live" class="msg note" hidden><div id="live-line" role="button" tabindex="0" aria-expanded="false" title="Tap to show what Aurora is thinking"></div><pre id="live-think" hidden></pre></div>
+  <form id="send">
+    <textarea id="text" rows="1" aria-label="Message" placeholder="Message Aurora" autocomplete="off"></textarea>
+    <button class="btn" type="button" id="load-ctx" disabled title="Fill the message with: load <workspace>/context.md">Load context</button>
+    <button class="btn" type="button" id="stop" hidden>Stop</button>
+    <button class="btn primary" type="submit" id="go">Send</button>
+  </form>
+</main>
+</div>
+<dialog id="view">
+  <div class="bar"><h3 class="grow" id="view-title" style="margin:0">Session</h3><button class="btn primary" type="button" id="view-resume" hidden>Resume</button><button class="btn" type="button" id="view-close">Close</button></div>
+  <div class="msg md" id="view-body"></div>
+</dialog>
+<dialog id="approve">
+  <h3 id="ap-title">Approve?</h3>
+  <pre id="ap-body"></pre>
+  <div class="btns">
+    <button class="btn" type="button" data-a="n">Deny</button>
+    <button class="btn" type="button" data-a="s">Stop turn</button>
+    <button class="btn primary" type="button" data-a="y">Approve once</button>
+  </div>
+</dialog>
+<dialog id="confirm">
+  <h3 id="cf-title">Clear the history?</h3>
+  <p class="sec" id="cf-text" style="margin-bottom:var(--sp)">The conversation is wiped and the next message starts fresh.</p>
+  <pre id="cf-pre" hidden></pre>
+  <div class="btns" style="grid-template-columns:1fr 1fr">
+    <button class="btn" type="button" id="cf-no">Cancel</button>
+    <button class="btn primary" type="button" id="cf-yes">Clear</button>
+  </div>
+</dialog>
+<script src="/app.js"></script>
+</body>
+</html>

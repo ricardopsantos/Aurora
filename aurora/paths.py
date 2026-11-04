@@ -2,6 +2,7 @@
 key store). Chosen at install time; everything project-agnostic lives here so
 the git repo stays machine-neutral."""
 
+import errno
 import os
 import tempfile
 from pathlib import Path
@@ -152,6 +153,9 @@ def write_text_preserving(path: "Path | str", text: str) -> None:
         mode = p.stat().st_mode & 0o7777
     except OSError:
         mode = None          # new file — let the umask decide, as before
+    if mode is not None and p.is_file():
+        _rewrite_in_place(p, text)
+        return
     p.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(p.parent),
                                prefix=f".{p.name}.", suffix=".tmp")
@@ -174,12 +178,61 @@ def write_text_preserving(path: "Path | str", text: str) -> None:
         raise
 
 
+def _rewrite_in_place(p: Path, text: str) -> None:
+    """R322: overwrite an EXISTING file through its own inode.
+
+    `os.replace` gives the path a new inode, so a single file bind-mounted into
+    a container (`./Caddyfile:/etc/caddy/Caddyfile`) keeps showing the old
+    content, a hard link is split off, and owner/group/xattrs are lost. Writing
+    through the open file keeps all of them. To stay safe against a failed
+    write: the space is reserved first (ENOSPC raises before anything is
+    touched) and the old bytes are put back if the write itself fails."""
+    data = text.encode("utf-8")
+    with open(p, "r+b") as f:
+        old = f.read()
+        try:
+            try:
+                # macOS has no posix_fallocate; skip the up-front reservation there.
+                if hasattr(os, "posix_fallocate"):
+                    os.posix_fallocate(f.fileno(), 0, len(data))
+            except OSError as e:
+                if e.errno == errno.ENOSPC:
+                    raise
+            f.seek(0)
+            f.truncate(0)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        except BaseException:
+            f.seek(0)
+            f.truncate(0)
+            f.write(old)
+            f.flush()
+            raise
+
+
 def _umask() -> int:
-    """Read the process umask without leaving it changed — there is no
-    read-only accessor before Python 3.13's `os.umask` semantics change."""
-    current = os.umask(0o022)
-    os.umask(current)
-    return current
+    """The process umask, read from /proc/self/status (R323) so no thread ever
+    sees it briefly changed; computed once and cached. Falls back to the
+    set-and-restore trick (no read-only accessor exists) only where /proc is
+    missing, e.g. macOS — and then only on the first call, before threads."""
+    global _UMASK
+    if _UMASK is None:
+        try:
+            for line in Path("/proc/self/status").read_text().splitlines():
+                if line.startswith("Umask:"):
+                    _UMASK = int(line.split()[1], 8)
+                    break
+        except (OSError, ValueError, IndexError):
+            pass
+        if _UMASK is None:
+            current = os.umask(0o022)
+            os.umask(current)
+            _UMASK = current
+    return _UMASK
+
+
+_UMASK: "int | None" = None
 
 
 _MARKER = Path.home() / ".aurora-path"

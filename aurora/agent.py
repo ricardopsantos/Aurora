@@ -22,7 +22,7 @@ from .providers.base import (
 def _provider_label(provider) -> str:
     """A generic, non-identifying descriptor for user-facing connectivity
     messages — NEVER the raw config-key name (`provider.name`, e.g. a
-    Tailscale/LAN entry a user may have keyed with something personal) and
+    VPN/LAN entry a user may have keyed with something personal) and
     NEVER a local base_url (a MagicDNS/LAN hostname can bake in a personal
     name too). Config is user data; Aurora never echoes it back verbatim."""
     base = getattr(provider, "base_url", "")
@@ -112,6 +112,38 @@ def _explain_tool_call(provider, model, name: str, args: dict,
         return f"[explain failed: {e.__class__.__name__}: {e}]"
 
 
+# R314: with auto-approve on, the iteration-cap prompt is skipped only until
+# a turn hits either backstop — a looping model must not run unattended forever.
+AUTO_CONTINUE_MAX_ROUNDS = 50
+AUTO_CONTINUE_MAX_SECS = 3600
+# R350: rounds in a row where EVERY call repeated last round's call and result.
+# The in-band nudge is advisory and a weak model ignores it (80 re-reads of one
+# file, 2026-10-24), so past this the turn ends instead of burning tokens.
+REPEAT_ROUNDS_STOP = 3
+
+
+# separate clock so tests that fake `time.monotonic` for latency stay untouched
+_gen_clock = time.perf_counter
+
+
+def _stamp_first(on_text, first: list):
+    """Wrap `on_text` to record when the first token streamed (R352)."""
+    def wrapped(chunk):
+        if not first:
+            first.append(_gen_clock())
+        return on_text(chunk)
+    return wrapped
+
+
+def _note_gen(turn, result, first: list) -> None:
+    """R352: add this request's generation tokens/seconds to the turn. Skipped
+    when the backend reported no output tokens or nothing streamed."""
+    toks = getattr(result, "output_tokens", 0) or 0
+    if first and toks:
+        turn.gen_tokens += toks
+        turn.gen_secs += max(_gen_clock() - first[0], 0.0)
+
+
 @dataclass
 class AgentCallbacks:
     on_text: Callable[[str], None]                 # streamed assistant text
@@ -122,6 +154,10 @@ class AgentCallbacks:
     notify: Callable[[str], None]                  # notices (degrade, cancel)
     cancelled: Callable[[], bool]                  # poll for a user cancel (Esc/Ctrl+C)
     checkpoint: Callable[[str, dict], object] | None = None  # pre-mutation snapshot (R47/R181)
+    # arguments of the call whose result `on_tool_result` is being told about,
+    # so the session log can record WHAT ran, not just what it printed; {} for
+    # results that never ran a call (skips, denials)
+    call_args: dict = field(default_factory=dict)
     on_request: Callable[[], None] | None = None   # an LLM request is starting
     # R262: `/auto-approve on` — polled fresh per gated call (not read once
     # at turn start) so toggling it mid-turn takes effect on the very next
@@ -129,6 +165,10 @@ class AgentCallbacks:
     # reads through a callback instead of a snapshot. None means "no such
     # concept" for a caller that never wires it — treated as always-off.
     auto_approve: Callable[[], bool] | None = None
+    # R314: True while the iteration-cap prompt should be skipped (TUI with
+    # /auto-approve on). Separate from auto_approve so headless --yes keeps
+    # honouring an explicit --max-steps.
+    auto_continue: Callable[[], bool] | None = None
     # R58: secret-redaction challenge. None means the feature is OFF (the
     # engine only ever sets this when runtime.redact_secrets is true) — the
     # agent loop then skips scanning entirely, no cost when disabled.
@@ -137,6 +177,15 @@ class AgentCallbacks:
     # R58: hashes (secrets.hash_value) of confirmed false positives — matches
     # against these are dropped before secret_challenge ever fires again
     secret_allowlist: set | None = None
+    # R329: hashes the user chose to "keep" this session; consulted only for
+    # tool OUTPUT scans, never for prompts, replies or writes
+    secret_session_keep: set | None = None
+    # R339: `/plan on` — every call that would need approval is refused with a
+    # "describe it in your plan" result instead of being asked or run.
+    plan_mode: Callable[[], bool] | None = None
+    # R340: () -> (state, message); state "ok" | "warn" | "stop". Polled once
+    # per round, after the model answered and before its tool calls run.
+    budget: Callable[[], tuple[str, str]] | None = None
     # R192: (input_tokens, output_tokens, cached_input_tokens) per round.
     on_usage: Callable[[int, int, int], None] | None = None
     # R133c: every outcome of the approval gate, including the ones that never
@@ -154,13 +203,25 @@ class AgentCallbacks:
     # enabled at all); the loop only owns knowing when it's safe to ask.
     # Must mutate `messages` IN PLACE — see run_turn.
     maybe_compact: Callable[[], None] | None = None
+    # R348: lines the user typed while this turn was running. Drained when the
+    # round's last tool result is written, so the model reads them before its
+    # next step, exactly like a "Comment" at the approval gate. None = no such
+    # channel (headless).
+    steer: Callable[[], list[str]] | None = None
+    # R348: the approval menu's "Yes, and turn auto-approve ON" answer.
+    set_auto_approve: Callable[[bool], None] | None = None
 
 
 # R133c: the closed set of gate outcomes. Kept as data so the session log and
 # any reader agree on the vocabulary instead of matching free text.
 _APPROVAL_DECISIONS = ("allowlisted", "approved", "always_allow", "denied",
                        "denied_policy", "always_deny", "steered", "stopped",
-                       "auto_approved")
+                       "auto_approved", "plan_mode", "session_allow")
+
+
+def _diagnosable(msg: str) -> bool:
+    from . import diagnose
+    return diagnose.classify(msg) in ("auth", "notfound", "tls", "dns")
 
 
 def _norm(ans, default_note: str = "") -> tuple:
@@ -202,6 +263,11 @@ class Turn:
     # just do" reading should mean, not the sum/average across a multi-tool
     # turn.
     last_request_latency: float = 0.0
+    # R352: output tokens and seconds spent GENERATING (first streamed token
+    # to the end of the request, so prompt processing is not counted) — the
+    # status bar's average tokens/second.
+    gen_tokens: int = 0
+    gen_secs: float = 0.0
     iterations: int = 0
     # R266: did this turn append ANY assistant message? The engine used to
     # infer it from `len(messages)` growing, which a mid-turn fold (R154)
@@ -250,6 +316,7 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                   "tool calls until it's fixed")
         deny, deny_broken = {}, True
     tool_specs = tools.specs() if tools_enabled else None
+    turn_start = time.time()
     iteration = 0
     checkpoint = max_iterations   # "continue?" grants another full block
     silent_continue = False       # user picked "keep going, don't ask again"
@@ -258,6 +325,7 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
     # re-test) whose output actually changed is never told "you already ran
     # this exact call with this exact result" when it didn't.
     last_results: dict[tuple, str] = {}
+    repeat_rounds = 0
 
     while True:
         if cb.cancelled():
@@ -280,9 +348,11 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
             cb.on_request()
         _t0 = time.monotonic()
         try:
+            _first = []
             result = provider.turn(model, messages, system, tool_specs,
-                                   cb.on_text, cb.cancelled)
+                                   _stamp_first(cb.on_text, _first), cb.cancelled)
             turn.last_request_latency = time.monotonic() - _t0
+            _note_gen(turn, result, _first)
         except MalformedToolCall as e:
             # R5: one corrective retry, then degrade to chat. The corrective
             # nudge is a transient message — removed whether the retry
@@ -297,9 +367,11 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                     cb.on_request()
                 _t0 = time.monotonic()
                 try:
+                    _first = []
                     result = provider.turn(model, messages, system, tool_specs,
-                                           cb.on_text, cb.cancelled)
+                                           _stamp_first(cb.on_text, _first), cb.cancelled)
                     turn.last_request_latency = time.monotonic() - _t0
+                    _note_gen(turn, result, _first)
                 except MalformedToolCall:
                     cb.notify("still malformed — dropping tools for this session (chat only)")
                     turn.degraded = True
@@ -337,9 +409,21 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                 # can be on ANY provider, so don't assume it was the local one.
                 label = _provider_label(provider)
                 hint = _connectivity_hint(provider)
+                # R345: the same cause/fix list the startup panel shows — no
+                # host, URL or config-key name (see the NEVER above)
+                from . import diagnose as _dg
+                d = _dg.diagnose(_dg.classify(msg), local=label.startswith("local"))
                 cb.notify(f"{label} unreachable — check your connection, or "
                           "/model to switch to another backend"
-                          + (f"\n  {hint}" if hint else ""))
+                          + (f"\n  {hint}" if hint else "")
+                          + "\n" + "\n".join(_dg.render(d, indent="  ")))
+            elif _diagnosable(msg):
+                # R345: a rejected key / unknown model / bad certificate is not
+                # "provider error: <wall of JSON>" — say what to do about it
+                from . import diagnose as _dg
+                d = _dg.diagnose(_dg.classify(msg), local=False)
+                cb.notify(f"{_provider_label(provider)} failed — {d.cause}\n"
+                          + "\n".join(_dg.render(d, indent="  ")[1:]))
             else:
                 cb.notify(f"provider error: {e}")
             turn.events.append({"error": str(e)})
@@ -475,9 +559,28 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                     messages.append(provider.tool_result_message(c, o))
             round_out.clear()
 
+        if cb.budget:
+            state, msg = cb.budget()
+            if state == "stop":
+                cb.notify(msg)
+                _skip(result.tool_calls,
+                      "[skipped: spend limit reached — the user must raise "
+                      "/budget to continue]")
+                _flush()
+                return turn
+            if state == "warn" and msg:
+                cb.notify(msg)
+
         # iteration cap — each "continue" grants another max_iterations block
         guidance = ""  # optional user steer, injected into this round's results
-        if not silent_continue and iteration >= checkpoint:
+        if (iteration >= checkpoint and cb.auto_continue and cb.auto_continue()
+                and iteration < AUTO_CONTINUE_MAX_ROUNDS
+                and time.time() - turn_start < AUTO_CONTINUE_MAX_SECS):
+            # R314: auto-approve means "don't ask me" — up to a runaway
+            # backstop, past which the normal prompt returns. The cap still
+            # advances so turning it off mid-turn asks one block later.
+            checkpoint = iteration + max_iterations
+        elif not silent_continue and iteration >= checkpoint:
             go_on, guidance = _norm(cb.ask_continue(iteration))
             if not go_on:
                 cb.notify("stopped at iteration cap")
@@ -509,9 +612,16 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
         # stopping there prefetches nothing.
         prefetched: dict[int, str] = {}
         if tools.PARALLEL_ENABLED and not cb.cancelled():
+            # R321: only reads that come BEFORE the round's first
+            # non-read call are prefetched. A read after an edit/command must
+            # run after it, or it returns the pre-edit state.
+            first_write = next((i for i, c in enumerate(result.tool_calls)
+                                if c.name not in tools.PARALLEL_SAFE),
+                               len(result.tool_calls))
             batch = [(i, c.name, c.arguments)
                      for i, c in enumerate(result.tool_calls)
-                     if c.name in tools.PARALLEL_SAFE
+                     if i < first_write
+                     and c.name in tools.PARALLEL_SAFE
                      # R283: a gated fetch must wait for its approval
                      and not tools.needs_approval(c.name, c.arguments)
                      # R301: nor may a denied one run in the prefetch
@@ -526,9 +636,21 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
             def _finish(out: str) -> None:
                 # user guidance rides on the round's last tool result so the
                 # model reads it before its next step
-                if guidance and idx == len(result.tool_calls) - 1:
-                    out += f"\n[user guidance: {guidance}]"
-                cb.on_tool_result(call.name, out)
+                if idx == len(result.tool_calls) - 1:
+                    notes = [guidance] if guidance else []
+                    if cb.steer is not None:
+                        typed = [n for n in cb.steer() if n]
+                        if typed:
+                            cb.notify(f"steer delivered ({len(typed)} line"
+                                      f"{'s' if len(typed) != 1 else ''} typed mid-turn)")
+                        notes += typed
+                    if notes:
+                        out += f"\n[user guidance: {' / '.join(notes)}]"
+                cb.call_args = call.arguments
+                try:
+                    cb.on_tool_result(call.name, out)
+                finally:
+                    cb.call_args = {}
                 round_out.append((call, out))
 
             def _gate(decision: str, detail: str = "") -> None:
@@ -548,6 +670,14 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                 _flush()
                 turn.cancelled = True
                 return turn
+            if (cb.plan_mode and cb.plan_mode()
+                    and tools.needs_approval(call.name, call.arguments)):
+                _gate("plan_mode")
+                _finish("[plan mode — not run. Nothing that changes state "
+                        "runs until the user turns it off. Put this step in "
+                        "your plan instead.]")
+                turn.events.append({"tool": call.name, "plan_mode": True})
+                continue
             # R301: URL tools consult the denylist even when ungated — an
             # "always deny" origin rule must also stop that origin's plain
             # public pages ("deny always wins", R120).
@@ -585,6 +715,11 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                     cb.notify(f"always-allow added: {call.name} · {rule}")
                     allow = _load_allow_or_empty(cb)   # R196: same guard
                     _gate("always_allow", rule)
+                elif ans == "t":
+                    # R334: remembered for this process only
+                    rule = approve.add_session_rule(call.name, call.arguments)
+                    cb.notify(f"allowed for this session: {call.name} · {rule}")
+                    _gate("session_allow", rule)
                 elif ans == "d":
                     rule = approve.add_deny_rule(call.name, call.arguments)
                     cb.notify(f"always-deny added: {call.name} · {rule}")
@@ -611,7 +746,12 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                     _finish(f"[not run — user guidance: {note}]")
                     turn.events.append({"tool": call.name, "steered": note})
                     continue
-                elif ans != "y":
+                elif ans == "o" and cb.set_auto_approve is not None:
+                    # R348: approve this call AND stop being asked
+                    cb.set_auto_approve(True)
+                    cb.notify("auto-approve ON for this session")
+                    _gate("approved", "auto-approve turned on")
+                elif ans not in ("y", "t"):
                     _gate("denied", note)
                     _finish(f"[denied by user: {note}]" if note
                             else "[denied by user]")
@@ -693,7 +833,9 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
             # every tool uniformly, including read-only ones (read_file, grep)
             # that never went through the approval gate at all.
             if cb.secret_challenge:
-                matches = secretscan.scan(out, cb.secret_allowlist)
+                matches = secretscan.scan(
+                    out, (cb.secret_allowlist or set())
+                    | (cb.secret_session_keep or set()))
                 if matches:
                     decision = cb.secret_challenge(f"tool:{call.name}", matches,
                                                    source_text=out)
@@ -716,12 +858,19 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
             # just the call, so a deliberate re-run (write -> test -> fix ->
             # re-test) whose output changed is never told it's a no-op repeat.
             key = (call.name, repr(sorted(call.arguments.items())))
+            raw_out = out   # compare/store without the note, or round 3 never matches
             if last_results.get(key) == out:
                 out += ("\n[note: you already ran this exact call with this "
                         "exact result — do not repeat it; use the result "
                         "above or give your final answer]")
-            this_round_results[key] = out
+            this_round_results[key] = raw_out
             _finish(out)
             turn.events.append({"tool": call.name, "args": call.arguments})
+        repeated = bool(this_round_results) and all(
+            last_results.get(k) == v for k, v in this_round_results.items())
+        repeat_rounds = repeat_rounds + 1 if repeated else 0
         last_results = this_round_results
         _flush()
+        if repeat_rounds >= REPEAT_ROUNDS_STOP:
+            cb.notify("stopped: the model keeps repeating the same call")
+            return turn

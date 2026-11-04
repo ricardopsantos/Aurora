@@ -3,6 +3,8 @@ name = "aurora-agent"
 version = "0.1.0"
 description = "Aurora — micro terminal coding agent (Anthropic / OpenRouter / local llama.cpp / local Ollama)"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+classifiers = ["License :: OSI Approved :: MIT License"]
 dependencies = [
     "httpx>=0.27",
     "PyYAML>=6.0",
@@ -12,6 +14,8 @@ dependencies = [
     "keyring>=24.0",
     "cryptography>=42.0",
     "ddgs>=9.0",
+    "pypdf>=4.0",       # R381: text from PDF attachments in the web chat
+    "Pillow>=10.0",     # R381: picture attachments are shrunk to 1568 px for the model
 ]
 
 [project.scripts]
@@ -71,3 +75,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["aurora*"]
+
+[tool.setuptools.package-data]
+"aurora.web" = ["index.html", "index_paper.html", "index_v2.html", "app.js", "sw.js", "manifest.webmanifest", "favicon.png", "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png"]

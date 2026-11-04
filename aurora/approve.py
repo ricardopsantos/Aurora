@@ -133,6 +133,14 @@ DANGEROUS_COMMANDS = frozenset({
     "nohup", "timeout", "nice", "watch", "crontab", "at",
     # process killers: the target pid/name is the payload
     "kill", "pkill", "killall",
+    # R319: more interpreters and writers. Verified before the fix: `sqlite3
+    # app.db .tables` stored `sqlite3 app.db` and then auto-approved
+    # `sqlite3 app.db '.shell id'`; `psql -c`/`mysql -e` leave the SQL free;
+    # `csh`/`tcsh`/`pwsh`/`tclsh`/`expect`/`julia`/`swift`/`irb` run any script.
+    "sqlite3", "psql", "mysql", "mariadb", "mongosh", "redis-cli",
+    "csh", "tcsh", "pwsh", "tclsh", "wish", "expect", "julia", "swift", "irb",
+    "luajit", "groovy", "scala", "kotlin", "dotnet",
+    "sort", "nc", "ncat", "socat", "telnet", "ftp",
 })
 
 # R277: `git` itself is safe to generalize (`git status`, `git log …`) —
@@ -140,6 +148,8 @@ DANGEROUS_COMMANDS = frozenset({
 # `git -c core.sshCommand=… fetch`, `git -c alias.x='!cmd' x`. A stored
 # `git -c` rule used to auto-approve any of those.
 _GIT_EXEC_OPTIONS = ("-c", "--config-env", "--exec-path")
+_GIT_RETARGET_OPTIONS = ("-C", "--git-dir", "--work-tree", "--namespace")
+_GIT_CONFIG_SUBCOMMANDS = ("config", "alias")
 
 # families whose real binary name carries a suffix: mkfs.ext4, newfs_hfs
 _DANGEROUS_PREFIXES = ("mkfs.", "newfs_")
@@ -253,6 +263,15 @@ def _is_dangerous(toks: tuple) -> bool:
     if "git" in names and any(t == o or t.startswith(o + "=")
                               for t in toks for o in _GIT_EXEC_OPTIONS):
         return True
+    # R319: `git -C <dir>` retargets the whole command and `git config` /
+    # `git alias` write settings that later run code (`alias.x=!cmd`,
+    # `core.fsmonitor`, `core.hooksPath`), so neither may generalize.
+    if "git" in names:
+        i = [os.path.basename(t) for t in toks].index("git")
+        rest = toks[i + 1:]
+        if rest and (rest[0] in _GIT_RETARGET_OPTIONS
+                     or any(t in _GIT_CONFIG_SUBCOMMANDS for t in rest[:2])):
+            return True
     return False
 
 
@@ -517,6 +536,46 @@ def _matches(tool: str, args: dict, data: dict, strict: bool = False) -> bool:
                for g in rules)
 
 
+# R334: "allow for this session" — rules kept in memory only, built by the same
+# `_rule_for` (so every R149/R319 safety rule applies) and gone on exit.
+_SESSION_RULES: dict[str, list[str]] = {}
+
+
+def add_session_rule(tool: str, args: dict) -> str:
+    rule = _rule_for(tool, args)
+    if rule and rule not in _SESSION_RULES.setdefault(tool, []):
+        _SESSION_RULES[tool].append(rule)
+    return rule
+
+
+def session_rules() -> dict[str, list[str]]:
+    return {k: list(v) for k, v in _SESSION_RULES.items() if v}
+
+
+def clear_session_rules() -> None:
+    _SESSION_RULES.clear()
+
+
+def rule_scope(tool: str, args: dict) -> tuple[str, str]:
+    """R335: what "always allow" would store, and in words how far it reaches,
+    so the approval prompt can show it BEFORE the user commits."""
+    rule = _rule_for(tool, args)
+    if not rule:
+        return "", ""
+    if tool in _COMMAND_TOOLS:
+        full = shlex.join(_norm_command(args.get("command", "")))
+        if rule == full:
+            return rule, "exactly this command"
+        if len(_norm_command(rule)) == 1:
+            return rule, f"`{rule}` with any arguments"
+        return rule, f"any command starting `{rule}`"
+    if tool in _URL_TOOLS:
+        return rule, "any page on that site"
+    if rule == "*":
+        return rule, "every call of this tool"
+    return rule, "this path"
+
+
 def is_allowed(tool: str, args: dict, data: dict | None = None) -> bool:
     # R299: wait_until runs a SECOND shell command, `then`, that no rule ever
     # saw — the signature is `command` only — so one "always allow" on a
@@ -529,8 +588,10 @@ def is_allowed(tool: str, args: dict, data: dict | None = None) -> bool:
     # the working directory always prompts (the prompt now shows `in:`).
     if tool in _COMMAND_TOOLS and _foreign_cwd(args.get("cwd")):
         return False
-    return _matches(tool, args, data if data is not None else load(),
-                    strict=True)
+    return (_matches(tool, args, data if data is not None else load(),
+                     strict=True)
+            or (bool(_SESSION_RULES)
+                and _matches(tool, args, _SESSION_RULES, strict=True)))
 
 
 def _foreign_cwd(cwd) -> bool:
@@ -578,6 +639,55 @@ def legacy_rules(data: dict | None = None) -> list[str]:
             if p and len(p.split()) < 2 and p not in SAFE_COMMANDS]
 
 
+def audit(data: dict | None = None) -> dict[str, list[tuple[str, str]]]:
+    """R336: run_command/wait_until rules that no longer earn their place.
+    Returns {tool: [(rule, reason)]}. Reasons: `duplicate`, `legacy` (single
+    token that is not a safe command — exact match only), `exact-only` (a
+    two-token rule on a command today's classifier would store whole, so it
+    only ever matches itself)."""
+    data = data if data is not None else load()
+    out: dict[str, list[tuple[str, str]]] = {}
+    for tool in _COMMAND_TOOLS:
+        seen, found = set(), []
+        for rule in data.get(tool, []):
+            if not rule:
+                continue
+            if rule in seen:
+                found.append((rule, "duplicate"))
+                continue
+            seen.add(rule)
+            toks = _norm_command(rule)
+            if len(toks) < 2 and rule not in SAFE_COMMANDS:
+                found.append((rule, "legacy"))
+            elif (len(toks) == 2 and rule not in SAFE_COMMANDS
+                  and (_is_dangerous(toks) or _is_compound(rule)
+                       or toks[1].startswith("-"))):
+                found.append((rule, "exact-only"))
+        if found:
+            out[tool] = found
+    return out
+
+
+def prune(data: dict | None = None) -> int:
+    """R336: drop what `audit` reports (every duplicate but the first, every
+    legacy and exact-only rule). Returns how many were removed."""
+    data = data if data is not None else load()
+    removed = 0
+    for tool, found in audit(data).items():
+        drop = {r for r, why in found if why != "duplicate"}
+        keep, seen = [], set()
+        for rule in data.get(tool, []):
+            if rule in drop or rule in seen:
+                removed += 1
+                continue
+            seen.add(rule)
+            keep.append(rule)
+        data[tool] = keep
+    if removed:
+        save(data)
+    return removed
+
+
 def _rule_for(tool: str, args: dict) -> str:
     """The rule string add_rule/add_deny_rule persist. For commands, the
     first TWO normalized tokens ("rm -rf", "git push") — a bare first token
@@ -614,8 +724,14 @@ def _rule_for(tool: str, args: dict) -> str:
         # varying part is always just a path/pattern) — store the bare
         # command name so "always allow" on `find /a` also covers `find /b`
         # in a different project/session instead of re-prompting per path
-        return toks[0] if toks and toks[0] in SAFE_COMMANDS \
-            else shlex.join(toks[:2])
+        if toks and toks[0] in SAFE_COMMANDS:
+            return toks[0]
+        # R319: a flag as the second token is the harmless half of a payload
+        # (`sort -o`, `psql -c`, `tcsh -c`): the value after it is what runs
+        # or gets overwritten. Store the whole command, exact-only.
+        if len(toks) >= 2 and toks[1].startswith("-"):
+            return shlex.join(toks)
+        return shlex.join(toks[:2])
     if tool in _URL_TOOLS:                                    # R283
         return _url_origin_rule(str(args.get("url", "")))
     return _norm_path(args.get("path", "")) or "*"
@@ -687,26 +803,41 @@ def _rewind_note(tool: str, args: dict) -> str:
             "this write]\n")
 
 
+def _raw_lines(path: Path) -> list[str]:
+    """R324: the file as the write will see it — no universal-newline
+    translation, so `\\r\\n` and a lone `\\r` are not folded into `\\n`."""
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return f.read().split("\n")
+
+
 def _diff_preview(tool: str, args: dict) -> str:
     if tool == "write_file":
         path = Path(args["path"]).expanduser()
-        old = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
-        new = args.get("content", "").splitlines()
+        old = _raw_lines(path) if path.is_file() else []
+        new = args.get("content", "").split("\n")
         d = difflib.unified_diff(old, new, "before", "after", lineterm="")
     elif tool == "edit_file":
         path = Path(args["path"]).expanduser()
         if not path.is_file():
             return "[new edit — file does not exist]"
-        text = path.read_text(encoding="utf-8")
+        from .tools import _read_for_edit
+        text, _crlf = _read_for_edit(path)
         # R95a: honour replace_all. The preview must show what the edit will
         # ACTUALLY do — a fixed count of 1 here previewed one changed line
         # while `tools.edit_file(replace_all=True)` then changed every
         # occurrence, so the human approved a diff that wasn't the change.
         old, new = args.get("old", ""), args.get("new", "")
         count = -1 if args.get("replace_all") else 1
+        # R324: the preview must not show a change the tool will refuse.
+        n = text.count(old)
+        if n == 0:
+            return "[edit will fail: `old` not found — nothing changes]"
+        if n > 1 and count == 1:
+            return (f"[edit will fail: `old` occurs {n} times and replace_all "
+                    "is not set — nothing changes]")
         d = difflib.unified_diff(
-            text.splitlines(),
-            text.replace(old, new, count).splitlines(),
+            text.split("\n"),
+            text.replace(old, new, count).split("\n"),
             "before", "after", lineterm="")
     elif tool == "apply_patch":
         path = Path(args["path"]).expanduser()
@@ -719,10 +850,11 @@ def _diff_preview(tool: str, args: dict) -> str:
         # to the human as the preview itself, via diff_preview()'s outer
         # exception guard, rather than only being discovered after approval)
         from . import patch as patchmod
-        text = path.read_text(encoding="utf-8")
+        from .tools import _read_for_edit
+        text, _crlf = _read_for_edit(path)
         hunks = patchmod.parse(args.get("diff", ""))
         new_text = patchmod.apply(text, hunks)
-        d = difflib.unified_diff(text.splitlines(), new_text.splitlines(),
+        d = difflib.unified_diff(text.split("\n"), new_text.split("\n"),
                                  "before", "after", lineterm="")
     else:
         return ""

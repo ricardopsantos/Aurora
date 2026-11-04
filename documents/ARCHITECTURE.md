@@ -1,658 +1,699 @@
-# Aurora — Architecture
+# Aurora architecture
 
-Reference doc for how the pieces fit together. `CHANGELOG_TECHNICAL.md`
-(formerly `AURORA.md`) is the numbered requirements/spec (the *what* and
-*why*, R1–R306+); this is the *how* — module
-map, data flow, boundaries, and the mechanisms worth understanding before
-touching them. Update this file whenever a change alters one of these shapes,
-not just when adding a requirement.
+How the pieces fit together: the module map, the data flow, the boundaries,
+and the mechanisms worth understanding before you change them. The numbered
+requirements (what and why) are in `CHANGELOG_TECHNICAL.md` (R1 to R293) and
+in `REQUIREMENTS.md` with `requirements/` (the newer ones). Update this file
+whenever a change alters one of these shapes, not only when you add a
+requirement.
 
-## 1. The two halves: Engine and Frontend
+## 1. The two halves: engine and front ends
 
 Aurora is built around one hard boundary, enforced by a test
-(`tests/test_architecture.py` greps imports):
+(`tests/test_architecture.py` checks the imports):
 
 ```
-UI (tui.py / ui.py)  ──drives──>  Engine (engine.py)  ──drives──>  Provider (providers/*)
-      ^                                  |
-      └──────── Frontend protocol ───────┘
-         (engine calls back INTO the UI)
+front end (tui.py / ui.py / headless.py / web/)  ──drives──>  Engine (engine.py)  ──drives──>  Provider (providers/*)
+      ^                                                            |
+      └──────────────────── Frontend protocol ─────────────────────┘
+                     (the engine calls back into the front end)
 ```
 
-- **`engine.py`** owns ALL conversation state: provider/model selection,
-  `messages` history, session, config, cost/token accounting. It **never**
-  imports a UI toolkit (no `prompt_toolkit`, no `print`, no `input`) and never
-  touches the terminal directly. Every side effect the engine needs from a
-  human goes through a `Frontend`.
-- **`frontend.py`** defines the `Frontend` Protocol — the ONLY vocabulary
-  shared between the two halves: `on_text`, `on_think`, `on_tool_start`,
-  `on_tool_result`, `on_usage`, `notify`, `invalidate_status`, `approve`,
-  `ask_continue`, `ask_secret`, `secret_challenge`, `cancelled`. If the
-  engine ever needs a new kind of
-  human interaction, it is added here first, then every front end
-  implements it.
-- **Two front ends today**, both implementing `Frontend`: `tui.py` (full-screen
-  `prompt_toolkit` Application) and `ui.py` (classic inline REPL, used for
-  `--classic` and non-tty/pipe/CI). **`tui.TuiFrontend` subclasses
-  `ui.TerminalFrontend`** — most of the interaction logic (approve/ask_continue/
-  secret_challenge text and option lists) lives once in `ui.py`; the TUI only
-  overrides what actually needs a different *render* (see §4).
+- `engine.py` owns all conversation state: the provider and model, the
+  `messages` history, the session, the config, and cost and token counts. It
+  never imports a UI toolkit (no `prompt_toolkit`, no `print`, no `input`) and
+  never touches the terminal. Anything the engine needs from a person goes
+  through a `Frontend`.
+- `frontend.py` defines the `Frontend` protocol, the only vocabulary the two
+  halves share: `on_text`, `on_think`, `on_tool_start`, `on_tool_result`,
+  `on_usage`, `notify`, `invalidate_status`, `approve`, `ask_continue`,
+  `ask_secret`, `secret_challenge` and `cancelled`. If the engine needs a new
+  kind of interaction, add it here first and then implement it in every front
+  end.
+- There are four front ends:
+  - `tui.py`, the full-screen `prompt_toolkit` application.
+  - `ui.py`, the classic inline REPL, used for `--classic` and when there is
+    no terminal (pipes, CI). `tui.TuiFrontend` subclasses
+    `ui.TerminalFrontend`, so most of the interaction logic (the text and
+    options for approvals, continue questions and secret challenges) lives
+    once in `ui.py`. The TUI overrides only what it draws differently
+    (see §4).
+  - `headless.py`, for `aurora -t` one-shot runs. It never asks: allowlisted
+    tools run and the rest are denied, unless `--yes` is given (R311, R337).
+  - `aurora/web/`, Aurora Lite (`aurora --web`, R353). `server.py` is the
+    HTTP side, standard library only, serving the pages and the `/api/*`
+    routes behind a bearer token. `core.py` holds the web `Frontend` and the
+    one shared session: one engine, one turn at a time, with later messages
+    queued in order (R373), and the events kept in memory so a page that
+    reconnects can replay what it missed. Notes, attachments, chat exports,
+    folders and shares each have their own module (`notes.py`, `attach.py`,
+    `export.py`, `folders.py`, `shares.py`). The pages are static files
+    (`index_v2.html` for `/`, `index_paper.html` for `/paper`, `index.html`
+    for `/v1`) sharing one `app.js`, with `sw.js` and a manifest for offline
+    use and the home screen.
 
-**Why this matters**: a third front end (HTML/websocket, say) is "write a new
-`Frontend` implementation," not "refactor the engine." Conversely, anything
-that feels like it needs `print()` or a widget inside `engine.py` or
-`agent.py` is a sign the abstraction is leaking — route it through a new
-`Frontend` method instead.
+The point of the boundary: a new front end means writing a new `Frontend`
+implementation, not changing the engine, and the web version was built that
+way. If something seems to need `print()` or a widget inside `engine.py` or
+`agent.py`, the abstraction is leaking; add a `Frontend` method instead.
 
-**The guard is only as good as its AST check (R90a).** A *relative* import —
-`from .ui import estimate_tokens` inside `engine.py` — parses as
-`module="ui", level=1`, so the original `node.module.endswith(".ui")` test
-never saw it, and exactly that import sat in the engine for weeks while the
-suite stayed green. The check now rebuilds the dotted name from `node.level`
-and also inspects plain `import` statements. The general lesson: when a
-shared helper is wanted on both sides of the boundary, it goes into a
-neutral engine-side module (that's what `tokens.py` is — `estimate_tokens`
-/`fmt_token_count`, re-exported from `ui` for the existing call sites),
-never imported *out of* the UI half.
+The import check is only as good as its parsing (R90a). A relative import
+such as `from .ui import estimate_tokens` inside `engine.py` parses as
+`module="ui", level=1`. The original check, `node.module.endswith(".ui")`,
+never saw it, and that exact import sat in the engine for weeks while the
+tests stayed green. The check now rebuilds the dotted name from `node.level`
+and also looks at plain `import` statements. When both halves need a helper,
+put it in a neutral module on the engine side and never import it from the UI
+half. `tokens.py` is that module for `estimate_tokens` and `fmt_token_count`,
+which `ui` re-exports for its existing callers.
+
+### The front-end contract: `aurora/service.py` (R394)
+
+A front end gets two things from the core. One is the engine object, passed
+in and driven through the `Frontend` protocol above. The other is
+`aurora.service`, a small facade for everything else a UI needs:
+
+- `version()` and `aurora_home()`;
+- sessions: `session_ids`, `session_exists`, `list_sessions`,
+  `search_sessions`, `session_mtime`, `count_prompts`, `export_markdown`,
+  `usage_by_model`, `new_session`, and `session_records` with
+  `format_tool_call` for the HTML export (R421);
+- the `models:` list in `config.yaml`, edited as text: `model_entries`,
+  `model_add`, `model_update`, `model_delete`, `load_models`,
+  `write_text_atomic` and `ModelEditError` (R423);
+- remembered state: `load_state` and `save_state`;
+- the key store's prompt: `set_secret_prompter`;
+- checkpoints and undo: `checkpoints`, `diff_since`, `undo_preview`,
+  `undo_diff` and `undo`;
+- `ProviderError`.
+
+`aurora/web/` may import nothing else from the core, so `session`, `rewind`,
+`config`, `keystore` and `paths` can change freely as long as the facade keeps
+its signatures. `tests/test_architecture.py::test_web_imports_core_only_via_service`
+enforces this, resolving relative imports as described for R90a. Each facade
+function looks up its target when called, so tests that patch
+`aurora.session` still work. A new front end (or a daemon or API mode) should
+use the same facade. If it needs more, add a function to the facade instead
+of importing a core module.
+
+`session_exists` checks every session id that comes from a page (read,
+resume, delete, rename, move). It accepts exact ids only and costs one
+`stat`, so call it freely (R395). The listing functions behind the facade
+scan the sessions folder once per call; don't add per-session checks back
+into them.
 
 ## 2. The agent loop (`agent.py`)
 
 `run_turn(provider, model, messages, system, cb: AgentCallbacks, ...)` is the
-model⇄tool loop, driven entirely by callbacks (`AgentCallbacks`), so it's
-UI-agnostic and directly unit-testable with a fake provider + fake callbacks
-(see `tests/test_core.py::FakeProvider`/`_cb`). One call = one user turn = a
+loop between the model and the tools. It's driven entirely by callbacks
+(`AgentCallbacks`), so it knows nothing about the UI and can be tested
+directly with a fake provider and fake callbacks (see
+`tests/test_core.py::FakeProvider` and `_cb`). One call is one user turn, a
 `while True` loop that:
 
-1. Calls `provider.turn(...)` (streams text via `cb.on_text`).
-2. If the response has tool calls: for each one — approval gate if needed
-   (`tools.NEEDS_APPROVAL`), R58 secret scan (see §5), run the tool, R58 scan
-   the OUTPUT, then append the (call, output) pair to `round_out`.
-3. Flushes `round_out` as history messages (`_flush()` — one message per
-   call via `tool_result_message()`; a provider MAY instead implement the
-   optional `tool_results_messages()` hook to bulk-flush a round as one
-   message, if its API needs that shape for parallel tool results — no
-   current provider does).
-4. Loops until the model stops calling tools (final answer) or a control
-   signal fires: cancelled, iteration cap hit and user says stop, approval
-   says stop, or a secret challenge says stop.
+1. Calls `provider.turn(...)`, which streams text through `cb.on_text`.
+2. If the response has tool calls, for each one: asks for approval if needed
+   (`tools.NEEDS_APPROVAL`), runs the R58 secret scan (see §7), runs the
+   tool, scans the output, and adds the (call, output) pair to `round_out`.
+3. Writes `round_out` to the history with `_flush()`, one message per call
+   through `tool_result_message()`. A provider may implement the optional
+   `tool_results_messages()` hook instead, to write a whole round as one
+   message if its API needs that for parallel tool results. No current
+   provider does.
+4. Repeats until the model stops calling tools (the final answer) or
+   something stops it: a cancel, the step limit with the user choosing to
+   stop, an approval answered "stop", or a secret challenge answered "stop".
 
-**Mutates `messages` in place** — the caller (`Engine.send`) passes its own
-`self.messages` list, so history persists across turns without the agent loop
-knowing anything about session/engine state.
+The loop changes `messages` in place. `Engine.send` passes its own
+`self.messages` list, so the history carries over between turns without the
+loop knowing anything about the session or the engine.
 
-**In place is a contract, not an implementation detail (R154).** `run_turn`
-holds that one list object for the whole turn, so anything that rewrites
-history *during* a turn must mutate the same object — `Engine.compact_history`
-does `self.messages[:] = ...` rather than rebinding for exactly this reason. A
-rebind splits the two: the engine holds the new list while the loop keeps
-appending to and sending the old one, silently, with nothing looking wrong.
+In place is a contract (R154). `run_turn` holds that one list object for the
+whole turn, so anything that rewrites the history during a turn must change
+the same object. That's why `Engine.compact_history` does
+`self.messages[:] = ...` instead of assigning a new list. A new list would
+split the two: the engine would hold the new list while the loop kept adding
+to and sending the old one, and nothing would look wrong.
 
-**Step 0 (R154): `cb.maybe_compact()`, between rounds only.** Before building
-each request after the first, the loop asks the engine whether history needs
-folding (auto-compact at 80%, see `_maybe_auto_compact_mid_turn`). A round
-boundary is the only safe point: it is where every assistant `tool_calls`
-entry already has its matching `tool` results, so the list can be rewritten
-without producing an invalid sequence. The split of responsibility is
-deliberate — the loop knows *when it is safe to ask*, the engine owns *the
-policy* (threshold, whether it's enabled at all, what a fold does).
+Step 0 (R154) is `cb.maybe_compact()`, between rounds only. Before each
+request after the first, the loop asks the engine whether the history needs
+folding (auto-compact at 80%, see `_maybe_auto_compact_mid_turn`). The gap
+between rounds is the only safe point, because there every assistant
+`tool_calls` entry already has its matching `tool` results, so the list can
+be rewritten without leaving an invalid sequence. The loop knows when it's
+safe to ask; the engine owns the policy (the threshold, whether it's on, and
+what a fold does).
 
-**Step 2 runs read-only calls concurrently (R94), and that changes nothing
-observable.** Before the sequential per-call loop, every call whose name is
-in `tools.PARALLEL_SAFE` is dispatched at once through
-`tools.run_tools_parallel`; the loop then consumes those results in the
-model's original order. The invariant to preserve when touching this: only
-the *waiting* is parallel. Tool starts, approvals, secret challenges, the
-transcript and the history messages all stay strictly ordered — a user must
-never be asked two questions at once, and `messages` must never depend on
-which read finished first. `PARALLEL_SAFE` is an explicit allowlist, not
-`set(all) - NEEDS_APPROVAL`: the test is "read-only AND no shared state", so
-an ungated but stateful tool would be correctly excluded even though it
-needs no approval (`todo_write`, R93, was that case before its removal).
+Step 2 runs read-only calls at the same time (R94), and nothing visible
+changes. Before the loop that handles calls one by one, every call whose name
+is in `tools.PARALLEL_SAFE` is started at once through
+`tools.run_tools_parallel`, and the loop then takes their results in the
+model's original order. Keep this rule when you change it: only the waiting
+is parallel. Tool starts, approvals, secret challenges, the transcript and the
+history all stay in order. The user must never get two questions at once,
+and `messages` must never depend on which read finished first.
+`PARALLEL_SAFE` is an explicit list, not "every tool that needs no approval",
+because the test is "read-only and no shared state". A tool that needs no
+approval but keeps state is left out; `todo_write` (R93) was such a tool
+before it was removed.
 
-**Degrade paths are deliberate, not incidental**: a malformed tool call gets
-one corrective retry, then the model degrades to chat-only for the rest of
-the session (`turn.degraded`); a `ProviderError` is inspected for known
-substrings ("timed out", "context" + "exceed", …) to give targeted advice
-instead of a raw exception. Every one of these is a place a future change
-should ADD a case, not replace the pattern — see CHANGELOG_TECHNICAL.md's per-R entries
-for the history of what each one is guarding against.
+The fallback paths are deliberate. A malformed tool call gets one corrective
+retry; after that the model falls back to plain chat for the rest of the
+session (`turn.degraded`). A `ProviderError` is checked for known phrases
+("timed out", "context" with "exceed", and so on) to give specific advice
+instead of a raw exception. When you change one of these, add a case rather
+than replacing the pattern. The per-requirement entries say what each one
+guards against.
 
 ## 3. Providers (`providers/`)
 
-`base.Provider` is the abstract contract: `turn()` returns a `TurnResult`
-(text, tool_calls, stop_reason, token counts); `assistant_message()` /
-`tool_result_message()` convert Aurora's internal shapes to the API's wire
-format. One concrete implementation:
+`base.Provider` is the abstract contract. `turn()` returns a `TurnResult`
+(text, tool calls, stop reason, token counts), and `assistant_message()` and
+`tool_result_message()` turn Aurora's internal shapes into the API's format.
+There is one implementation:
 
-- **`openai_compat.py`** — one implementation for THREE backends: OpenRouter,
-  a local llama.cpp server, and any other OpenAI-compatible server (LM
-  Studio, …). This sharing is why generic-sounding fixes (connect timeouts,
-  retries) live in one file but must reason about very different network
-  conditions (a VPN/tailnet-only local server vs. a public API).
+- `openai_compat.py` serves three kinds of backend: OpenRouter, a local
+  llama.cpp server, and any other OpenAI-compatible server (LM Studio and
+  others). Because of this, general fixes such as connect timeouts and
+  retries live in one file but have to handle very different networks, from
+  a local server reached over a VPN to a public API.
 
-**`make_provider(name, cfg, timeout)`** (`providers/__init__.py`) builds the
-right one from a config entry's `type:` field.
+`make_provider(name, cfg, timeout)` in `providers/__init__.py` builds the
+right provider from the `type:` field of a config entry.
 
-**Per-turn knobs are ATTRIBUTES, not `turn()` parameters** — `extra_body`,
-`on_think` and (R91) `cache_prompt` are all set on the provider by
-`Engine.send` just before the call. That's a deliberate pattern, not
-laziness: `turn()`'s signature is implemented by every provider and faked by
-a dozen tests, so widening it for each new per-turn option would churn all
-of them for something only one implementation reads. New per-turn options
-should follow the same route.
+Per-turn settings are attributes, not `turn()` parameters. `extra_body`,
+`on_think` and `cache_prompt` (R91) are set on the provider by `Engine.send`
+just before the call. Every provider implements `turn()`'s signature and a
+dozen tests fake it, so adding a parameter for each new per-turn option would
+change all of them for something only one implementation reads. New per-turn
+options should work the same way.
 
 ### Prompt caching (R91)
-`_system_message(system, cache)` decides between a plain string and a
-content block carrying `cache_control: {"type": "ephemeral"}`. The
-OpenAI-compatible world splits in two here and one marker covers both:
-OpenAI/DeepSeek-style backends cache long prefixes automatically and ignore
-the marker; Anthropic-family models via OpenRouter cache ONLY at an explicit
-breakpoint. Below `_CACHE_MIN_CHARS` nothing is marked — a cache *write*
-costs more than a plain read, and Anthropic won't cache a short prefix at
-all. The system prompt is the only sensible breakpoint: it's the one part of
-a request that is byte-identical for a whole session, and it is re-sent on
-every tool iteration, each one billed (R37).
 
-### Networking hardening (all in `openai_compat.py` — read before touching connect logic)
-These exist because of *specific* production failures, not speculative
-robustness — each one is load-bearing:
-- **`_is_lan_host(base_url)`** classifies a host as local/tailnet (loopback,
-  private IP, `.local`, `.ts.net`) vs. a public API. Connect timeout is 5s for
-  LAN (fail fast when a local server is off) vs. 20s for remote (a public
-  API's TLS handshake can legitimately be slow).
-- **`_is_bare_ip(base_url)`** (R64) is the NARROWER sibling check used to skip
-  TLS verification: true only for a literal private/loopback IP host, never
-  for a hostname (`.ts.net` included). A reverse proxy fronting llama.cpp
-  commonly serves a cert issued for one hostname only — dialling the same
-  listener by LAN IP always fails verification even though the connection is
-  trusted. `verify=not _is_bare_ip(url)` must be passed to
-  `HappyEyeballsTransport(...)` itself, NOT to `httpx.Client(verify=...)` —
-  httpx silently ignores the client-level `verify=`/`cert=` kwargs once a
-  custom `transport=` is supplied. Every bare-IP dial site needs this: the
-  pooled client in `openai_compat.py`, its `_probe()`, and
-  `engine.provider_health()`'s own separate `/props` call — a second,
-  easy-to-miss call site outside `openai_compat.py` entirely.
-- **`live_context_limit()`** (the `/props` llama.cpp probe) is gated behind
-  `_is_lan_host` — probing it on a remote provider wastes a doomed ~6s
-  request on the UI thread at every status render, freezing startup.
-- **`pick_endpoint()`'s `_probe()`** hits `{base}/props` (llama.cpp-native,
-  `/v1` stripped) to fail over between a `base_url` list fast instead of
-  waiting for the real request to time out. Any OpenAI-compatible endpoint
-  put in front of a local server — e.g. m7's `aurora-gateway.py`, which
-  unifies local llama.cpp + real OpenRouter behind one provider entry (see
-  CHANGELOG_TECHNICAL.md's "As-built additions" for the deployment note) — MUST
-  implement a passthrough `/props` route or every request looks
-  unreachable and Aurora never gets past the probe.
-- **`happy_eyeballs.py`** — a custom httpcore network backend that races
-  IPv4/IPv6 and uses whichever connects first (RFC 8305). A host with both A
-  and AAAA records on a machine whose public IPv6 route is dead (common with
-  Tailscale up) otherwise burns the WHOLE connect timeout stalling on IPv6
-  before falling back (measured 17s → 0.56s against OpenRouter). This is
-  NOT the same as forcing IPv4 — the race is correct on IPv4-only and
-  IPv6-only networks too.
-- **Pre-stream connection retry** (`turn()`'s `_ATTEMPTS` loop) — a pooled
-  keep-alive connection that went stale while Aurora sat idle resets on reuse
-  ("Connection reset by peer"). httpcore's own `retries=` only covers the
-  CONNECT phase, not a failure during the request, so `turn()` retries a
-  transient connection error itself — but ONLY while `result.text` is still
-  empty (a mid-stream drop keeps its partial instead, never duplicating
-  output already shown to the user).
-- **User-facing connectivity errors never echo config verbatim** (`agent.py`
-  `_provider_label`/`_connectivity_hint`, 2026-07-12). A `ProviderError`'s own
-  message embeds `provider.name` — the raw config-KEY string, which a user
-  can name however they like (their own machine's nickname, say) — and a
-  local/LAN `base_url` can bake in a personal hostname too (a Tailscale
-  MagicDNS name). Neither is ever printed: the notice classifies
-  `_is_lan_host(base_url)` into "local backend" (generic, no hostname) or the
-  hostname itself for a remote provider (public SaaS domains — openrouter.ai
-  — aren't personal, so showing them is fine and more useful). A `curl`-based
-  connectivity hint follows the same rule: concrete
-  for remote, host-free for local. Open-source hygiene: config is user data,
-  Aurora never echoes it back.
+`_system_message(system, cache)` returns either a plain string or a content
+block with `cache_control: {"type": "ephemeral"}`. One marker covers both
+kinds of OpenAI-compatible backend: OpenAI- and DeepSeek-style backends cache
+long prefixes automatically and ignore the marker, while Anthropic models on
+OpenRouter cache only at an explicit marker. Below `_CACHE_MIN_CHARS` nothing
+is marked, because writing to the cache costs more than a plain read and
+Anthropic won't cache a short prefix anyway. The system prompt is the only
+sensible place for the marker: it's the one part of a request that stays the
+same for a whole session, and it's sent again, and billed again, on every
+tool step (R37).
 
-### Backend API surface a self-hosted server must implement
+### Network handling (all in `openai_compat.py`; read this before changing connection code)
 
-Everything below is what Aurora actually calls against `providers.local
-.base_url` (llama.cpp's own OpenAI-compat server). Nothing here is
-Aurora-specific protocol — it's the exact subset of llama.cpp's real HTTP
-API Aurora depends on; a from-scratch reimplementation only needs to match
-these.
+Each of these exists because of a specific failure in real use:
 
-**Required — llama.cpp server (`providers.local.base_url`, `type: openai`):**
-- `POST {base_url}/chat/completions` — OpenAI-compatible chat completions,
-  **streaming** (`"stream": true`, SSE `data:` lines, terminated by
-  `data: [DONE]`). Aurora sends `messages`, `model`, `stream_options:
-  {"include_usage": true}`, and (if the model entry has `tools:`)
-  `tools` in OpenAI tool-call schema. It reads `choices[0].delta.content`,
-  `choices[0].delta.tool_calls[].function.{name,arguments}` (both can arrive
-  fragmented across chunks — Aurora accumulates by index), `choices[0]
-  .delta.reasoning_content` (optional — thinking models only, e.g. Qwen3.x;
-  routed to the UI's dim reasoning stream, never stored in history), and a
-  final chunk's `usage.{prompt_tokens,completion_tokens}`. `finish_reason`
-  on the last choice becomes `TurnResult.stop_reason`. (`openai_compat.py
-  :turn()`)
-- Auth: `Authorization: Bearer <LLAMA_API_KEY>` if `api_key_env` is set on
-  the provider (omitted entirely when no key is configured — llama-server
-  treats that as open).
+- `_is_lan_host(base_url)` sorts a host into local or VPN (loopback, a
+  private IP, `.local`, `.ts.net`) or a public API. The connect timeout is
+  5 seconds for local hosts, to fail fast when a local server is off, and 20
+  seconds for remote ones, because a public API's TLS handshake can be slow.
+- `_is_bare_ip(base_url)` (R64) is the narrower check used to skip TLS
+  verification. It's true only when the host is a literal private or loopback
+  IP, never for a hostname (including `.ts.net`). A reverse proxy in front of
+  llama.cpp usually has a certificate for one hostname, so reaching the same
+  server by its LAN IP always fails verification even though the connection
+  is trusted. Pass `verify=not _is_bare_ip(url)` to
+  `HappyEyeballsTransport(...)` itself, not to `httpx.Client(verify=...)`:
+  httpx ignores the client's `verify=` and `cert=` once you give it a custom
+  `transport=`. Every place that dials a bare IP needs this: the pooled client
+  in `openai_compat.py`, its `_probe()`, and the separate `/props` call in
+  `engine.provider_health()`, which is easy to miss because it's outside
+  `openai_compat.py`.
+- `live_context_limit()`, the llama.cpp `/props` lookup, runs only for local
+  hosts. On a remote provider it would waste a doomed request of about 6
+  seconds on the UI thread at every status redraw and freeze startup.
+- `_probe()` in `pick_endpoint()` calls `{base}/props` (llama.cpp's own route,
+  with `/v1` removed) to choose quickly between the URLs in a `base_url` list,
+  instead of waiting for a real request to time out. Any OpenAI-compatible
+  endpoint placed in front of a local server, such as a gateway that combines
+  a local llama.cpp server and OpenRouter behind one provider entry, must pass
+  `/props` through. Otherwise every request looks unreachable and Aurora never
+  gets past the probe.
+- `happy_eyeballs.py` is a custom httpcore network backend that tries IPv4 and
+  IPv6 at the same time and uses whichever connects first (RFC 8305). Without
+  it, a host with both A and AAAA records, on a machine whose public IPv6
+  route is dead (common with a VPN), waits out the whole connect timeout on
+  IPv6 before trying IPv4. Against OpenRouter this went from 17 seconds to
+  0.56. It isn't the same as forcing IPv4; the race also works on IPv4-only
+  and IPv6-only networks.
+- `turn()` retries a failed connection before streaming starts (its
+  `_ATTEMPTS` loop). A pooled keep-alive connection that went stale while
+  Aurora was idle resets when reused ("Connection reset by peer"). httpcore's
+  own `retries=` covers only the connect phase, not a failure during the
+  request, so `turn()` retries a temporary connection error itself, but only
+  while `result.text` is still empty. A drop in the middle of the stream
+  keeps what arrived, so nothing the user has already seen is repeated.
+- Connection errors shown to the user never repeat the config word for word
+  (`_provider_label` and `_connectivity_hint` in `agent.py`). A
+  `ProviderError` message includes `provider.name`, the config key, which the
+  user may have named after their own machine, and a local `base_url` may
+  contain a personal hostname such as a VPN name. Aurora prints neither. The
+  message says "local backend" for a local host, and the hostname only for a
+  remote provider, since public domains such as openrouter.ai aren't
+  personal and showing them helps. The suggested `curl` command follows the
+  same rule. Config is user data, and Aurora doesn't echo it back.
 
-**Optional but exercised whenever the server is llama.cpp itself (not a
-generic OpenAI-compat backend like OpenRouter) — llama.cpp's own `/props`:**
-- `GET {base_url_without_/v1}/props` — used for THREE separate things, so a
-  server claiming llama.cpp compatibility should implement it if it wants
-  full behavior rather than degraded-but-working:
-  1. **Fast-fail probing** (`_probe()`) — a 2s-budget health check per
-     configured endpoint, so `pick_endpoint()` can fail over between a LAN
-     and Tailscale `base_url` in seconds instead of waiting out the full
-     request timeout.
-  2. **Live context limit** (`live_context_limit()`) — reads
-     `default_generation_settings.n_ctx` so the status bar / `/status`
-     shows the REAL loaded context, not a guessed config default.
-  3. **`/status` / startup banner health** (`Engine.provider_health()`) —
-     reads `model_path` (basename shown as "ready") and the same `n_ctx`
-     field; a response that's missing either is treated as "reachable but
-     schema changed" (loud, not silently blank — see R: "Upgrade surfaces").
-  Missing `/props` entirely degrades gracefully: context limit falls back
-  to `config.yaml`'s `context_limit` (default 128k), and `/status` shows
-  "remote API (no health endpoint)" instead of erroring — this is exactly
-  how a non-llama.cpp OpenAI-compat backend (OpenRouter, LM Studio) is
-  already handled, so it's a supported configuration, not just tolerated.
+### What a self-hosted server must provide
 
-## 4. The TUI's three areas (`tui.py`) — R53
+These are the calls Aurora makes to `providers.local.base_url` (llama.cpp's
+OpenAI-compatible server). None of it is Aurora's own protocol; it's the
+subset of llama.cpp's HTTP API that Aurora uses, so a server written from
+scratch only needs to match this.
 
-Full-screen layout is an `HSplit` of exactly three regions, and this is a
-**discipline for future surfaces**, not just current layout — pick the one
-area matching a new feature's role:
+Required, for a llama.cpp server (`type: openai`):
 
-1. **Chat/scrollback** (`_ChatControl` in a `Window`) — the only area that
-   scrolls; wheel/PgUp/drag-select live here. Fragment-cached per entry
-   (`_cache`) since a long session appends thousands of chunks and re-parsing
-   the whole ANSI stream on every keystroke would be O(n²). **Rendered from
-   an incremental LINE cache (R289)**: `_ChatControl` overrides
-   `create_content` and serves `Tui._render_lines()` through a lazy
-   `UIContent.get_line`, so a frame reads only the rows the Window asks for
-   (the visible ones). The stock `FormattedTextControl` re-split and hashed
-   the whole transcript ~2.6× per frame (63ms at 9.6k lines; 7.6ms after).
-   `_rebuild_locked` records the first line a truncation/append can touch
-   (`_split_line`); only lines from there are re-split. **Capped at
-   `_SCROLLBACK_MAX_LINES` (R152)**: Aurora's own flatten is flat in session
-   length (R96b), but the fragment list goes whole to prompt_toolkit's
-   `create_content`, which is linear and runs before its own cache — so the
-   only lever is fewer fragments. Trimming invalidates any selection rather
-   than remapping it, because `_sel`/`_sel_frozen` are absolute line
-   coordinates.
-2. **Input area** — `self.input` (a `TextArea`) plus, ABOVE it, a dedicated
-   menu window for `select()` challenges. Two separate mechanisms live here,
-   easy to conflate:
-   - **`ask()`** (free-text: passphrases, comment guidance) reuses the
-     `TextArea`'s own `prompt=` (a `BeforeInput` processor) — fine for a
-     single line.
-   - **`select_menu()`** (multi-choice: approvals, confirms, R58 challenges)
-     renders in its OWN `Window(FormattedTextControl(...))`, NOT the input
-     prompt — a multi-line prompt drawn via `BeforeInput` turns embedded
-     newlines into literal `^J` (staircased garbage). This was a real,
-     shipped bug; don't reintroduce it by "simplifying" the menu back into
-     the input prompt.
-   - **A menu label can carry raw ANSI colour** (R59 — `/model`'s `[$]`/
-     `[free]` tags use the same `GREEN`/`YELLOW` constants the classic REPL
-     prints directly). `_menu_fragments` parses each label through
-     `ANSI(label).__pt_formatted_text__()` rather than treating it as
-     literal text — otherwise the raw escape bytes render as garbage
-     characters instead of colour. Each parsed sub-fragment's colour layers
-     ONTO the row's base style (selected/option), so a plain label (the
-     common case — approve/confirm menus have none) keeps its old look.
-3. **Status bar** (2 lines, `FormattedTextControl`) — read-only, never
-   scrolls or takes input. Line 1 is identity ONLY (model/ctx/session
-   id/mode — `prompt mode` or `bash mode`); line 2 is tooltips by default,
-   replaced wholesale by whichever transient
-   status is live (exit-confirm → awaiting-answer → copy-notice → busy
-   spinner → tooltips — first match wins, they never coexist).
+- `POST {base_url}/chat/completions`: OpenAI-compatible chat completions with
+  streaming (`"stream": true`, SSE `data:` lines ending with `data: [DONE]`).
+  Aurora sends `messages`, `model`, `stream_options: {"include_usage": true}`
+  and, if the model entry has `tools:`, `tools` in the OpenAI tool-call
+  schema. It reads `choices[0].delta.content`,
+  `choices[0].delta.tool_calls[].function.{name,arguments}` (both may arrive
+  in pieces across chunks; Aurora joins them by index),
+  `choices[0].delta.reasoning_content` (optional, for thinking models such as
+  Qwen3; shown in the dim reasoning stream and never stored in the history),
+  and the last chunk's `usage.{prompt_tokens,completion_tokens}`. The last
+  choice's `finish_reason` becomes `TurnResult.stop_reason`. (See
+  `openai_compat.py:turn()`.)
+- Auth: `Authorization: Bearer <LLAMA_API_KEY>` when the provider has
+  `api_key_env`. With no key configured the header is left out, which
+  llama-server treats as open.
 
-**The `builtins.input` monkeypatch** (`Tui.run()`): while the TUI runs,
-`input()` is replaced with `self.ask()`, and `ui.select` is replaced with
-`self.select_menu()`. This is how `ui.py`'s interaction code (written against
-plain `input()`/`select()`) renders differently in the TUI without
-duplicating any of that logic — restored on exit via `finally`.
+Optional, but used whenever the server is llama.cpp itself (not a generic
+OpenAI-compatible backend such as OpenRouter):
 
-**Mouse handlers can crash the whole app.** prompt_toolkit's own
-`CompletionsMenuControl.mouse_handler` asserts an active `complete_state`;
-a stray click after the completions closed (e.g. returning to the terminal
-window after switching away) raises, and any handler exception kills
-`app.run()`. `_SafeCompletionsMenuControl` is the pattern for guarding a
-library handler we don't own: check the precondition, swallow if absent.
-Any future float/control built on a library class needs the same scrutiny.
+- `GET {base_url without /v1}/props`, used for three things:
+  1. Fast health checks (`_probe()`): a 2-second check per configured
+     endpoint, so `pick_endpoint()` can switch between a LAN and a VPN
+     `base_url` in seconds instead of waiting for the full request timeout.
+  2. The live context limit (`live_context_limit()`): it reads
+     `default_generation_settings.n_ctx`, so the status bar and `/status`
+     show the real loaded context instead of a config default.
+  3. Health in `/status` and the startup banner
+     (`Engine.provider_health()`): it reads `model_path` (the file name is
+     shown as "ready") and `n_ctx`. A reply missing either is reported as
+     "reachable but the response changed", loudly, rather than shown blank.
 
-## 5. Persistence — several DIFFERENT stores, on purpose
+  Without `/props` everything still works. The context limit falls back to
+  `context_limit` in `config.yaml` (128k by default), and `/status` shows
+  "remote API (no health endpoint)" instead of an error. Aurora handles
+  OpenRouter and LM Studio this way, so it's a supported setup.
+
+## 4. The TUI's three areas (`tui.py`, R53)
+
+The full-screen layout is an `HSplit` of exactly three areas. Treat this as a
+rule for new features too: put each one in the area that matches its role.
+
+1. Chat and scrollback (`_ChatControl` in a `Window`). This is the only area
+   that scrolls, and the mouse wheel, PgUp and drag-select work here.
+   Fragments are cached per entry (`_cache`), because a long session adds
+   thousands of chunks and parsing the whole ANSI stream on every keystroke
+   would be O(n²).
+   - It's drawn from an incremental line cache (R289). `_ChatControl`
+     overrides `create_content` and serves `Tui._render_lines()` through a
+     lazy `UIContent.get_line`, so a frame reads only the rows the window
+     asks for, which are the visible ones. The stock `FormattedTextControl`
+     split and hashed the whole transcript about 2.6 times per frame (63 ms
+     at 9,600 lines, 7.6 ms after the change). `_rebuild_locked` records the
+     first line a trim or append can affect (`_split_line`), and only lines
+     from there are split again.
+   - It's capped at `_SCROLLBACK_MAX_LINES` (R152). Aurora's own flattening
+     doesn't grow with session length (R96b), but the fragment list goes
+     whole to prompt_toolkit's `create_content`, which is linear and runs
+     before prompt_toolkit's own cache. The only way to speed that up is
+     fewer fragments. Trimming clears any selection instead of moving it,
+     because `_sel` and `_sel_frozen` are absolute line positions.
+2. The input area: `self.input` (a `TextArea`) and, above it, a separate
+   window for `select()` menus. Two mechanisms live here and are easy to mix
+   up:
+   - `ask()` (free text: passphrases, comments) uses the `TextArea`'s own
+     `prompt=` (a `BeforeInput` processor), which is fine for one line.
+   - `select_menu()` (multiple choice: approvals, confirmations, R58
+     challenges) draws in its own `Window(FormattedTextControl(...))`, not in
+     the input prompt. A multi-line prompt drawn with `BeforeInput` shows
+     each newline as a literal `^J`, a staircase of garbage. That bug shipped
+     once; don't bring it back by moving the menu into the input prompt.
+   - A menu label can contain raw ANSI colour (R59). The `[$]` and `[free]`
+     tags in `/model` use the same `GREEN` and `YELLOW` constants the classic
+     REPL prints. `_menu_fragments` parses each label with
+     `ANSI(label).__pt_formatted_text__()` instead of treating it as plain
+     text, which would show the escape bytes as garbage. Each parsed piece's
+     colour is layered onto the row's base style (selected or not), so a
+     plain label (approval and confirm menus have none) looks the same as
+     before.
+3. The status bar (two lines, `FormattedTextControl`). It's read-only and
+   never scrolls or takes input. Line 1 shows identity only: model, context,
+   session id, and the mode (`prompt mode` or `bash mode`). Line 2 shows
+   key hints by default, replaced entirely by whichever temporary status is
+   live. The order is exit question, waiting for an answer, copy notice,
+   busy spinner, then key hints; the first that applies wins, and they never
+   appear together.
+
+The TUI replaces `builtins.input` while it runs (`Tui.run()`). `input()`
+becomes `self.ask()` and `ui.select` becomes `self.select_menu()`. That's how
+the interaction code in `ui.py`, written for plain `input()` and `select()`,
+draws differently in the TUI without being duplicated. Both are restored on
+exit in a `finally` block.
+
+Mouse handlers can crash the whole app. prompt_toolkit's own
+`CompletionsMenuControl.mouse_handler` asserts that a `complete_state` is
+active. A click after the completion menu closed (for example when you come
+back to the terminal window) raises, and any exception in a handler ends
+`app.run()`. `_SafeCompletionsMenuControl` shows how to guard a library
+handler we don't own: check the precondition and ignore the event if it's
+missing. Any new float or control built on a library class needs the same
+care.
+
+## 5. Storage: several separate stores, on purpose
 
 | File | Lives in | What | Written by |
 |---|---|---|---|
-| `config.yaml` | repo (committed, synced) | providers, models, `runtime.*` defaults incl. `secret_allowlist` (SHA-256 hashes only — see §7) | `persist_runtime_value()` — `/redact`, `/redact allowlist [clear]`, `/multiline` (`/max` was removed, see §8) |
-| `AURORA_HOME/state.yaml` | per-machine | `last_model`/`last_provider` (R51) | `config.save_state_values()` |
-| `AURORA_HOME/allowlist.yaml` | per-machine | tool-approval "always" rules (unrelated to the secret allowlist above — same word, two different features) | `approve.add_rule()` |
-| `AURORA_HOME/denylist.yaml` | per-machine | tool-approval "always DENY" rules — never asked again, and no allowlist rule can bypass one | the approval prompt's *Always DENY* |
-| `AURORA_HOME/sessions/<id>.jsonl` | per-machine | every turn/tool/approval, append-only. Past `session.SESSION_LOG_MAX_BYTES` (5MB) a session CONTINUES in `<id>.2.jsonl`, `<id>.3.jsonl`, … — one session id maps to a *sequence* of parts, oldest first, and every reader in `session.py` walks that sequence via `_parts_for()`. Nothing is ever deleted; only which file a record lands in changes | `Session.log()` |
-| `AURORA_HOME/keys.enc` + `keys.salt` | per-machine | the opt-in Fernet-encrypted key store and its PBKDF2 salt — see the keyring note at the end of this section | `keystore._encfile_save()` via `paths.write_bytes_atomic` (mode `0600`) |
-| `AURORA_HOME/bootstrap.md` | per-machine | the saved global bootstrap prompt; a project's `.aurora/bootstrap.md` overrides it | `/bootstrap set` |
-| `AURORA_HOME/trusted_bootstraps.json` | per-machine | R286: project bootstrap prompts approved to run, as path → SHA-256 of the approved content (an edit asks again) | `bootstrap.trust()` |
-| `AURORA_HOME/checkpoints/<hash>/` | per-machine | shadow git repo, pre-mutation snapshots (R47), capped at `rewind.RETENTION` (R151) | `rewind.checkpoint()` |
+| `config.yaml` | Your checkout (only `config.yaml.example` is in the repo). Some setups commit and share it. | Providers, models and `runtime.*` defaults, including `secret_allowlist` (SHA-256 hashes only, see §7) | `persist_runtime_value()`, used by `/redact`, `/redact allowlist [clear]` and `/multiline`; the web page's model editor (R423, R427) |
+| `AURORA_HOME/config.local.yaml` | This machine | Settings for this machine only, merged over `config.yaml` (R316) | You, or the web page's YAML editor (R427) |
+| `AURORA_HOME/state.yaml` | This machine | `last_model` and `last_provider` (R51), and the web page's own `web_last_model`, `web_last_provider` and `web_auto_approve` | `config.save_state_values()` |
+| `AURORA_HOME/allowlist.yaml` | This machine | "Always allow" approval rules. (Not related to the secret allowlist above; same word, two features.) | `approve.add_rule()` |
+| `AURORA_HOME/denylist.yaml` | This machine | "Always DENY" approval rules. They're never asked again and no allow rule overrides them. | The approval prompt's "Always DENY" |
+| `AURORA_HOME/sessions/<id>.jsonl` | This machine | Every turn, tool call and approval, append-only. Past `session.SESSION_LOG_MAX_BYTES` (5 MB) a session continues in `<id>.2.jsonl`, `<id>.3.jsonl` and so on, so one session id maps to a sequence of parts, oldest first. Every reader in `session.py` walks that sequence through `_parts_for()`. Nothing is deleted; only the file a record goes to changes. | `Session.log()` |
+| `AURORA_HOME/keys.enc` and `keys.salt` | This machine | The optional Fernet-encrypted key store and its PBKDF2 salt (see the keyring note below) | `keystore._encfile_save()` through `paths.write_bytes_atomic` (mode `0600`) |
+| `AURORA_HOME/bootstrap.md` | This machine | The saved global bootstrap prompt; a project's `.aurora/bootstrap.md` takes precedence | `/bootstrap set` |
+| `AURORA_HOME/trusted_bootstraps.json` | This machine | Project bootstrap prompts approved to run, as path to SHA-256 of the approved content; editing the prompt makes Aurora ask again (R286) | `bootstrap.trust()` |
+| `AURORA_HOME/checkpoints/<hash>/` | This machine | Shadow git repo with snapshots taken before each change (R47), capped at `rewind.RETENTION` (R151) | `rewind.checkpoint()` |
+| `AURORA_HOME/spend.json` | This machine | Daily spending totals for `/budget day`, 60 days kept (R340) | The engine |
+| `AURORA_HOME/try/<timestamp>/` | This machine | Throwaway worktrees for `/try` (R342) | `trybox.py` |
+| `AURORA_HOME/web-notes/`, `web-chats.json`, `web-shares.json` | This machine | The web page's notes (one `.txt` per note plus `index.json`), chat folders and share links | `web/notes.py`, `web/folders.py`, `web/shares.py` |
+| `AURORA_HOME/workspace/input/` and `workspace/outputs/` | This machine | Files attached in the web page, and files Aurora writes for you (R413, R432) | `web/attach.py` |
 
-**Every one of these files is written atomically** — `paths.write_text_atomic`
-for the YAML (R146a), `paths.write_bytes_atomic` for the key store (R201) —
-both being: sibling temp file, `fsync`, `os.replace`, then `_fsync_dir` on the
-parent directory (R171/I6, R234). A plain `write_text()` over the live file
-truncates it first, so a crash mid-write left `config.yaml` empty and
-`load_config` failing at the next start; and without the directory fsync a
-power loss can drop the *rename* itself and resurrect the previous contents,
-which for `keys.enc` means every stored key. The two writers share
-`_fsync_dir` precisely so they cannot drift apart — they had, and
-`write_bytes_atomic` (the key store's writer) was the half missing it. Any new
-persisted file gets the same treatment.
+Every one of these files is written atomically: `paths.write_text_atomic`
+for text (R146a) and `paths.write_bytes_atomic` for the key store (R201).
+Both write a temporary file next to the target, `fsync` it, `os.replace` it,
+then `fsync` the folder with `_fsync_dir` (R171/I6, R234). A plain
+`write_text()` over the live file empties it first, so a crash in the middle
+used to leave `config.yaml` empty and `load_config` failing on the next
+start. Without the folder `fsync`, a power cut can lose the rename itself and
+bring back the old contents, which for `keys.enc` means every stored key. The
+two writers share `_fsync_dir` so they can't drift apart; they had, and the
+key store's writer was the one missing it. Any new stored file gets the same
+treatment.
 
-**Only the checkpoints directory has a retention policy** (R151 — `RETENTION`
-snapshots per project, `UNDO_TAG_RETENTION` undo tags, pruned on a background
-thread every `_PRUNE_EVERY` checkpoints). It is the one store that grows
-per-mutation rather than per-setting. Note *why* it needed a real mechanism
-rather than a delete loop: old commits can't be removed while they're
-ancestors of HEAD, so `prune()` marks the Nth commit as a **shallow root**
-(the `git fetch --depth` mechanism) instead of rewriting history — rewriting
-would change every hash, including ones `/rewind` has already shown the user.
-The `undo-<hash>` tags matter more than the chain: each one made an orphaned
-commit reachable, so growth was previously *irreducible*, not just unbounded.
-Session JSONLs still grow forever by design (R20).
+Only the checkpoints folder has a retention policy (R151): `RETENTION`
+snapshots per project and `UNDO_TAG_RETENTION` undo tags, pruned on a
+background thread every `_PRUNE_EVERY` checkpoints. It's the one store that
+grows with every change rather than every setting. A delete loop wasn't
+enough, because old commits can't be removed while they're ancestors of
+HEAD. `prune()` marks the Nth commit as a shallow root (the mechanism behind
+`git fetch --depth`) instead of rewriting history, which would change every
+hash, including ones `/rewind` has already shown you. The `undo-<hash>` tags
+mattered even more than the chain: each one kept an orphaned commit
+reachable, so without pruning the growth could never be reduced. Session
+logs still grow forever, by design (R20).
 
-**Why config.yaml vs. state.yaml is a real distinction, not a whim**:
-config.yaml is meant to be committed and synced between machines (providers,
-model list, feature defaults); state.yaml is per-machine runtime state that
-would be actively WRONG to sync (which model you had loaded on THIS machine).
-A new persisted setting has to pick the right one — "does this make sense to
-share across machines?" is the test.
+The split between `config.yaml` and `state.yaml` is real. `config.yaml` can
+be shared between machines (providers, the model list, feature defaults).
+`state.yaml` is runtime state for one machine that would be wrong to share,
+such as which model you last used on this machine. A new stored setting has
+to pick one; ask "does this make sense on every machine?".
 
-**The allowlist matches on NORMALIZED command tokens** (`approve._norm_command`
-— `shlex` split + `~` expansion), not raw strings. `bash ~/x.sh`, `bash
-"/home/me/x.sh"`, and `bash /home/me/x.sh` must all match one stored rule —
-this was a real bug (each spelling was a distinct string, so "always allow"
-silently never fired for the next spelling the model happened to emit).
+The allowlist matches normalized command words (`approve._norm_command`,
+which splits with `shlex` and expands `~`), not raw strings. `bash ~/x.sh`,
+`bash "/home/me/x.sh"` and `bash /home/me/x.sh` must all match one saved
+rule. This was a real bug: each spelling was a different string, so "always
+allow" never fired for the next spelling the model happened to use.
 
-**`SAFE_COMMANDS` (R67) generalizes read-only commands across arguments.**
-The default rule stores the first TWO tokens of a command (`find /path/A`)
-and matches that prefix exactly — correct for anything that can write/delete/
-execute, since a bare `rm` must never auto-approve `rm -rf /`. But for a
-curated set of read-only commands (`find`, `ls`, `tree`, `grep`, `cat`, …)
-that's too strict: "always allow" on one path never covered the same command
-against a different path in a different project, which read as "the
-allowlist doesn't persist across sessions" even though the file itself was
-fine. For a `SAFE_COMMANDS` entry, `add_rule()` stores just the bare command
-name and `is_allowed()` prefix-matches it regardless of args.
+`SAFE_COMMANDS` (R67) lets read-only commands match any arguments. The
+default rule stores the first two words of a command (`find /path/A`) and
+matches that prefix exactly, which is right for anything that can write,
+delete or run code, since a bare `rm` must never approve `rm -rf /`. For a
+chosen set of read-only commands (`find`, `ls`, `tree`, `grep`, `cat` and
+others) that was too strict: "always allow" on one path never covered the
+same command on a different path in another project, which looked like "the
+allowlist doesn't persist" even though the file was fine. For a
+`SAFE_COMMANDS` entry, `add_rule()` stores just the command name and
+`is_allowed()` matches it whatever the arguments, unless the call uses one of
+that command's writing flags (see FEATURES.md).
 
-**The OS keyring lives OUTSIDE `AURORA_HOME` entirely** (R60) — macOS
-Keychain / SecretService via `keyring.{get,set,delete}_password`, a SEPARATE
-store keyed by service name `"aurora-agent"`, not a file under `AURORA_HOME`.
-Note the qualifier: this is true of the KEYRING backend, not of key storage
-in general. The opt-in fallback — `keys.enc` in the table above — *is* a file
-under `AURORA_HOME`, which is why `aurora wipe` destroys it along with
-everything else. This is why `aurora wipe` clears keyring entries FIRST
-(`keystore.clear_key` for every `api_key_env`/`token_env` this config.yaml
-uses — `_known_key_names()`, not a hardcoded list) and only THEN deletes the
-`AURORA_HOME` directory: `rm -rf`ing the directory alone would leave stored
-keys behind, silently un-logging-out the user. `aurora key clear <VAR>`
-exposes the same clearing logic for a single key. Verifying delete/clear
-logic MUST mock both the keyring module AND `AURORA_HOME` in the same
-command — see the MEMORY finding on this (a real Keychain deletion incident
-from an ad-hoc verification run that mocked only one of the two).
+The OS keyring lives outside `AURORA_HOME` (R60). It's the macOS Keychain or
+SecretService, used through `keyring.{get,set,delete}_password` under the
+service name `"aurora-agent"`, a store of its own rather than a file. This is
+true of the keyring only: the optional fallback, `keys.enc`, is a file under
+`AURORA_HOME`, which is why `aurora wipe` removes it with everything else. It
+also explains the order in `aurora wipe`. It first clears the keyring entry
+for every `api_key_env` and `token_env` the config uses (`keystore.clear_key`
+over `_known_key_names()`, not a fixed list), and only then deletes
+`AURORA_HOME`. Deleting the folder alone would leave stored keys behind and
+quietly keep the user logged in. `aurora key clear <VAR>` uses the same logic
+for one key. When you test delete or clear logic, mock both the keyring
+module and `AURORA_HOME` in the same run. Mocking only one of them has
+deleted real Keychain entries before.
 
 ## 6. Threading model
 
-- **Main/UI thread**: runs the `prompt_toolkit` `Application` event loop
-  (`self.app.run()`). MUST NEVER BLOCK — no network calls, no `input()`. Any
-  blocking ask (`ask()`/`select_menu()`) raises `RuntimeError` if called from
-  this thread specifically, to fail loudly instead of deadlocking silently
-  (that thread is the one that would have to deliver the answer).
-- **Worker thread** (`Tui._worker`): runs one loop consuming submitted lines
-  from `self._inbox`, calling into `ui._send_turn`/`_handle_command` (R96f —
-  `_send_turn` directly, not through a per-turn wrapper thread; see below).
-  This is where `Engine.send()` and the whole agent loop execute — it's fine
-  for this thread to block on network I/O or on `ask()`/`select_menu()`
-  (those route back to the UI thread via a `queue.Queue`).
-- **Side worker thread** (`Tui._side_worker`, R245/R253): the second consumer,
-  fed only by `_route_submitted_line` and only while the main worker is busy.
-  It runs the things that must not wait for a turn — a `!` bash command, a
-  read-only `/command`, `/model`, or a prompt answered as a quick-ask. What
-  may reach it is defined by what it must NOT do: nothing here writes
-  `engine.messages` or the session, so the single-writer property below is
-  unchanged. `Engine.quick_ask` is the shape that makes a mid-turn question
-  possible without one — it reads a *snapshot* of history and writes nothing
-  back, rather than becoming a second turn. Note what else is per-turn shared
-  state once a second thread exists: a **provider** carries `on_think`,
-  `extra_body`, `cache_prompt` and `notify`, all assigned by `send()` for the
-  turn in flight, and `fe.on_text` is that turn's renderer. So a side turn
-  builds its own provider (`_side_provider`, cached per provider like the
-  turn's) and renders through neither. The rule generalizes: **anything a
-  turn configures by assignment, or infers from its own output, is not safe
-  to borrow from the side channel** — R254 found four separate instances of
-  it (the provider's per-turn callbacks, the frontend renderer, `append()`'s
-  merge-into-the-previous-entry, and `append()` closing the think row on the
-  reasoning that output means this request stopped thinking). R255 then found
-  three more on a path with **no second thread at all** — the one-off side
-  completions (the approval gate's `explain`, the commit draft, the compact
-  summarizer) each borrowed `provider.on_think`, which `send()` assigns per
-  turn, so their reasoning landed in the running turn's think row. Same
-  thread is not the same as same context: the rule is about what the turn
-  *owns*, not about concurrency. `providers.base.side_completion` is the one
-  correct implementation of that shape.
+- The main (UI) thread runs the `prompt_toolkit` application event loop
+  (`self.app.run()`). It must never block: no network calls, no `input()`.
+  Any blocking question (`ask()` or `select_menu()`) raises `RuntimeError`
+  when called from this thread, so it fails loudly instead of deadlocking,
+  because this is the thread that would have to deliver the answer.
+- The worker thread (`Tui._worker`) runs one loop that takes submitted lines
+  from `self._inbox` and calls `ui._send_turn` or `_handle_command` (R96f;
+  `_send_turn` directly, not through a per-turn wrapper thread, see below).
+  `Engine.send()` and the whole agent loop run here. This thread may block on
+  the network or on `ask()` and `select_menu()`, which hand the question to
+  the UI thread through a `queue.Queue`.
+- The side worker thread (`Tui._side_worker`, R245, R253) is a second
+  consumer. `_route_submitted_line` feeds it, and only while the main worker
+  is busy. It runs what shouldn't wait for a turn: a `!` bash command, a
+  read-only `/command`, `/model`, or a prompt answered as a side question.
+  - What it may do is defined by what it must not do: it never writes
+    `engine.messages` or the session, so the history keeps a single writer.
+    `Engine.quick_ask` is what makes a side question possible without a
+    second writer: it reads a snapshot of the history and writes nothing
+    back, instead of becoming a second turn.
+  - Once there's a second thread, more state turns out to belong to the
+    turn. A provider carries `on_think`, `extra_body`, `cache_prompt` and
+    `notify`, all set by `send()` for the turn in progress, and `fe.on_text`
+    is that turn's renderer. So a side request builds its own provider
+    (`_side_provider`, cached per provider like the turn's) and uses neither.
+  - The general rule: anything a turn sets by assignment, or works out from
+    its own output, isn't safe to borrow from the side channel. R254 found
+    four cases: the provider's per-turn callbacks, the front end's renderer,
+    `append()` merging into the previous entry, and `append()` closing the
+    thinking row on the assumption that output means the request has
+    stopped thinking.
+  - R255 found three more on a path with no second thread at all. The
+    one-off side requests (the approval prompt's Explain, the commit draft,
+    the compaction summary) each borrowed `provider.on_think`, which `send()`
+    sets per turn, so their reasoning showed up in the running turn's
+    thinking row. Being on the same thread isn't the same as sharing the
+    turn's context: the rule is about what the turn owns, not about
+    concurrency. `providers.base.side_completion` is the one correct way to
+    make such a request.
+  - The same goes for checks, the other way round: the side path must make
+    every check the main path makes. The R58 secret scan was skipped there
+    and leaked a token to the provider and the session log (R254g). It now
+    refuses instead, because the challenge is interactive and the side path
+    may not own the input line.
+- There's no per-turn wrapper thread in the TUI (R96f). `ui._run_turn` runs a
+  turn in its own thread so the main thread can catch `KeyboardInterrupt`
+  while `input()` blocks. That only makes sense in the classic REPL, where the
+  turn runs on the main thread. The TUI's `_worker` is already a background
+  thread, and SIGINT only ever reaches the main thread (prompt_toolkit also
+  keeps the terminal in raw mode, so `^C` never becomes a signal; the TUI
+  cancels with `fe.cancel_event.set()` from the Esc menu). So the TUI calls
+  `ui._send_turn`, the body of `_run_turn`, directly on the worker thread.
+  That cuts the depth of "which thread is a mid-turn question on" from four
+  levels to three.
+- The ticker thread is cosmetic. It redraws the app every 0.5 seconds while
+  busy, to animate the spinner and the elapsed time.
+- The startup health check (`Tui._banner` and `ui._banner`, both calling
+  `Engine.provider_health()`) also runs on the main thread, but before
+  `app.run()` starts the event loop. Nothing is on screen yet, so a stuck
+  call would make the whole app look dead at launch (R66).
+  `provider_health()` runs the actual check on a throwaway daemon thread and
+  waits at most `timeout` (4 seconds by default) with `thread.join(timeout)`.
+  If the check hasn't answered by then, startup goes on with an "unknown /
+  timed out" result. A health check must never block the thing it's
+  checking.
+- The context limit refresh (`Engine._context_limit_nonblocking`, R95i)
+  applies the same rule to normal redraws. `status()` calls
+  `context_stats()` on the UI thread for every frame, and for the `local`
+  model the limit is a live `/props` lookup behind an endpoint check. When
+  the backend was down, the app froze for about 6 seconds every time the
+  120-second cache expired. The lookup now runs on a daemon thread and the
+  redraw gets the cached value (or `Provider.static_context_limit()`, the
+  offline answer, before the first lookup finishes). A stale value is better
+  than a frozen screen.
 
-  The same applies to gates, in the other direction: the side path must pass
-  everything the main path passes. R58's secret scan was skipped there and
-  leaked a token to the provider and to the session log (R254g); it now
-  refuses, because the challenge is interactive and this path may not own
-  the input line.
-- **No per-turn wrapper thread in the TUI (R96f).** `ui._run_turn` wraps a
-  turn in its own thread so the MAIN thread can catch `KeyboardInterrupt`
-  while `input()` blocks — that only makes sense in the classic REPL, where
-  `run_turn` executes ON the main thread. The TUI's `_worker` is already a
-  background thread, and SIGINT is only ever delivered to the process's main
-  thread anyway (prompt_toolkit also runs the terminal in raw mode, so `^C`
-  never becomes a signal there at all — TUI cancellation is
-  `fe.cancel_event.set()` via the Esc-Esc menu, unrelated to this
-  mechanism). So the TUI calls `ui._send_turn` — the turn's body factored out
-  of `_run_turn` — directly on the worker thread, collapsing "which thread is
-  a mid-turn key prompt on" from four levels deep to three.
-- **Ticker thread**: purely cosmetic, invalidates the app every 0.5s while
-  busy to animate the spinner/elapsed-time.
-- **Startup banner health probe** (`Tui._banner`/`ui._banner`, both call
-  `Engine.provider_health()`): this runs on the main thread too, but BEFORE
-  `app.run()` even starts the event loop — nothing is on screen yet, so a
-  stuck call here doesn't just block one render, it makes the whole app look
-  dead at launch (R66). `provider_health()` therefore runs its actual probe
-  on a throwaway daemon thread and hard-caps the wait (`timeout=4.0` default)
-  via `thread.join(timeout)` — if the probe hasn't returned in time, startup
-  proceeds with an "unknown/timed out" health result instead of waiting on
-  it. A health CHECK must never be able to block the thing it's checking.
-- **Context-limit refresh** (`Engine._context_limit_nonblocking`, R95i): the
-  same rule applied to the *steady-state* render path. `context_stats()` is
-  called by `status()` on the UI thread on every frame, and for the `local`
-  model the limit is a live `/props` lookup behind an endpoint probe — so a
-  backend that was down froze the app for ~6s each time the 120s cache
-  expired. The lookup now runs on a daemon thread and the render is served
-  the cached value (or `Provider.static_context_limit()`, the offline
-  answer, before the first one lands). **Stale beats blocking.**
+  Use this shape for anything the status bar shows: if getting the answer
+  can touch a socket, the redraw gets the last known value and a refresh
+  runs in the background. The redraw never makes the call itself.
 
-  This is the general shape for anything the status bar wants to show: if
-  answering it can touch a socket, the render path gets the last known
-  value and a background refresh, never the call itself.
+A blocking question is a hand-off through a queue. The worker thread calls
+`ask()` or `select_menu()`, which sets state (`self._question` or
+`self._menu_*`), asks the UI thread to redraw so the question appears, and
+then waits on `self._answers.get()`. The UI thread's key handlers `put()` the
+answer when Enter or a menu choice fires. This is the only synchronization
+between the two threads for questions. Only the worker thread touches the
+session and message state, so that state needs no lock of its own.
 
-A blocking ask/select is a **queue handoff**: the worker thread calls
-`ask()`/`select_menu()`, which sets state (`self._question`/`self._menu_*`),
-invalidates the app so the UI thread renders the prompt, then blocks on
-`self._answers.get()`. The UI thread's key-binding handlers (running on the
-main thread) `put()` the answer when Enter/a menu choice fires. This is the
-one synchronization primitive between the two threads for interactive
-prompts — session/message state itself is only ever touched by the worker
-thread, so it doesn't need its own lock.
+The input line does need one (R253). `ask()` and `select_menu()` write single
+slots (`_question`, `_menu_prompt` and `_menu_options`, `_saved_draft`) and
+wait on the one `_answers` queue. Once a second thread could ask, two
+questions could overwrite each other and neither would ever be answered. The
+Esc confirmation had already hit this once (R142a). `_prompt_lock`, an
+`RLock` because one command may ask more than once, is held for as long as a
+command is asking. The main worker waits for it, because whoever holds it is
+showing the user something. The side worker marks its thread
+`_prompt_nowait` and gets an `InputLineBusy` refusal instead, because waiting
+there would defeat a channel that exists so questions never wait. The lock
+protects the terminal's one input line, not engine state, which still has
+exactly one writer.
 
-The *input line* does need one (R253). `ask()`/`select_menu()` write single
-slots (`_question`, `_menu_prompt`/`_menu_options`, `_saved_draft`) and block
-on that one `_answers` queue, so once a second thread could prompt, two
-prompts could overwrite each other and neither would ever be answered — the
-shape R142a already survived once with the Esc-Esc confirm. `_prompt_lock`
-(an `RLock`: one command legitimately prompts more than once) is held for the
-whole duration of a prompting command. The main worker blocks for it, because
-whoever holds it is something a human is looking at; the side worker marks
-its thread `_prompt_nowait` and takes an `InputLineBusy` refusal instead,
-since parking there would defeat a channel that exists so a question never
-waits. Note the asymmetry is the design: the lock protects the *terminal's*
-one input line, not engine state, which still has exactly one writer.
+## 7. Secret redaction (R58): the engine decides, the front end draws
 
-## 7. Secret redaction (R58) — a case study in "engine decides, frontend renders"
+This feature touches every layer above, so it's a good template for the
+next similar one.
 
-Added 2026-07-12; a good template for the next similar feature, since it
-touches all the layers above:
+- `secrets.py` only detects and redacts; it has no UI and no I/O:
+  `scan(text) -> list[Match]`, `redact(text, matches) -> str` and
+  `preview(matches) -> str`. The preview summarizes the kinds and counts and
+  never shows the secret itself, not even in the challenge. Detection has
+  two passes:
+  - Known vendor shapes, by regex: `AKIA…`, `ghp_…`, `.env`-style
+    assignments, and a GUID/UUID pattern, because some systems use those as
+    API keys or session tokens.
+  - An entropy check for tokens with no recognizable prefix, such as an
+    internal tool's random token, which no shape regex would match. It only
+    looks at text the first pass didn't already claim, so a UUID counts
+    once, as `"GUID/UUID"`. It skips hex-only strings (git SHAs, MD5 and SHA
+    digests) on purpose, because they're a common false positive.
+  - Source code and word-shaped names are skipped (R328).
+- There are three main scan points, chosen so the session log always matches
+  what was sent, with no separate check for the log:
+  - `Engine.send()` scans `user_text` before it enters `messages` and the
+    log.
+  - The tool loop in `agent.py` scans each tool's raw output before
+    `_finish()`, which is before `on_tool_result` and before it becomes a
+    `tool_result_message`. This covers every tool the same way, including
+    read-only ones such as `read_file` and `grep` that never go through the
+    approval prompt.
+  - `run_command`'s own command string is scanned just before it runs. This
+    one is deliberately different: it only calls `notify()`. It never
+    challenges, blocks or redacts, because a command usually needs its real
+    argument (a real key in a curl header) to work, so changing it would
+    break it, and blocking would repeat the approval the call already
+    passed. No other tool's arguments are scanned before running; a
+    `write_file`'s content is checked when it's later read back with
+    `read_file`, through the normal output scan.
+- A fourth scan point is the `/commit` draft (R284). The staged diff is new
+  content from disk sent to the provider, so `ui._commit_cmd` scans exactly
+  what `draft_message` would send and runs the same challenge. Stop means no
+  draft; redact sends the redacted diff.
+- The approval prompt shows control characters literally (R287).
+  `colors.visible()` turns every C0 and C1 control character, DEL, and every
+  bidirectional or zero-width character into a visible escape (`\x1b`,
+  `‮`) in everything the prompt prints. SGR colour codes are otherwise
+  kept, and SGR 8 (conceal) could hide the end of a command being approved.
+- Turning the feature on or off changes what the engine passes in, not a
+  branch inside `agent.py`. `Engine` passes
+  `AgentCallbacks.secret_challenge=fe.secret_challenge` only when
+  `self.redact_secrets` is true and `None` otherwise, and the loop's
+  `if cb.secret_challenge:` check skips scanning entirely. When the feature
+  is off it costs nothing, and `agent.py` never needs to know about the
+  config.
+- There's one challenge per block, not per match. A `.env` file with ten
+  keys produces one `secret_challenge(context, matches)` call with all of
+  them, and the answer (keep, redact, stop, always) applies to every match in
+  that block.
+- `Frontend.secret_challenge` is implemented once in `ui.TerminalFrontend`,
+  as a numbered menu through the shared `select()`, and the TUI inherits it,
+  as with `approve` and `ask_continue`.
+- Confirmed false positives can be allowed for good. A fourth answer,
+  `"always"`, stops a repeated false positive (a test UUID, an internal
+  tool's token) from being flagged again. Only `Engine` knows what "always"
+  means. `Engine._secret_challenge()` wraps `fe.secret_challenge()`. On
+  `"always"` it hashes every matched value with `secrets.hash_value()`
+  (SHA-256; the raw value is never stored), adds the hashes to
+  `self.secret_allowlist`, saves them with
+  `persist_runtime_value(cfg, "secret_allowlist", …)`, and returns `"keep"`.
+  `send()` and the agent loop only ever see the original three answers.
+  `Engine.__init__` loads the saved hashes into `self.secret_allowlist` and
+  passes them to every `secrets.scan(text, allowlist)` call (directly in
+  `send()`, and through `AgentCallbacks.secret_allowlist` in the agent loop).
+  `scan()` drops any match whose hash is in the set before it's shown.
+  Manage the list with `/redact allowlist [clear]`.
 
-- **`secrets.py`** — pure detection/redaction, zero UI, zero I/O:
-  `scan(text) -> list[Match]`, `redact(text, matches) -> str`,
-  `preview(matches) -> str` (kind + count summary; NEVER echoes the actual
-  secret text back, even in the challenge prompt). Two passes: known vendor
-  **shapes** (regex — `AKIA…`, `ghp_…`, `.env`-style assignments, a dedicated
-  GUID/UUID pattern since those are sometimes used as API keys/session
-  tokens, not just harmless correlation IDs), plus an **entropy fallback**
-  for tokens with no recognizable prefix at all (shape regex alone misses an
-  ad-hoc token from some internal tool — it's just a random string). The
-  fallback only scans spans the shape pass didn't already claim (so a UUID
-  is counted once, as `"GUID/UUID"`, not also as a generic high-entropy hit),
-  and explicitly excludes hex-only strings (git SHAs, MD5/SHA digests) — a
-  real false-positive source worth guarding deliberately rather than tuning
-  away by accident. (UUIDs used to be excluded here too, until it became
-  clear some systems DO use them as secrets — see CHANGELOG_TECHNICAL.md R58.)
-- **Three hook points**, chosen so the on-disk session log is automatically
-  consistent with what was sent (no separate log-side check needed):
-  `Engine.send()` scans `user_text` before it enters `messages`/the log;
-  `agent.py`'s tool loop scans a tool's raw output before `_finish()` (i.e.
-  before `on_tool_result` AND before it becomes a `tool_result_message`) —
-  this covers EVERY tool uniformly, including read-only ones (`read_file`,
-  `grep`) that never go through the approval gate at all. The THIRD is
-  narrower and asymmetric on purpose: `run_command`'s own command STRING is
-  scanned right before it runs, but only ever produces a `notify()` — never
-  a challenge, never a block, never a redaction. A command usually needs its
-  real argument to actually work (a real key in a curl header), so silently
-  altering it would just break it, and blocking would duplicate the approval
-  gate the call already passed. No other tool's arguments get this
-  pre-execution scan (a `write_file`'s content isn't checked until its
-  eventual `read_file` output is, through the normal hook above) — this is
-  specifically about what's about to be handed to a shell.
-- **A FOURTH hook, `/commit`'s draft (R284)**: the staged diff is new
-  content off disk sent to the provider, so `ui._commit_cmd` scans exactly
-  what `draft_message` would send and runs the same challenge (stop = draft
-  nothing, redact = send the redacted diff).
-- **The approval surface renders control characters literally (R287)**:
-  `colors.visible()` turns every C0/C1 control, DEL and bidi/zero-width
-  character into a visible `\x1b`/`\u202e` escape in everything the gate
-  prints — SGR is otherwise kept for colour, and SGR 8 (conceal) could hide
-  the tail of a command being approved.
-- **The toggle is a capability, not a runtime branch inside `agent.py`**:
-  `Engine` only ever passes `AgentCallbacks.secret_challenge=fe.secret_challenge`
-  when `self.redact_secrets` is true; otherwise it passes `None`, and the
-  agent loop's `if cb.secret_challenge:` guard skips scanning entirely — zero
-  cost when the feature is off, and `agent.py` never has to know about config.
-- **One challenge per block**, not per match — a `.env` file with ten keys
-  produces ONE `secret_challenge(context, matches)` call (all matches
-  together), not ten. The user's decision (keep/redact/stop/always) applies
-  to every match in that block.
-- **`Frontend.secret_challenge`** is implemented once in
-  `ui.TerminalFrontend` (numbered menu via the shared `select()` primitive)
-  and inherited by the TUI for free — same pattern as `approve`/`ask_continue`.
-- **Allowlist for confirmed false positives (2026-07-14).** A 4th challenge
-  outcome, `"always"`, lets a repeat false positive (a fixture UUID, an
-  internal-tool token) stop being flagged at all. `Engine` is the only layer
-  that knows what "always" means: `Engine._secret_challenge()` wraps
-  `fe.secret_challenge()`, and on `"always"` it hashes every matched value
-  with `secrets.hash_value()` (SHA-256 — the raw value is never persisted,
-  only its hash), adds the hashes to `self.secret_allowlist`, persists via
-  `persist_runtime_value(cfg, "secret_allowlist", …)`, and returns `"keep"`
-  to the caller — `send()` and the agent loop only ever see the original
-  three outcomes. `Engine.__init__` loads the persisted hashes into
-  `self.secret_allowlist` and threads it into every `secrets.scan(text,
-  allowlist)` call (directly in `send()`, via `AgentCallbacks.secret_allowlist`
-  in the agent loop); `scan()` drops any match whose `hash_value()` is in the
-  set before it's ever surfaced. Managed via `/redact allowlist [clear]`.
+## 8. The agent loop's one limit: steps (R6, R9)
 
-## 8. The agent loop's one cap: iterations (R6/R9)
+`agent.run_turn()` checks once per round, while handling tool calls:
+`if iteration >= checkpoint: cb.ask_continue(iteration)`. It only fires when
+the model keeps calling tools. After each check the limit is set again
+(`checkpoint = iteration + max_iterations`), so continuing gives one more
+full interval before the next question, rather than asking every round.
 
-`agent.run_turn()` checks once per round, inside the tool-handling branch:
-`if iteration >= checkpoint: cb.ask_continue(iteration)` — only fires when
-the model is actually looping on tool calls, using a
-**checkpoint-then-re-arm** pattern (`checkpoint = iteration +
-max_iterations`): continuing grants exactly one more full interval before
-asking again, not "asks every single round forever."
+This is the only limit on looping. A time-based limit (`max_wait` and
+`ask_wait`, R61) once existed alongside it, but it fired on elapsed time even
+when the model wasn't looping, so one long but normal reply (a big local
+model, a slow network) got a "still working, continue?" question. It was
+removed at the user's request; see `CHANGELOG_TECHNICAL.md` R61 for the call
+sites that went with it.
 
-A second, TIME-based cap (`max_wait`/`ask_wait`, R61) existed alongside this
-from 2026-07-12 to 2026-07-13: it fired on wall-clock elapsed time regardless
-of whether the model was looping, which meant a single long-but-normal
-generation (big local model, slow network) got a "still working, continue?"
-challenge unrelated to any actual runaway behavior. Removed at the user's
-request — see CHANGELOG_TECHNICAL.md R61 for the full torn-out call-site list. The
-iteration cap above is the only loop-safety mechanism now.
+## 9. Esc, pressed twice (R62), and why it needed a non-blocking menu
 
-## 9. Esc as a generic double-tap control key (R62) — and why it needed a NEW non-blocking menu
+Three states share one Esc gesture: busy, bash mode, and idle with an empty
+prompt. The first press arms the action and shows a status-bar hint. A second
+press within 2 seconds opens an arrow-key Yes/No question, and nothing happens
+until the user picks an answer. `Tui._on_escape(app_exit)` is a plain method,
+not a closure over the key binding's `event`, so tests can call it directly.
+Sending real Esc bytes through a pipe runs into prompt_toolkit's delay for
+telling a lone Esc from an escape sequence, which made timing-based tests
+flaky.
 
-Three states — busy/working, bash mode, idle-empty-prompt — share ONE Esc
-gesture: **first press arms (shows a status-bar hint), second press (within
-2s) opens an explicit arrow-key Yes/No question**; nothing happens until the
-user actually picks an option from it. `Tui._on_escape(app_exit)` is a plain
-method (not a closure over the key-binding's `event`), specifically so it's
-directly callable/testable — driving real Esc bytes through a pipe input
-hits prompt_toolkit's own ESC-vs-escape-sequence disambiguation delay, which
-made timing-based tests flaky; calling the method directly sidesteps that
-entirely.
+It can't simply call `select_menu()` (the blocking mechanism from §4 and §6).
+Esc fires as a key binding, which runs on the UI thread. `select_menu()` waits
+on `self._answers.get()`, and the answer comes from another key binding
+(Enter or a digit), also on the UI thread. Calling `select_menu()` from a key
+binding would make the UI thread wait for an answer only the UI thread can
+deliver. That's the deadlock `ask()` and `select_menu()` already prevent by
+raising `RuntimeError` on that thread (§6).
 
-**Why this couldn't just call `select_menu()`** (§4/§6's blocking mechanism):
-Esc fires as a key binding, which runs ON THE UI THREAD. `select_menu()`
-blocks on `self._answers.get()`, and the answer is delivered by ANOTHER key
-binding (Enter/digit) — also on the UI thread. Calling `select_menu()` from
-inside a key binding would be the UI thread blocking on an answer only the
-UI thread can deliver: the same deadlock `ask()`/`select_menu()` already
-guard against by raising `RuntimeError` when called from that thread (§6).
+So there's a second, non-blocking menu, `Tui._open_ui_menu()`. It reuses all
+of `select_menu()`'s drawing (`_menu_fragments` and the arrow-key and digit
+bindings, all keyed off `self._menu_options is not None`; Esc does nothing
+while a menu is open, so the pick must be explicit), but it resolves
+differently:
 
-**The fix: a second, non-blocking menu path, `Tui._open_ui_menu()`**, reusing
-every piece of `select_menu()`'s RENDERING (`_menu_fragments`, the arrow-key/
-digit-jump bindings — all keyed off the same `self._menu_options is not None`
-check; Esc is a no-op while any menu is open, the pick must be explicit) but
-resolving differently:
-- `select_menu()` (worker-thread callers: approvals, R58, `/model`) →
-  `_resolve_menu()` puts the chosen key on `self._answers` queue.
-- `_open_ui_menu()` (UI-thread callers: Esc confirms) → sets
-  `self._menu_on_select = on_select`; `_resolve_menu()` checks this FIRST and,
-  if set, clears the menu state and calls `on_select(key)` directly instead
-  of touching the queue — no thread ever blocks.
+- `select_menu()` (callers on the worker thread: approvals, R58, `/model`):
+  `_resolve_menu()` puts the chosen key on the `self._answers` queue.
+- `_open_ui_menu()` (callers on the UI thread: the Esc confirmations): sets
+  `self._menu_on_select = on_select`. `_resolve_menu()` checks this first
+  and, if it's set, clears the menu and calls `on_select(key)` directly
+  without touching the queue, so no thread ever waits.
 
-Three resolvers, one per confirmable state: `_resolve_cancel_menu` (→
-`fe.cancel_event.set()`), `_resolve_bash_leave_menu` (→ `self._bash_mode =
-False`), `_resolve_quit_menu` (→ the injected `app_exit()`). **History**:
-busy-cancel briefly confirmed directly on the second press (shipped, then
-revised same-day) before being brought in line with the other two, for one
-reason — an explicit picked choice, not an implicit "you pressed Esc twice,
-that counts."
+There's one resolver per state: `_resolve_cancel_menu` sets
+`fe.cancel_event`, `_resolve_bash_leave_menu` sets `self._bash_mode = False`,
+and `_resolve_quit_menu` calls the injected `app_exit()`. All three require
+an explicit choice rather than treating two presses as a yes.
 
-**A bare Esc must fire promptly (R264).** The escape-prefixed Alt bindings
-(`escape+enter`, `escape+m`, `escape+end`) make a lone Esc a key-SEQUENCE
-prefix, which prompt_toolkit holds for `Application.timeoutlen` (1.0s by
-default) — not just `ttimeoutlen`, the byte-level wait. Both are lowered
-(`ttimeoutlen=0.001`, `timeoutlen=0.05`); an Alt chord arrives from the
-terminal as one burst, so it still completes. Adding another
-`escape`-prefixed binding is fine; raising `timeoutlen` brings the 1s lag
-back on every Esc tap.
+A single Esc must act quickly (R264). The Alt bindings that start with Esc
+(`escape+enter`, `escape+m`, `escape+end`) make a lone Esc the start of a key
+sequence, which prompt_toolkit holds for `Application.timeoutlen` (1 second
+by default), not only for `ttimeoutlen`, the byte-level wait. Both are
+lowered (`ttimeoutlen=0.001`, `timeoutlen=0.05`). An Alt chord arrives from
+the terminal as one burst, so it still works. Adding another binding that
+starts with `escape` is fine; raising `timeoutlen` brings back the 1-second
+lag on every Esc.
 
-**The 2-second window is a real timer, not "immediately after"**: tracked as
-`(self._esc_armed: str | None, self._esc_armed_at: float)` — the KIND of
-pending action plus when it armed. A second Esc past the window, or while a
-DIFFERENT state is active, is treated as a fresh first press (re-arms,
-never confirms) — this matters because state can change between the two
-presses through some OTHER path (e.g. bash mode left via Backspace-on-empty,
-not Esc) and a stale arm must never silently fire on an unrelated later Esc.
+The 2-second window is a real timer. It's stored as
+`(self._esc_armed: str | None, self._esc_armed_at: float)`: which action is
+armed and when. A second Esc after the window, or while a different state is
+active, counts as a new first press: it arms again and never confirms. This
+matters because the state can change between the two presses some other way
+(for example leaving bash mode with Backspace on an empty line), and an old
+arm must never fire on an unrelated later Esc.
 
 ## Where to look next
 
-- **Requirements** (R1–R306+, the numbered spec with dates and rationale):
-  `CHANGELOG_TECHNICAL.md`.
-- **User-facing feature list**: `README.md` → "Daily use" and "Esc, the
-  double-tap control key".
-- **`.agentic_context/`**: this project's own cross-session memory system
-  (yes, Aurora dogfoods a version of the same protocol it was built to
-  assist with) — see `.agentic_context/KNOWLEDGE/project/*.md`.
+- Requirements: `CHANGELOG_TECHNICAL.md` for R1 to R293, and
+  `REQUIREMENTS.md` with `requirements/` for the newer ones.
+- What users see: `README.md` and `documents/FEATURES.md`; the Esc rule is in
+  `documents/COMMANDS.md`.

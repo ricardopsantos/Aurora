@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1a1a1a" media="(prefers-color-scheme: dark)">
+<title>Aurora</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="/favicon.png">
+<style>
+/* Web App Design Language v1.23, flavour 3 (Chat). Aurora Lite R377: the official page at / since R418 (it was /v2 on trial). */
+:root{
+  color-scheme: light dark;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "DejaVu Sans", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --bg:#ffffff; --panel:#f9f9f9; --view:#ffffff; --fg:#1f1f1f; --dim:#666666; --line:#e3e3e3; --hover:#ececec;
+  --btn:#ffffff; --bubble:#f0f0f0; --sel:#e8e8e8; --sel-fg:#1f1f1f;
+  --accent:#1f1f1f; --accent-fg:#ffffff; --link:#2463c7;
+  --ok:#2a7347; --warn:#9c4d00; --bad:#b3261e;
+  --shadow:0 2px 12px rgba(0,0,0,.06), 0 0 0 1px var(--line);
+  --sp-half:8px; --sp:16px; --sp-2x:32px; --sp-4x:64px;
+  --fs-title:16px; --fs-body:15px; --fs-secondary:13px; --fs-caption:12px; --fs-mono:13px;
+  --r-sm:6px; --r-md:12px; --r-lg:24px;
+  --side:260px; --col:768px;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#1a1a1a; --panel:#141414; --view:#262626; --fg:#ececec; --dim:#a3a3a3; --line:#333333; --hover:#2a2a2a;
+  --btn:#262626; --bubble:#2f2f2f; --sel:#2a2a2a; --sel-fg:#ececec;
+  --accent:#ececec; --accent-fg:#1a1a1a; --link:#8ab4f8;
+  --ok:#8fd08f; --warn:#e6a55a; --bad:#ef8b84;
+  --shadow:0 2px 12px rgba(0,0,0,.4), 0 0 0 1px var(--line);
+}}
+:root[data-theme="dark"]{color-scheme:dark;
+  --bg:#1a1a1a; --panel:#141414; --view:#262626; --fg:#ececec; --dim:#a3a3a3; --line:#333333; --hover:#2a2a2a;
+  --btn:#262626; --bubble:#2f2f2f; --sel:#2a2a2a; --sel-fg:#ececec;
+  --accent:#ececec; --accent-fg:#1a1a1a; --link:#8ab4f8;
+  --ok:#8fd08f; --warn:#e6a55a; --bad:#ef8b84;
+  --shadow:0 2px 12px rgba(0,0,0,.4), 0 0 0 1px var(--line);
+}
+:root[data-theme="light"]{color-scheme:light}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:400 var(--fs-body)/1.55 var(--font-sans);height:100dvh;overflow:hidden;display:flex;-webkit-text-size-adjust:100%}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--link);outline-offset:2px}
+:where(p,h1,h2,h3,ul,ol,pre,blockquote){margin:0}
+code,pre{font-family:var(--font-mono);font-size:var(--fs-mono)}
+.sec{color:var(--dim);font-size:var(--fs-secondary)}
+.cap{font-size:var(--fs-caption);font-weight:600;color:var(--dim)}
+.grow{flex:1 1 auto;min-width:0}
+.ib{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;flex:none;border:0;border-radius:var(--r-sm);background:none;color:var(--dim)}
+.ib:hover{background:var(--hover);color:var(--fg)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--sp-half);background:var(--btn);border:1px solid var(--line);border-radius:var(--r-md);padding:8px 12px;min-width:0;color:var(--fg);font-size:var(--fs-secondary)}
+.btn:hover{background:var(--hover)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg);font-weight:600}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.danger{background:var(--bad);border-color:var(--bad);color:#fff;font-weight:600}
+.tag{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:999px;padding:2px 10px;min-height:36px;display:inline-flex;align-items:center;font-size:var(--fs-caption);color:var(--dim);background:var(--hover)}
+.tag:empty{display:none}
+#ctx{display:inline-flex;align-items:center;gap:6px;cursor:pointer;flex:none}   /* R428: the pills keep their size; the title gives way */
+#ctx .meter{width:48px;flex:none}#ctx b{font-weight:600;color:var(--dim)}
+@media (max-width:480px){#ctx .meter{width:32px}}
+/* R392 U1/U7/U15: on a small phone the header keeps the title and the Menu button: the context pill drops its limit
+   and meter, the status tag is shown only while busy and is capped, nothing in the header can push ••• off-screen */
+@media (max-width:400px){#ctx .lim,#ctx .meter{display:none}#status:not(.busy){display:none}}
+#status{max-width:34vw}
+#ctx .meter.zero{display:none}
+#menu-btn{flex:none}
+.tag.busy,.tag.warn{color:var(--warn)}.tag.ok{color:var(--ok)}.tag.bad{color:var(--bad)}
+
+/* sidebar: the chats */
+#side{width:var(--side);flex:none;background:var(--panel);display:flex;flex-direction:column;height:100dvh;padding:var(--sp-half);padding-top:max(var(--sp-half),env(safe-area-inset-top));padding-bottom:max(var(--sp-half),env(safe-area-inset-bottom));gap:0;border-right:1px solid var(--line)}
+body.sb-closed #side{display:none}
+.brand{display:flex;align-items:center;gap:var(--sp-half);padding:4px 4px var(--sp-half) 8px;min-height:44px}
+.brand img,.brand .logo{width:24px;height:24px;border-radius:6px;flex:none;background:#1d1e21 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cg fill='none' stroke='%23f1ead0' stroke-width='1.5' stroke-linecap='round'%3E%3Cpath d='M8 12.5C9 7.8 13 6 17 6.2c5.6.3 9 3.7 9 9.2 0 6.5-4.4 10.3-9.7 10.3S7 22.4 7.4 16' stroke-dasharray='3.2 1.8'/%3E%3Cpath d='M13.9 20.2c1.7 1.2 3.5 1.2 5.2 0'/%3E%3Cg transform='rotate(-28 8 8)'%3E%3Cpath d='M8 8C6.6 5.6 3.6 5.4 3.4 7.6c-.2 2 2.8 2.4 4.6.4zM8 8c1.4-2.4 4.4-2.6 4.6-.4.2 2-2.8 2.4-4.6.4z'/%3E%3C/g%3E%3C/g%3E%3Cg stroke='%23f1ead0' stroke-width='1.8' stroke-linecap='round'%3E%3Cpath d='M12.4 13.8v2.4M20.6 13.8v2.4'/%3E%3C/g%3E%3C/svg%3E") center/20px no-repeat}
+.brand b{font-size:var(--fs-title);font-weight:600}
+.nav{display:flex;align-items:center;gap:12px;width:100%;border:0;background:none;border-radius:var(--r-md);padding:8px 10px;min-height:40px;text-align:left;color:var(--fg)}
+.nav:hover{background:var(--hover)}
+.nav svg{color:var(--dim)}
+.searchbox{display:flex;align-items:center;gap:12px;border-radius:var(--r-md);padding:0 10px;min-height:40px;color:var(--dim)}
+.searchbox:focus-within{background:var(--hover)}
+.searchbox input{flex:1 1 auto;min-width:0;border:0;background:none;outline:none;padding:8px 0;color:var(--fg)}
+.chats-head{display:flex;align-items:center;gap:4px;margin-top:var(--sp-half)}
+.chats-head #chats-cap{flex:1;margin-top:0}
+#chats-cap{display:flex;align-items:center;gap:var(--sp-half);padding:0 10px;margin-top:var(--sp-half);cursor:pointer;user-select:none;min-height:36px;border-radius:var(--r-md)}
+#confirm,#export{width:min(400px,calc(100vw - 2*var(--sp)))}   /* the small question dialogs share one width */
+#chats-cap:hover{background:var(--hover)}
+#chats-cap::before{content:"";flex:none;border:5px solid transparent;border-top:6px solid currentColor;border-bottom:0}
+#chats-cap[aria-expanded=false]::before{transform:rotate(-90deg)}
+body.chats-folded #sessions{display:none}
+#sessions{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;display:flex;flex-direction:column;gap:0;margin-top:var(--sp-half);padding-bottom:var(--sp)}
+#sessions .grp{font-size:var(--fs-caption);font-weight:500;color:var(--dim);padding:var(--sp) 10px var(--sp-half);margin:0}
+#sessions .grp:first-child{padding-top:var(--sp-half)}
+.chat{display:flex;align-items:center;gap:var(--sp-half);border:0;background:none;border-radius:var(--r-md);padding:8px 10px;min-height:40px;width:100%;text-align:left;color:var(--fg);font-size:14px}
+.chat:hover{background:var(--hover)}
+.chat.cur{background:var(--sel);font-weight:500}
+.chat .ct{flex:1 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.chat .ca{flex:none;font-size:var(--fs-caption);color:var(--dim)}
+.empty{color:var(--dim);font-size:var(--fs-secondary);padding:var(--sp-half) 10px}
+/* R383: folders, the delete buttons, drag targets */
+.chat{cursor:pointer}
+.chat.in{padding-left:28px}
+.mini{flex:none;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border:0;border-radius:var(--r-sm,6px);background:none;color:var(--dim);padding:0}
+.mini:hover,.mini:focus-visible{background:var(--hover);color:var(--fg)}
+.mini.cx:hover,.mini.fx:hover{color:var(--bad)}
+.chat .cx,.fh .fr,.fh .fx{display:none}
+.chat .cn{flex:none;font-size:var(--fs-caption);color:var(--dim);font-variant-numeric:tabular-nums;min-width:1.5em;text-align:right}
+.chat form.nm{flex:1 1 auto;min-width:0}.chat form.nm input{width:100%}
+.chat .cr,.chat .cs,.chat .cd{display:none}
+.chat:hover .ca,.chat:focus-within .ca,.fh:hover .ca,.chat:hover .cn,.chat:focus-within .cn{display:none}   /* R437: the actions get the count's room too */
+.chat:hover .cx,.chat:focus-within .cx,.chat:hover .cr,.chat:focus-within .cr,.chat:hover .cs,.chat:hover .cd,.chat:focus-within .cs,.chat:focus-within .cd,.fh:hover .fr,.fh:hover .fx,.fh:focus-within .fr,.fh:focus-within .fx{display:inline-flex}
+.chat .cm{display:none}
+@media (hover:none),(pointer:coarse){.chat .ca{display:none}.fh .fr,.fh .fx{display:inline-flex}.mini{width:36px;height:36px}
+  /* R392 U11: one ⋯ per row on touch; rename/delete only after it is tapped, so the name gets the width */
+  .chat .cm{display:inline-flex}.chat .cx,.chat .cr,.chat .cs,.chat .cd,.chat:hover .cx,.chat:hover .cr,.chat:hover .cs,.chat:hover .cd,.chat:focus-within .cx,.chat:focus-within .cr,.chat:focus-within .cs,.chat:focus-within .cd{display:none}
+  .chat.open .cx,.chat.open .cr,.chat.open .cs,.chat.open .cd{display:inline-flex}.chat.open .cn,.chat.open .cm{display:none}}
+.fold{border-radius:var(--r-md)}
+.fh{display:flex;align-items:center;gap:var(--sp-half);border-radius:var(--r-md);padding:4px 6px 4px 8px;min-height:40px;cursor:pointer;color:var(--fg);font-size:14px;font-weight:500}
+.fh:hover{background:var(--hover)}
+.fh .chev{display:inline-flex;color:var(--dim);transition:transform .12s}
+.fold.open>.fh .chev{transform:rotate(90deg)}
+.fh .fn{flex:1 1 auto;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.fh .ca{font-size:var(--fs-caption);color:var(--dim);font-weight:400}
+.fh.newf{padding:4px 8px}
+form.nm{flex:1 1 auto;min-width:0;display:flex}
+form.nm input{flex:1 1 auto;min-width:0;border:1px solid var(--line);border-radius:var(--r-sm,6px);background:var(--bg);color:var(--fg);padding:4px 8px;font:inherit;outline:none}
+form.nm input:focus{border-color:var(--accent,var(--link))}
+.fold.over,#sessions.over{background:var(--sel);outline:1px dashed var(--accent,var(--link));outline-offset:-1px}
+#scrim{display:none}
+
+/* the chat */
+.main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;height:100dvh;position:relative}
+header{flex:none;display:flex;align-items:center;gap:var(--sp-half);padding:var(--sp-half) var(--sp-half) var(--sp-half) var(--sp-half);padding-top:max(var(--sp-half),env(safe-area-inset-top));min-height:56px}
+#sb-toggle{display:none}
+body.sb-closed #sb-toggle{display:inline-flex}
+#chat-title{font-size:17px;font-weight:500;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0;padding-left:8px;flex:1 1 0}
+#status{cursor:pointer;flex:none}
+#plan-tag{flex:none;color:var(--warn);font-weight:600;background:none;border:1px solid var(--warn)}
+#log{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;display:flex;flex-direction:column;gap:var(--sp);padding:var(--sp) var(--sp) var(--sp-2x);scroll-padding-bottom:var(--sp)}
+#log>*{width:100%;max-width:var(--col);margin-inline:auto}
+#log:empty::before{content:"How can I help?";margin:auto;font-size:26px;font-weight:500;color:var(--dim);text-align:center}
+.msg{overflow-wrap:anywhere;white-space:pre-wrap}
+.msg.user{align-self:flex-end;width:auto;max-width:min(80%,var(--col));margin-left:auto;margin-right:max(0px,calc((100% - var(--col))/2));background:var(--bubble);border-radius:var(--r-lg);padding:10px 18px}
+.msg.reply{position:relative;padding-left:40px}
+.msg.reply::before{content:"";position:absolute;left:0;top:2px;width:28px;height:28px;border-radius:8px;background:#1d1e21 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cg fill='none' stroke='%23f1ead0' stroke-width='1.5' stroke-linecap='round'%3E%3Cpath d='M8 12.5C9 7.8 13 6 17 6.2c5.6.3 9 3.7 9 9.2 0 6.5-4.4 10.3-9.7 10.3S7 22.4 7.4 16' stroke-dasharray='3.2 1.8'/%3E%3Cpath d='M13.9 20.2c1.7 1.2 3.5 1.2 5.2 0'/%3E%3Cg transform='rotate(-28 8 8)'%3E%3Cpath d='M8 8C6.6 5.6 3.6 5.4 3.4 7.6c-.2 2 2.8 2.4 4.6.4zM8 8c1.4-2.4 4.4-2.6 4.6-.4.2 2-2.8 2.4-4.6.4z'/%3E%3C/g%3E%3C/g%3E%3Cg stroke='%23f1ead0' stroke-width='1.8' stroke-linecap='round'%3E%3Cpath d='M12.4 13.8v2.4M20.6 13.8v2.4'/%3E%3C/g%3E%3C/svg%3E") center/22px no-repeat}
+/* plain browser tab: the owner's site logo (base_logo-192, 96px) on the sidebar and the reply avatar; the installed app keeps the face. After the face rules so it wins */
+@media (display-mode: browser){.brand .logo,.msg.reply::before{background:#000 url("data:image/webp;base64,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") center/contain no-repeat}}
+.msg.reply+.msg.reply::before,details+.msg.reply::before{display:none}
+.msg.md,#note-view{white-space:normal}
+.msg.md>*+*,#note-view>*+*{margin-top:12px}
+.msg.md h1,#note-view h1,.msg.md h2,#note-view h2,.msg.md h3,#note-view h3,.msg.md h4,#note-view h4{line-height:1.3;font-weight:600;font-size:var(--fs-title)}
+.msg.md h1,#note-view h1{font-size:19px}.msg.md h2,#note-view h2{font-size:17px}.msg.md h3,#note-view h3{font-size:16px}   /* R439: the levels differ */
+.msg.md ul,#note-view ul,.msg.md ol,#note-view ol{padding-left:1.4em}
+.msg.md li+li,#note-view li+li{margin-top:4px}
+.msg.md blockquote,#note-view blockquote{border-left:3px solid var(--line);padding-left:12px;color:var(--dim)}
+.msg.md hr,#note-view hr{border:0;border-top:1px solid var(--line)}
+.msg.md a,#note-view a{color:var(--link)}
+/* R439: the rest of the Markdown the renderer now draws */
+.msg.md h5,#note-view h5,.msg.md h6,#note-view h6{font-size:var(--fs-secondary);font-weight:600;line-height:1.3}.msg.md h6,#note-view h6{color:var(--dim)}
+.msg.md del,#note-view del{color:var(--dim)}
+.msg.md ul ul,.msg.md ol ol,.msg.md ul ol,.msg.md ol ul,#note-view ul ul,#note-view ol ol,#note-view ul ol,#note-view ol ul{margin-top:4px}
+.msg.md li>*+*,#note-view li>*+*{margin-top:4px}.msg.md .loose>li+li,#note-view .loose>li+li{margin-top:8px}
+.msg.md li.task,#note-view li.task{list-style:none;margin-left:-1.4em;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start}
+.msg.md li.task>input,#note-view li.task>input{width:18px;height:18px;margin-top:.3em;flex:none;accent-color:var(--accent,var(--link))}
+.msg.md li.task>span,#note-view li.task>span{flex:1 1 0;min-width:0}.msg.md li.task>:not(input):not(span),#note-view li.task>:not(input):not(span){flex:1 0 100%;padding-left:26px;margin-top:0}
+.msg.md li.task.done>span,#note-view li.task.done>span{color:var(--dim);text-decoration:line-through}
+.msg.md a.md-img,#note-view a.md-img{text-decoration:none;border:1px solid var(--line);border-radius:var(--r-sm);padding:0 6px}
+.msg.md td code,#note-view td code{white-space:nowrap}
+.msg code,#note-view code{background:var(--hover);border-radius:4px;padding:1px 5px}
+.msg :not(pre)>code,#note-view :not(pre)>code{overflow-wrap:anywhere;word-break:break-word;white-space:pre-wrap}   /* R392 U5: a long path wraps instead of being cut */
+.acts{display:flex;flex-wrap:wrap;gap:var(--sp-half);padding-left:40px;margin-top:calc(-1 * var(--sp-half))}
+#log>.speak{width:auto;align-self:flex-start;margin:calc(-1 * var(--sp-half)) 0 0 max(40px,calc((100% - var(--col))/2 + 40px))}   /* R436: an older reply's Read aloud, under its text */
+.btn.act.speak{border:1px solid var(--line);background:var(--btn);color:var(--fg)}.btn.act.speak[aria-pressed=true]{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+.acts .btn{padding:4px 10px;font-size:var(--fs-caption);min-height:28px}
+.msg pre,#note-view pre{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:12px;overflow-x:auto;white-space:pre;margin-top:var(--sp-half)}
+.msg pre code,#note-view pre code{background:none;padding:0}
+.msg.md table,#note-view table{border-collapse:collapse;display:block;overflow-x:auto;font-size:14px}
+.msg.md th,#note-view th,.msg.md td,#note-view td{border:1px solid var(--line);padding:6px 10px;text-align:left}
+.msg.md th,#note-view th{background:var(--panel)}
+.msg.note{align-self:center;width:auto;max-width:min(100%,var(--col));color:var(--dim);font-size:var(--fs-secondary);text-align:center;padding:0 var(--sp)}
+.msg.err{color:var(--bad)}
+body.hide-tools details.tool{display:none}
+#log details{font-size:var(--fs-secondary);color:var(--dim);padding-left:40px}
+#log details summary{cursor:pointer;list-style:none;display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:2px 10px;background:var(--hover);max-width:100%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+#log details summary::-webkit-details-marker{display:none}
+#log details summary::before{content:"";flex:none;border:4px solid transparent;border-left:5px solid currentColor;border-right:0}
+#log details[open] summary::before{transform:rotate(90deg)}
+#log details pre{margin-top:var(--sp-half);white-space:pre-wrap;overflow-wrap:anywhere;max-height:40vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:12px;color:var(--fg)}
+#jump{position:absolute;right:var(--sp);bottom:calc(var(--composer-h,120px) + 8px);z-index:5;box-shadow:var(--shadow);border-radius:999px;background:var(--view);color:var(--fg);width:32px;height:32px;opacity:.9}
+
+/* bottom: queue, live line, composer */
+.bottom{flex:none;padding:0 var(--sp) max(var(--sp),env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:var(--sp-half)}
+.bottom>*{width:100%;max-width:var(--col);margin-inline:auto}
+#queue{display:flex;flex-direction:column;gap:4px;border:1px dashed var(--line);border-radius:var(--r-md);padding:var(--sp-half) var(--sp);color:var(--dim);font-size:var(--fs-secondary);max-height:20vh;overflow-y:auto}
+#queue .q-item{display:flex;align-items:center;gap:var(--sp-half);min-width:0}
+#queue .q-item>.grow{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+#live{display:flex;flex-direction:column;gap:var(--sp-half);color:var(--dim);font-size:var(--fs-secondary)}
+#live-line{display:flex;align-items:center;gap:var(--sp-half);cursor:pointer;padding:0 4px}
+#live-line::before{content:"";flex:none;width:8px;height:8px;border-radius:50%;background:var(--warn);animation:pulse 1.2s ease-in-out infinite}
+#live-think{max-height:min(30dvh,240px);overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--fg);background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:12px}
+@keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
+#hint{color:var(--warn);font-size:var(--fs-secondary);text-align:center}
+form#send{background:var(--view);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:12px 12px 8px 18px;display:flex;flex-direction:column;gap:var(--sp-half)}
+form#send textarea{width:100%;resize:none;border:0;outline:none;background:none;font-size:16px;line-height:1.45;padding:6px 0;max-height:40vh;min-height:32px}
+.crow{display:flex;align-items:center;gap:var(--sp-half);min-width:0}
+.crow .tag{flex:0 1 auto}
+#auto-tag.on{color:var(--warn)}
+#auto-tag input{accent-color:var(--warn)}
+#mic.rec{color:var(--bad)}
+#editing{display:flex;align-items:center;gap:var(--sp-half);font-size:var(--fs-secondary);color:var(--warn)}
+#go,#stop{width:36px;height:36px;border-radius:50%;border:0;display:inline-flex;align-items:center;justify-content:center;flex:none}
+#go{background:var(--accent);color:var(--accent-fg)}
+#go.queue{background:var(--warn);color:#fff}
+#stop{background:var(--hover);color:var(--fg)}
+
+/* the ... menu */
+.cmds{display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-half)}
+.cmds.three{grid-template-columns:1fr 1fr 1fr}
+.btn[aria-pressed=true]{background:var(--sel);border-color:var(--fg);font-weight:600}
+/* R431: Settings fill the right side like Notes and Files: one column of at most 560 px, a heading per group */
+#settings{width:min(640px,calc(100vw - 2*var(--sp)))}
+#settings .set-col{max-width:560px;margin:0 auto;display:flex;flex-direction:column;gap:var(--sp-2x)}
+#settings section{display:flex;flex-direction:column;gap:var(--sp-half)}
+#settings h4{margin:0;padding-bottom:var(--sp-half);border-bottom:1px solid var(--line)}
+#settings .field{display:flex;flex-direction:column;gap:4px;font-size:14px}
+#settings .set-row{display:flex;flex-wrap:wrap;align-items:center;gap:var(--sp-half)}
+#settings p{margin:0}
+#settings-btn{margin-top:var(--sp-half);border-top:1px solid var(--line);border-radius:0}
+.opt{display:flex;align-items:center;gap:10px;cursor:pointer;min-height:36px;font-size:14px}
+.opt input{flex:none;margin:0;width:18px;height:18px;accent-color:var(--fg)}
+.meter{height:6px;border-radius:3px;background:var(--hover);overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:var(--ok)}
+.meter.warn i{background:var(--warn)}.meter.bad i{background:var(--bad)}
+.token-row{display:flex;gap:var(--sp-half)}
+.token-row input{flex:1 1 auto;min-width:0;font-family:var(--font-mono);font-size:16px;background:var(--bg);border:1px solid var(--line);border-radius:var(--r-sm);padding:8px}
+.secret{-webkit-text-security:disc}
+#sid{cursor:pointer;font-family:var(--font-mono);align-self:flex-start;display:inline-flex;align-items:center}
+.usage{width:100%;border-collapse:collapse;font-size:var(--fs-secondary)}
+.usage th,.usage td{text-align:right;padding:4px 6px;border-bottom:1px solid var(--line)}
+.usage th:first-child,.usage td:first-child{text-align:left;overflow-wrap:anywhere}
+.budget{display:grid;grid-template-columns:auto 1fr auto;gap:var(--sp-half);align-items:center;margin-top:var(--sp)}
+.budget input{min-width:0;padding:6px 8px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--bg)}
+
+dialog{background:var(--view);color:var(--fg);border:0;border-radius:var(--r-md);padding:var(--sp);max-width:min(640px,calc(100vw - 2*var(--sp)));box-shadow:0 10px 40px rgba(0,0,0,.35),0 0 0 1px var(--line)}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog h3{font-size:var(--fs-title);font-weight:600;margin-bottom:var(--sp-half)}
+dialog pre{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-sm);padding:var(--sp-half);max-height:45vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin-bottom:var(--sp)}
+dialog .btns{display:grid;grid-template-columns:1fr 1fr 1fr;gap:var(--sp-half)}
+#ap-args{font-size:var(--fs-mono);max-height:30vh}
+#ap-diff summary{cursor:pointer;color:var(--dim);font-size:var(--fs-secondary);margin-bottom:var(--sp-half)}
+dialog .btns.two{grid-template-columns:1fr 1fr}
+#models .bar{margin-bottom:var(--sp-half)}#models #md-tabs{margin-bottom:var(--sp)}
+#models{width:min(960px,calc(100vw - 2*var(--sp)))}
+#md-raw{display:flex;flex-direction:column;gap:var(--sp-half)}#md-raw[hidden]{display:none}#md-raw p{margin:0}
+.cfg-ed{display:flex;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--bg);height:min(60vh,560px);min-width:0;overflow:hidden}
+#cfg-gutter,#cfg-text{font-family:var(--font-mono);font-size:var(--fs-mono);line-height:1.5;padding:8px;margin:0}
+#cfg-gutter{flex:none;color:var(--dim);text-align:right;user-select:none;overflow:hidden;border:0;border-right:1px solid var(--line);border-radius:0;background:var(--panel);min-width:3em;max-height:none;white-space:pre;overflow-wrap:normal}   /* R434: not the 45vh dialog-pre cap */
+#cfg-text{flex:1;min-width:0;border:0;outline:none;resize:none;background:none;color:var(--fg);white-space:pre;overflow:auto;tab-size:2}
+#cfg-msg.ok{color:var(--ok)}#cfg-msg.bad{color:var(--bad);white-space:pre-wrap}
+@media (max-width:768px){#cfg-gutter,#cfg-text{font-size:16px}}
+dialog .ex-opt{display:flex;gap:var(--sp-half);align-items:baseline;padding:var(--sp-half) 0;cursor:pointer}
+dialog .btns .btn{min-height:40px}
+dialog>p{margin-bottom:var(--sp)}
+#view{width:min(820px,calc(100vw - 2*var(--sp)));max-height:calc(100dvh - 2*var(--sp))}
+#view:not([open]){display:none}
+#view[open]{display:flex;flex-direction:column;gap:var(--sp-half)}
+dialog .bar,.ntop{display:flex;align-items:center;gap:var(--sp-half);min-height:36px}   /* one header bar for every dialog and panel */
+dialog .bar h3,.ntop h3{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+dialog .bar .btn,.ntop .btn{height:36px}
+#files{width:min(640px,calc(100vw - 2*var(--sp)));max-height:calc(100dvh - 2*var(--sp))}
+#files:not([open]){display:none}
+#files[open]{display:flex;flex-direction:column;gap:var(--sp-half)}
+#files p{margin:0}
+#fl-tabs,#note-tabs,#md-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line)}
+#md-tabs .tab,#note-tabs .tab,#fl-tabs .tab{appearance:none;background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);padding:8px 12px;font:inherit;font-size:14px;cursor:pointer;min-height:44px}
+#fl-tabs .tab:hover,#note-tabs .tab:hover,#md-tabs .tab:hover{color:var(--fg)}
+#fl-tabs .tab[aria-selected=true],#note-tabs .tab[aria-selected=true],#md-tabs .tab[aria-selected=true]{color:var(--fg);border-bottom-color:var(--accent)}
+#note-tabs .tab{flex:1}
+#note-type{background:var(--btn);color:var(--fg);border:1px solid var(--line);border-radius:var(--r-md);font:inherit;font-size:var(--fs-secondary);padding:4px 8px;height:36px;flex:none;width:auto;min-width:96px}   /* R437: never cut to 'Persona' */
+.msg .out-imgs{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+.msg .out-img{display:flex;flex-direction:column;gap:4px;max-width:min(320px,100%)}
+.msg .out-img img{max-width:100%;max-height:320px;border:1px solid var(--line);border-radius:8px;cursor:zoom-in;object-fit:contain}
+#preview{width:min(900px,calc(100vw - 2*var(--sp)));max-height:calc(100dvh - 2*var(--sp))}
+#preview:not([open]){display:none}
+#preview[open]{display:flex;flex-direction:column;gap:var(--sp-half)}
+#pv-body{overflow:auto;min-height:0;display:flex;flex-direction:column;gap:var(--sp-half)}
+#pv-body .pv-image,#pv-body .pv-video{max-width:100%;max-height:calc(100dvh - 160px);object-fit:contain;align-self:center}
+#pv-body .pv-pdf{width:100%;height:calc(100dvh - 160px);border:1px solid var(--line);border-radius:8px;background:#fff}
+#pv-body .pv-audio{width:100%}
+#pv-body .pv-text{margin:0;white-space:pre-wrap;word-break:break-word;font-size:13px}
+.file-card{display:flex;align-items:center;gap:var(--sp-half);max-width:min(320px,100%);padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--view);color:inherit;font:inherit;text-align:left;cursor:pointer}
+.file-card:hover,.fl-open:hover{background:var(--hover)}
+.file-card .fl-thumb{width:40px;height:40px}
+.fc-txt{display:flex;flex-direction:column;min-width:0}
+.btn.act{display:inline-flex;align-items:center;gap:6px}
+@media (max-width:768px){.btn.act{padding:0;width:44px;height:44px;justify-content:center}.btn.act span{display:none}.fl-row{flex-wrap:nowrap}}
+.fc-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#fl-list{overflow-y:auto;display:flex;flex-direction:column}
+.fl-row{display:flex;align-items:center;flex-wrap:wrap;gap:var(--sp-half);padding:var(--sp-half) 0;border-bottom:1px solid var(--line)}
+.fl-thumb{flex:none;width:48px;height:48px;border-radius:8px;border:1px solid var(--line);display:flex;align-items:center;justify-content:center;overflow:hidden;font-size:22px;background:var(--panel)}
+.fl-open{flex:1 1 0;min-width:0;display:flex;align-items:center;gap:var(--sp-half);border:0;background:none;color:inherit;font:inherit;text-align:left;padding:4px;border-radius:8px;cursor:pointer;min-height:44px}
+.fl-thumb img{width:100%;height:100%;object-fit:cover}
+.fl-txt{flex:1 1 0;min-width:0;display:flex;flex-direction:column}
+.fl-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+#view-body{overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:var(--r-sm);padding:var(--sp-half) var(--sp);flex:1 1 auto;min-height:0}
+
+/* phone: the chats slide over, everything a thumb touches is 44 px */
+@media (max-width:768px){
+  #side{position:fixed;inset:0 auto 0 0;z-index:40;width:min(300px,85vw);border-right:0;box-shadow:0 0 40px rgba(0,0,0,.35);animation:slide .2s ease-out}
+  @keyframes slide{from{transform:translateX(-24px);opacity:0}to{transform:none;opacity:1}}
+  body:not(.sb-closed) #scrim{display:block;position:fixed;inset:0;z-index:35;background:rgba(0,0,0,.45)}
+  #sb-toggle{display:inline-flex}
+  header{padding-inline:4px}
+  #chat-title{font-size:16px;padding-left:0}
+  #log{padding:var(--sp-half) 12px var(--sp)}
+  .msg.user{max-width:85%;margin-right:0}
+  .msg.reply{padding-left:0}
+  .acts{padding-left:0}#log>.speak{margin-left:0}   /* R436 */
+  #notes .nfind #note-new,#notes .nfind #note-search{min-height:44px;height:44px}   /* R437 */
+  .nhead #note-mode,.nhead #note-type{height:44px}#note-edit .nhead{flex-wrap:wrap;gap:var(--sp-half)}   /* R437: 44 px targets; a 320 px phone wraps the toolbar instead of cutting it */
+  #preview .bar{flex-wrap:wrap}#preview #pv-h{flex:1 0 100%}   /* R437: the file name gets its own line */
+  .msg.reply::before{display:none}
+  #log details{padding-left:0}
+  .bottom{padding:0 var(--sp-half) max(var(--sp-half),env(safe-area-inset-bottom))}
+  form#send{padding:8px 8px 6px 14px}
+  .crow .tag#model{max-width:40vw}
+  #notes{inset:0;margin:0;width:100%;max-width:100%}   /* R392 U2 */
+}
+@media (max-width:768px),(pointer:coarse){
+  input,select,textarea{font-size:16px!important}   /* R392 U6: iOS zooms on a smaller focused field */
+  .crow .tag#model,#attach,#mic{min-height:44px;min-width:44px;display:inline-flex;align-items:center;justify-content:center}   /* U8 */
+  .ib,#go,#stop{width:44px;height:44px}
+  .tag,#note-type,.ntop .btn,dialog .bar .btn,dialog .bar,.ntop{min-height:44px}
+  dialog .bar .btn,.ntop .btn{height:44px}
+  .nav,.chat,.searchbox,.opt,#chats-cap,.btn,#sid,#live-line{min-height:44px}
+  #log details summary{min-height:32px}
+}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important}}
+
+/* R389/R390: dropdown Menu controls, the Commands popup beside Send, the Notes dialog */
+.sel{width:100%;min-height:40px;padding:6px 10px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--panel);color:var(--fg)}
+.popup{position:fixed;z-index:50;min-width:180px;max-width:min(92vw,320px);background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:var(--r-md);padding:4px;box-shadow:0 6px 24px rgba(0,0,0,.25)}
+.popup[hidden]{display:none}
+.dd-item{display:block;width:100%;text-align:left;background:none;border:0;border-radius:var(--r-sm);padding:8px 10px;cursor:pointer}
+.dd-item:hover:not(:disabled){background:var(--hover)}.dd-item:disabled{opacity:.5;cursor:not-allowed}
+.dd-item.danger{color:var(--bad)}
+#notes{width:min(1040px,94vw);max-width:none;height:min(80vh,740px);padding:0;overflow:hidden}
+#notes[open]{display:flex}
+.nshell{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
+.ntop{padding:var(--sp);border-bottom:1px solid var(--line)}
+#note-back{display:none}
+#note-close{margin-left:auto}
+.nmain{display:grid;grid-template-columns:300px minmax(0,1fr);flex:1;min-height:0;min-width:0}
+/* R437: inside the page, Notes and Files have no second title bar: the top bar names them */
+#notes.panel .ntop,#files.panel .bar{display:none}
+.nfind{display:flex;align-items:center;gap:var(--sp-half);margin:var(--sp-half)}.nfind #note-search{flex:1 1 auto;margin:0}
+.nfind #note-new{flex:none;height:36px}.nfind #note-search{height:36px;min-height:36px}
+.fl-head{display:flex;align-items:flex-end;gap:var(--sp-half);border-bottom:1px solid var(--line)}.fl-head #fl-tabs{flex:1 1 auto;border-bottom:0}.fl-head #fl-all{margin-bottom:4px}
+.npane{display:flex;flex-direction:column;min-height:0;min-width:0;border-right:1px solid var(--line);background:var(--panel)}
+.ntop>*{min-width:0}
+#note-title,#note-text{min-width:0}
+#note-search{min-width:0;width:auto;margin:var(--sp-half);padding:8px 12px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--view);min-height:36px}
+#note-list{flex:1;overflow:auto;padding:0 var(--sp-half) var(--sp-half)}
+#note-list .n{display:block;width:100%;text-align:left;background:none;border:0;border-radius:var(--r-sm);padding:10px 12px;cursor:pointer;margin-bottom:2px}
+#note-list .n:hover{background:var(--hover)}
+#note-list .n[aria-current=true]{background:var(--hover)}
+#note-list .n b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#note-list .n b.un{font-weight:400;color:var(--dim)}
+#note-list .n small{display:flex;gap:8px;color:var(--dim);font-size:var(--fs-secondary);margin-top:0}
+#note-list .n small span:last-child{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#note-list .n{position:relative;padding-right:44px}
+#note-list .grip{position:absolute;right:2px;top:0;bottom:0;width:40px;display:flex;align-items:center;justify-content:center;color:var(--dim);cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;font-size:18px}
+#note-list .grip:hover{color:var(--fg)}
+#note-list .n.dragging{background:var(--sel);box-shadow:var(--shadow);opacity:.95;cursor:grabbing;position:relative;z-index:1}
+#note-list .none{padding:20px 12px;color:var(--dim);text-align:center}
+.nedit{display:flex;flex-direction:column;min-width:0;min-height:0}
+#note-empty{margin:auto;color:var(--dim)}
+#note-edit{display:flex;flex-direction:column;flex:1;min-height:0;padding:0 clamp(16px,4vw,40px) var(--sp-half)}
+#note-edit[hidden],#note-empty[hidden]{display:none}
+.nhead{display:flex;align-items:center;gap:4px;padding:8px 0;min-height:48px}
+#note-title{border:0;outline:0;background:none;font-size:1.6rem;font-weight:700;padding:4px 0;width:100%;color:var(--fg)}
+#note-text{flex:1;min-height:0;width:100%;resize:none;border:0;outline:0;background:none;padding:8px 0;font-size:1rem;line-height:1.65;color:var(--fg)}
+#note-view{flex:1;min-height:0;overflow-y:auto;padding:8px 0;font-size:1rem;line-height:1.65;color:var(--fg);overflow-wrap:anywhere;outline:0}
+#note-view[hidden],#note-text[hidden]{display:none}
+#note-view:empty::before{content:"Empty note. Use Edit to write.";color:var(--dim)}
+#note-mode{min-width:56px;height:36px;padding:0 12px;font-size:var(--fs-secondary);font-weight:500;border:1px solid var(--line);border-radius:var(--r-md);background:var(--btn);color:var(--fg)}   /* R437: drawn like the other buttons */
+#note-mode[aria-pressed=true]{background:var(--btn)}
+#note-title::placeholder,#note-text::placeholder{color:var(--dim);opacity:.7}
+.nfoot{color:var(--dim);font-size:var(--fs-secondary);padding-top:6px;border-top:1px solid var(--line)}
+@media (max-width:768px){
+  #notes{width:100vw;height:100dvh;max-height:100dvh;border-radius:0;max-width:100vw}
+  .nmain{grid-template-columns:minmax(0,1fr)}
+  .nedit{display:none}.npane{border-right:0}
+  #nshell.editing .npane{display:none}#nshell.editing .nedit{display:flex}
+  #nshell.editing #note-back{display:inline-flex}#nshell.editing #note-new,#nshell.editing .ntop h3{display:none}
+  #nshell.editing .ntop .grow{flex:1}
+  #note-text{font-size:16px}
+}
+@media (max-width:768px),(pointer:coarse){.sel,.dd-item{min-height:44px}}
+/* R392 U12: keyboard up on a short screen: a slim header, the model row beside the input */
+body.kbd header{min-height:40px;padding-block:2px}
+body.kbd #ctx,body.kbd #status:not(.busy),body.kbd #plan-tag{display:none}
+body.kbd form#send{flex-direction:row;align-items:flex-end;padding:6px 6px 6px 12px}
+body.kbd form#send textarea{flex:1 1 auto;min-width:0}
+body.kbd .crow .tag#model,body.kbd .crow .grow{display:none}
+body.kbd #jump{display:none}
+.popup{max-height:calc(100dvh - 8px);overflow-y:auto}
+/* R418: Notes and Files take the chat's place (no overlay); New Chat reads Back to chat meanwhile */
+body[data-panel] .main>#log,body[data-panel] .main>.bottom,body[data-panel] #jump{display:none!important}
+#notes.panel[open],#files.panel[open],#settings.panel[open]{position:static;inset:auto;margin:0;width:auto;max-width:none;height:auto;max-height:none;flex:1 1 auto;min-height:0;border-radius:0;box-shadow:none;border-top:1px solid var(--line);background:var(--bg)}
+#files.panel[open]{padding:var(--sp)}
+#settings.panel[open]{padding:var(--sp);overflow-y:auto;overscroll-behavior:contain}   /* R431 */
+#notes.panel #note-close,#files.panel #fl-close,#settings.panel #set-close,#settings.panel .bar{display:none}
+.turnline{font-size:var(--fs-caption);color:var(--dim);font-variant-numeric:tabular-nums;margin-top:calc(-1 * var(--sp-half))}
+mark{background:color-mix(in srgb,var(--link) 30%,transparent);color:inherit;border-radius:2px}
+.offline-copy{opacity:.75}
+#ap-left{display:block;font-size:var(--fs-caption);color:var(--dim);margin-bottom:var(--sp-half)}
+#temp{width:100%}
+</style>
+<script>window.AURORA_CHAT = true; window.AURORA_ENTER_SENDS = true; window.AURORA_LOG_SCROLLS = true;
+window.AURORA_UI_VERSION = '3.1';   // the page's own version (Chat layout); the code version comes from the server
+window.AURORA_SB_KEY = 'aurora_web_sidebar_chat';
+try { const t = localStorage.getItem('aurora_web_theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}   // before first paint: no flash
+try { if (matchMedia('(max-width:768px)').matches) localStorage.removeItem(window.AURORA_SB_KEY); } catch (e) {}   // a phone always opens on the chat, not the list
+window.AURORA_SB_OPEN = !matchMedia('(max-width:768px)').matches;
+</script>
+</head>
+<body>
+<!-- Web App Design Language, flavour 3 (Chat). Aurora Lite R377. -->
+<nav id="side" aria-label="Chats">
+  <div class="brand"><span class="logo" aria-hidden="true"></span><b class="grow">Aurora</b><button class="ib" type="button" id="sb-close" title="Close the sidebar" aria-label="Close the sidebar"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg></button></div>
+  <button class="nav" type="button" id="new-chat"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/></svg> New Chat</button>
+  <button class="nav" type="button" id="notes-btn"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h9l4 4v14H6z"/><path d="M9 11h7M9 15h7"/></svg> Notes</button>
+  <button class="nav" type="button" id="files-btn"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg> Files</button>
+  <label class="searchbox"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4-4"/></svg><input type="search" id="search" placeholder="Search" aria-label="Search chats" autocomplete="off" enterkeyhint="search"></label>
+  <div class="chats-head">
+    <h2 class="cap" id="chats-cap" role="button" tabindex="0" aria-expanded="true" aria-controls="sessions">Chats</h2>
+    <button class="ib" type="button" id="new-folder" title="New chat folder" aria-label="New chat folder"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button>
+  </div>
+  <div id="sessions" aria-label="Recent chats"><p class="empty">…</p></div>
+  <button class="nav" type="button" id="settings-btn"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg> Settings</button>
+</nav>
+<div id="scrim"></div>
+<div class="main">
+<header>
+  <button class="ib" type="button" id="sb-toggle" aria-controls="side" aria-expanded="false" title="Chats" aria-label="Chats"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></svg></button>
+  <h1 id="chat-title" class="grow">New Chat</h1>
+  <span class="tag" id="plan-tag" title="Plan mode is on: nothing that changes files or runs commands is executed" hidden>PLAN</span>
+  <span class="tag" id="status" title="Tap to show what Aurora is doing">idle</span>
+  <span class="tag" id="ctx" role="button" tabindex="0" title="Context and usage (tap for details)"><span class="meter" id="hmeter"><i></i></span><span id="ctx-txt">0</span><b id="ctx-fold" hidden></b></span>
+</header>
+<div id="log" aria-live="polite"></div>
+<button class="ib" type="button" id="jump" hidden title="Jump to the latest" aria-label="Jump to the latest"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg></button>
+<div class="bottom">
+  <div id="queue" hidden></div>
+  <div id="live" hidden><div id="live-line" role="button" tabindex="0" aria-expanded="false" title="Tap to show what Aurora is thinking"></div><pre id="live-think" hidden></pre></div>
+  <span id="hint" hidden></span>
+  <div id="editing" hidden><span class="grow">Editing your last message: Send replaces it and the reply after it.</span><button class="btn" type="button" id="edit-cancel">Cancel</button></div>
+  <form id="send">
+    <textarea id="text" rows="1" aria-label="Message" placeholder="Send a message" data-ph="Send a message" autocomplete="off" enterkeyhint="send"></textarea>
+    <div class="crow">
+      <span class="tag" id="model">…</span>
+      <span class="grow"></span>
+      <button type="button" class="ib" id="mic" hidden title="Speak (tap again to stop)" aria-label="Voice input" aria-pressed="false"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+      <button type="button" class="ib" id="cmd-btn" aria-haspopup="menu" aria-expanded="false" title="Commands" aria-label="Commands"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 7l5 5-5 5M12 18h7"/></svg></button>
+      <button type="button" id="stop" hidden title="Stop" aria-label="Stop"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg></button>
+      <button type="submit" id="go" title="Send" aria-label="Send"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg></button>
+    </div>
+  </form>
+</div>
+</div>
+<div id="cmd-menu" class="popup" role="menu" hidden>
+        <button class="dd-item cmd" type="button" data-cmd="compact" title="Fold older messages into a summary">Compact</button>
+        <button class="dd-item cmd" type="button" data-cmd="context" title="Show the context used">Context</button>
+        <button class="dd-item cmd" type="button" id="diff-btn" title="Show what the last turn changed">Diff</button>
+        <button class="dd-item cmd" type="button" id="undo-btn" title="Revert just the last change (asks first)">Undo</button>
+        <button class="dd-item" type="button" id="load-ctx" disabled title="Fill the message with: load <workspace>/context.md">Load context</button>
+        <button class="dd-item cmd danger" type="button" data-cmd="clear" title="Wipe this chat's history (it stays in the list)">Clear</button>
+      </div>
+<dialog id="notes" aria-labelledby="notes-h">
+  <div class="nshell" id="nshell">
+    <div class="ntop">
+      <h3 id="notes-h" class="grow">Notes</h3>
+      <button class="ib" type="button" id="note-close" title="Close" aria-label="Close"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+    <div class="nmain">
+      <div class="npane">
+        <div id="note-tabs" role="tablist" aria-label="Type of note"><button class="tab" type="button" role="tab" data-type="personal" aria-selected="true">Personal</button><button class="tab" type="button" role="tab" data-type="work" aria-selected="false">Work</button><button class="tab" type="button" role="tab" data-type="skills" aria-selected="false">Skills</button></div>
+        <div class="nfind"><input type="search" id="note-search" placeholder="Search notes" aria-label="Search notes" autocomplete="off">
+          <button class="btn" type="button" id="note-new"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg> New note</button></div>
+        <div id="note-list"></div>
+      </div>
+      <div class="nedit">
+        <p id="note-empty">Select a note, or start a new one.</p>
+        <div id="note-edit" hidden>
+          <div class="nhead"><button class="ib" type="button" id="note-back" title="Back to the notes" aria-label="Back to the notes"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button><span class="sec grow" id="note-state" aria-live="polite"></span>
+            <select id="note-type" aria-label="Move the note to" title="Move the note to another type"><option value="personal">Personal</option><option value="work">Work</option><option value="skills">Skills</option></select>
+            <button class="ib" type="button" id="note-mode" aria-pressed="false" title="Show the formatted note (Ctrl+E)">View</button>
+            <button class="ib" type="button" id="note-send" title="Send to chat as context" aria-label="Send to chat as context"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12l16-8-6 16-2-7z"/><path d="M12 13l8-9"/></svg></button>
+            <button class="ib" type="button" id="note-copy" title="Copy the text" aria-label="Copy the text"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg></button>
+            <button class="ib" type="button" id="note-del" title="Delete the note" aria-label="Delete the note"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/></svg></button>
+          </div>
+          <input type="text" id="note-title" maxlength="80" aria-label="Note title" placeholder="Untitled" autocomplete="off">
+          <textarea id="note-text" aria-label="Note text" placeholder="Start writing…" spellcheck="true"></textarea>
+          <div id="note-view" class="md" tabindex="0" aria-label="Note, formatted" hidden></div>
+          <div class="nfoot"><span id="note-meta"></span> <button class="btn" type="button" id="note-src" hidden title="Open the chat this note was saved from">Open its chat</button></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</dialog>
+<dialog id="files" aria-labelledby="fl-h">
+  <div class="bar"><h3 class="grow" id="fl-h">Files</h3><button class="btn" type="button" id="fl-close">Close</button></div>
+  <div class="fl-head"><div id="fl-tabs" role="tablist"><button class="tab" type="button" role="tab" data-kind="input" aria-selected="true">Input</button><button class="tab" type="button" role="tab" data-kind="outputs" aria-selected="false">Outputs</button></div><button class="btn" type="button" id="fl-all" hidden>Delete all</button></div>
+  <p class="sec" id="fl-desc">Pictures and files you attached, saved so Aurora can open them. Deleted automatically after 30 days.</p>
+  <div id="fl-list"></div>
+</dialog>
+<dialog id="settings" aria-labelledby="set-h">
+  <div class="set-col">
+  <div class="bar"><h3 class="grow" id="set-h">Settings</h3><button class="btn" type="button" id="set-close">Close</button></div>
+  <section aria-labelledby="set-look">
+    <h4 class="cap" id="set-look">Appearance</h4>
+    <label class="field">Theme <select id="theme-sel" class="sel"><option value="auto">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+    <label class="opt"><input type="checkbox" id="md-on"> Show replies formatted (Markdown)</label>
+    <label class="opt"><input type="checkbox" id="hide-tools"> Hide tool calls</label>
+  </section>
+  <section aria-labelledby="set-chat">
+    <h4 class="cap" id="set-chat">Chat</h4>
+    <label class="opt" id="auto-tag" title="Run tool calls without asking (the web denylist still blocks)"><input type="checkbox" id="auto-on"> Auto-approve tool calls</label>
+    <label class="opt" title="The model plans; nothing that changes files or runs commands is executed"><input type="checkbox" id="plan-on"> Plan mode</label>
+    <label class="opt" title="Off: the page opens on your last chat"><input type="checkbox" id="clear-open"> New chat on open</label>
+    <label class="opt" title="Off: the model's own setting. Sent with each message from this page only"><input type="checkbox" id="temp-on"> Temperature <span id="temp-val"></span></label>
+    <input type="range" id="temp" min="0" max="1.5" step="0.05" value="0.7" aria-label="Temperature" hidden>
+  </section>
+  <section aria-labelledby="set-ctx">
+    <h4 class="cap" id="set-ctx">Context and usage</h4>
+    <div class="meter" id="meter" role="img" aria-label="Context used"><i></i></div>
+    <span class="sec" id="ctx-detail">no data yet</span>
+    <div class="set-row"><span class="tag" id="sid" title="session id (click to copy)" role="button" tabindex="0" hidden></span><button class="btn" type="button" id="usage-btn">Cost and usage…</button></div>
+  </section>
+  <section aria-labelledby="set-tok">
+    <h4 class="cap" id="set-tok">Access token</h4>
+    <span class="sec">Needed when this server asks for one. It is kept on this device only.</span>
+    <div class="token-row">
+      <input type="text" id="token" class="secret" aria-label="Access token" placeholder="bearer token" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-form-type="other">
+      <button class="btn" type="button" id="token-save">Save</button>
+    </div>
+  </section>
+  <p class="sec" id="set-about">Code <span id="ver-code">…</span> · UI <span id="ver-ui"></span> · <a href="/paper" style="color:var(--link)">Paper page</a></p>
+  </div>
+</dialog>
+<dialog id="preview" aria-labelledby="pv-h">
+  <div class="bar"><h3 class="grow" id="pv-h">Preview</h3><button class="btn" type="button" id="pv-prev" title="Previous file (←)" aria-label="Previous file" hidden>Prev</button><button class="btn" type="button" id="pv-next" title="Next file (→)" aria-label="Next file" hidden>Next</button><button class="btn" type="button" id="pv-dl">Download</button><button class="btn" type="button" id="pv-close">Close</button></div>
+  <div id="pv-body"></div>
+</dialog>
+<dialog id="view">
+  <div class="bar"><h3 class="grow" id="view-title">Session</h3><button class="btn primary" type="button" id="view-resume" hidden>Resume</button><button class="btn" type="button" id="view-close">Close</button></div>
+  <div class="msg md" id="view-body"></div>
+</dialog>
+<dialog id="approve">
+  <h3 id="ap-title">Approve?</h3>
+  <pre id="ap-args"></pre>
+  <span id="ap-left" hidden></span>
+  <details id="ap-diff" hidden><summary>Show diff</summary><pre id="ap-body"></pre></details>
+  <div class="btns">
+    <button class="btn" type="button" data-a="n" id="ap-deny" autofocus>Deny</button>
+    <button class="btn" type="button" data-a="s">Stop</button>
+    <button class="btn primary" type="button" data-a="y">Approve</button>
+  </div>
+</dialog>
+<dialog id="models" aria-labelledby="md-h">
+  <div class="bar"><h3 class="grow" id="md-h">Edit models</h3><button class="btn" type="button" id="md-close">Close</button></div>
+  <div id="md-tabs" role="tablist" aria-label="File"><button class="tab" type="button" role="tab" data-view="config.yaml" aria-selected="true">config.yaml</button><button class="tab" type="button" role="tab" data-view="config.local.yaml" aria-selected="false" hidden>config.local.yaml</button></div>
+  <div id="md-raw">
+    <p class="sec" id="cfg-path"></p>
+    <div class="cfg-ed"><pre id="cfg-gutter" aria-hidden="true"></pre><textarea id="cfg-text" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off" aria-label="File text"></textarea></div>
+    <p class="sec" id="cfg-msg" role="status" aria-live="polite"></p>
+    <div class="btns"><button class="btn" type="button" id="cfg-revert">Revert</button><button class="btn" type="button" id="cfg-check">Validate</button><button class="btn primary" type="button" id="cfg-save">Save</button></div>
+  </div>
+</dialog>
+<dialog id="export" aria-labelledby="ex-h">
+  <h3 id="ex-h">Download chat</h3>
+  <p class="sec">One HTML file that opens in any browser.</p>
+  <label class="ex-opt"><input type="radio" name="ex-level" value="brief" checked> Prompts and final answers</label>
+  <label class="ex-opt"><input type="radio" name="ex-level" value="full"> Everything: prompts, thinking, commands with their output, answers</label>
+  <div class="btns two">
+    <button class="btn" type="button" id="ex-no">Cancel</button>
+    <button class="btn primary" type="button" id="ex-yes">Download</button>
+  </div>
+</dialog>
+<dialog id="confirm">
+  <h3 id="cf-title">Clear the history?</h3>
+  <p class="sec" id="cf-text">The conversation is wiped and the next message starts fresh.</p>
+  <pre id="cf-pre" hidden></pre>
+  <div class="btns two">
+    <button class="btn" type="button" id="cf-no">Cancel</button>
+    <button class="btn primary" type="button" id="cf-yes">Clear</button>
+  </div>
+</dialog>
+<script src="/app.js"></script>
+<script>
+if (matchMedia('(pointer:coarse)').matches && !matchMedia('(pointer:fine)').matches) $('text').enterKeyHint = 'enter';   // Enter is a new line on a phone; the round button sends
+document.getElementById('ver-ui').textContent = window.AURORA_UI_VERSION + ' (Chat)';
+function setTheme(t) {
+  if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; else { t = 'auto'; delete document.documentElement.dataset.theme; }
+  try { localStorage.setItem('aurora_web_theme', t); } catch (e) {}
+  $('theme-sel').value = t;
+}
+$('theme-sel').onchange = e => setTheme(e.target.value);
+setTheme((() => { try { return localStorage.getItem('aurora_web_theme') || 'auto'; } catch (e) { return 'auto'; } })());
+// the jump button sits just above the composer, whatever its height
+new ResizeObserver(() => document.querySelector('.main').style.setProperty('--composer-h', document.querySelector('.bottom').offsetHeight + 'px')).observe(document.querySelector('.bottom'));
+// R392 U12: a short viewport with the message box focused is "keyboard up"
+const kbd = () => document.body.classList.toggle('kbd', document.activeElement === $('text') && (visualViewport ? visualViewport.height : innerHeight) < 450);
+$('text').addEventListener('focus', kbd); $('text').addEventListener('blur', () => setTimeout(kbd, 0)); (window.visualViewport || window).addEventListener('resize', kbd);
+addEventListener('keydown', e => { if (e.key === 'Escape' && !document.querySelector('dialog[open]') && !document.body.classList.contains('sb-closed') && matchMedia('(max-width:768px)').matches) sidebar(false); });
+</script>
+</body>
+</html>

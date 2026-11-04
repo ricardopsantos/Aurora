@@ -150,7 +150,8 @@ def apply(text: str, hunks: list[Hunk]) -> str:
         n = len(hits)
         if n == 0:
             raise PatchError(
-                f"hunk {h.header!r}: context not found — the file may have "
+                f"hunk {h.header!r}: context not found"
+                f"{_hunk_hint(text, h.old)} — the file may have "
                 f"changed since the patch was written, or a line is off by "
                 f"one; re-read the file and regenerate the patch")
         if n > 1:
@@ -160,6 +161,29 @@ def apply(text: str, hunks: list[Hunk]) -> str:
         i = hits[0]
         text = text[:i] + h.new + text[i + len(h.old):]
     return text
+
+
+def not_found_hint(text: str, old: str) -> str:
+    """R309: say WHY `old` missed (shared by edit_file and apply_patch), so
+    the model fixes the anchor instead of guessing again. Ordered
+    cheapest-to-confirm first; empty when nothing close is found."""
+    if old.strip() and old.strip() in text:
+        return " (found with different leading/trailing whitespace)"
+    squash = lambda t: re.sub(r"[ \t]+", " ", t)
+    if squash(old) in squash(text):
+        return " (found with different indentation or spacing — tabs vs spaces?)"
+    # The first line must match ONE whole line: a substring test fired on
+    # `}` or `else:` almost everywhere, pointing the model at nothing.
+    first = next((ln.strip() for ln in old.splitlines() if ln.strip()), "")
+    if first and sum(ln.strip() == first for ln in text.splitlines()) == 1:
+        return " (the first line exists; a later line differs)"
+    return ""
+
+
+def _hunk_hint(text: str, old: str) -> str:
+    if old in text:     # substring hit that _line_anchored rejected (R281)
+        return " (the text exists, but only inside a longer line)"
+    return not_found_hint(text, old)
 
 
 def _line_anchored(text: str, old: str) -> list[int]:

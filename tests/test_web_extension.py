@@ -110,3 +110,39 @@ def test_specs_takes_no_include_web_argument():
     ignored, so a stale caller fails loudly."""
     with pytest.raises(TypeError):
         tools.specs(False)
+
+
+# ── R338: readable text, not a tag-stripped dump ───────────────────────────
+_PAGE = """<html><head><title>T</title><style>.a{}</style></head><body>
+<nav><a href="/">Home</a> <a href="/x">Menu item</a></nav>
+<header><h1>The Title</h1></header>
+<main><p>First paragraph &amp; more.</p><ul><li>one</li><li>two</li></ul>
+<p>""" + "Body text. " * 30 + """</p></main>
+<aside>Related links</aside><form><input></form>
+<footer>Copyright junk</footer><script>var x = 1;</script></body></html>"""
+
+
+def test_html_to_text_drops_furniture_and_keeps_structure():
+    from aurora.extensions_bundled.web_extension import html_to_text
+    out = html_to_text(_PAGE)
+    for junk in ("Menu item", "Related links", "Copyright", "var x", ".a{}"):
+        assert junk not in out
+    assert "First paragraph & more." in out          # entity decoded
+    assert "- one" in out and "- two" in out         # list items
+    assert out.count("First paragraph") == 1
+    assert "\n\n\n" not in out
+
+
+def test_html_to_text_without_main_keeps_the_body():
+    from aurora.extensions_bundled.web_extension import html_to_text
+    out = html_to_text("<body><nav>skip</nav><div>keep this</div><p>and this</p></body>")
+    assert "skip" not in out and "keep this" in out and "and this" in out
+
+
+def test_html_to_text_is_linear_on_unclosed_blocks():
+    import time
+
+    from aurora.extensions_bundled.web_extension import html_to_text
+    t0 = time.monotonic()
+    html_to_text("<nav>" * 40000 + "<form" * 40000)
+    assert time.monotonic() - t0 < 2

@@ -40,10 +40,49 @@ def set_prompter(fn: Callable[[str], str]) -> None:
     _prompter = fn
 
 
+_keyring_stuck = False
+
+
+def _keyring_timeout() -> float:
+    try:
+        return float(os.environ.get("AURORA_KEYRING_TIMEOUT", "5"))
+    except ValueError:
+        return 5.0
+
+
+def _bounded(fn: Callable[[], object]):
+    """R325: run a keyring call with a deadline. SecretService can block
+    forever on a GUI unlock prompt nobody can see (ssh/tmux session, locked
+    GNOME keyring), freezing `/model` and the first keyed request. On timeout
+    the keyring is treated as "no key here" for the rest of the process, so the
+    wait is paid once, not per lookup; the env var / passphrase file / prompt
+    paths still work."""
+    global _keyring_stuck
+    if _keyring_stuck:
+        raise TimeoutError("keyring unavailable")
+    import threading
+    box: dict = {}
+
+    def run():
+        try:
+            box["v"] = fn()
+        except BaseException as e:           # noqa: BLE001 — relayed below
+            box["e"] = e
+    t = threading.Thread(target=run, daemon=True, name="aurora-keyring")
+    t.start()
+    t.join(_keyring_timeout())
+    if t.is_alive():
+        _keyring_stuck = True
+        raise TimeoutError("keyring did not answer (locked? waiting for an unlock prompt)")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
+
+
 def _keyring_get(name: str) -> str | None:
     try:
         import keyring
-        return keyring.get_password(_SERVICE, name)
+        return _bounded(lambda: keyring.get_password(_SERVICE, name))
     except Exception:
         return None
 
@@ -51,7 +90,7 @@ def _keyring_get(name: str) -> str | None:
 def _keyring_set(name: str, value: str) -> bool:
     try:
         import keyring
-        keyring.set_password(_SERVICE, name, value)
+        _bounded(lambda: keyring.set_password(_SERVICE, name, value))
         return True
     except Exception:
         return False

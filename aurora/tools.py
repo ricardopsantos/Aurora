@@ -4,6 +4,7 @@ Writes/commands are gated by the caller (agent.py) via approve.py; the tools
 themselves just do the work. Reads and web tools need no approval."""
 
 import atexit
+import collections
 import re
 import subprocess
 import threading
@@ -11,6 +12,7 @@ import time
 from pathlib import Path
 
 from . import patch as patchmod
+from .patch import not_found_hint as _not_found_hint
 from .paths import write_text_preserving
 
 MAX_READ_BYTES = 200_000
@@ -59,6 +61,18 @@ def _private_host(host: str, resolve: bool = True) -> bool:
     try:
         addrs = [ipaddress.ip_address(host)]
     except ValueError:
+        # R320: shorthand IPv4 (`127.1`, `2130706433`, `0x7f.1`) is not a
+        # literal to `ipaddress` but connects like one.
+        try:
+            addrs = [ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(host)))]
+        except (OSError, ValueError):
+            addrs = None
+        # R320: a bare single-label name (`myhost`) is resolved through
+        # the machine's search domains / VPN, so it is local by nature.
+        if addrs is None and "." not in host:
+            return True
+        if addrs is not None:
+            return any(not a.is_global for a in addrs)
         if not resolve:
             return False
         try:
@@ -138,7 +152,45 @@ def _resolve(path: str) -> Path:
     return Path(path).expanduser()
 
 
-def read_file(path: str, offset: int = 0, limit: int = 0, **_) -> str:
+def _skip_lines(fb, n: int) -> bool:
+    """R327: leave binary file `fb` positioned at the start of line n+1 by
+    counting newlines in 1 MB blocks (no decoding, no per-line objects).
+    False when the file has fewer than n lines."""
+    seen = 0
+    while seen < n:
+        block = fb.read(1 << 20)
+        if not block:
+            return False
+        c = block.count(b"\n")
+        if seen + c >= n:
+            pos = -1
+            for _ in range(n - seen):
+                pos = block.index(b"\n", pos + 1)
+            fb.seek(fb.tell() - len(block) + pos + 1)
+            return True
+        seen += c
+    return True
+
+
+def _tail_lines(p: Path, n: int) -> tuple[list[str], int]:
+    """R327: the last `n` lines and the file's total line count, found by
+    reading backwards from the end — O(n), not O(file) — except that the total
+    is only exact when the whole file was reached, so it is returned as 0 when
+    unknown."""
+    with p.open("rb") as f:
+        size = f.seek(0, 2)
+        end, buf = size, b""
+        while end > 0 and buf.count(b"\n") <= n:
+            step = min(1 << 16, end)
+            end -= step
+            f.seek(end)
+            buf = f.read(step) + buf
+    lines = buf.decode("utf-8", errors="replace").splitlines(keepends=True)
+    return lines[-n:], (len(lines) if end == 0 else 0)
+
+
+def read_file(path: str, offset: int = 0, limit: int = 0, tail: int = 0,
+              **_) -> str:
     """Read a text file, optionally a LINE RANGE (R90b): `offset` is the
     1-based first line, `limit` the number of lines. Without a range the old
     behaviour is unchanged — the head of the file up to MAX_READ_BYTES.
@@ -150,14 +202,29 @@ def read_file(path: str, offset: int = 0, limit: int = 0, **_) -> str:
     if not p.is_file():
         return f"[error: no such file: {path}]"
     try:
-        offset, limit = int(offset or 0), int(limit or 0)
+        offset, limit, tail = int(offset or 0), int(limit or 0), int(tail or 0)
     except (TypeError, ValueError):
-        return "[error: offset/limit must be integers]"
+        return "[error: offset/limit/tail must be integers]"
+    if tail > 0:
+        lines, total = _tail_lines(p, tail)
+        if not lines:
+            return "[no lines: file is empty]"
+        text = "".join(lines)
+        if len(text) > MAX_READ_BYTES:
+            text = text[-MAX_READ_BYTES:]
+        where = (f"[last {len(lines)} lines of {total}]" if total
+                 else f"[last {len(lines)} lines]")
+        return where + "\n" + text
     if offset or limit:
         start = max(offset, 1)
         out, n, total, more, size = [], 0, 0, False, 0
-        with p.open("r", encoding="utf-8", errors="replace") as f:
-            for i, line in enumerate(f, 1):   # stream: never slurp the file
+        import io
+        fb = p.open("rb")
+        if start > 1 and not _skip_lines(fb, start - 1):
+            fb.close()
+            return f"[no lines: file has fewer than {start} lines]"
+        with io.TextIOWrapper(fb, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f, start):   # stream: never slurp the file
                 total = i
                 if i < start:
                     continue
@@ -447,7 +514,8 @@ def edit_file(path: str, old: str, new: str, replace_all: bool = False,
     text, crlf = _read_for_edit(p)                              # R269
     n = text.count(old)
     if n == 0:
-        return "[error: `old` text not found — it must match exactly]"
+        return ("[error: `old` text not found — it must match exactly"
+                + _not_found_hint(text, old) + "]")
     if n > 1 and not replace_all:
         return (f"[error: `old` text appears {n} times — make it unique, "
                 f"or pass replace_all=true to change all {n}]")
@@ -502,6 +570,54 @@ def set_command_timeout(seconds: float) -> None:
 # so this cap is invisible there and generous here. Approximate, not exact:
 # the chunk that crosses the cap is kept whole.
 COMMAND_OUTPUT_CAP = 5 * 1024 * 1024
+
+
+class _HeadTail:
+    """R310: bounded capture that keeps the START and the END of a stream.
+    A head-only cap dropped exactly what matters for a long test/build run
+    (the failure summary is printed last). Memory stays <= COMMAND_OUTPUT_CAP
+    and the pipe is still drained, so R194/R153 hold."""
+
+    def __init__(self, cap: int | None = None):
+        self.half = (COMMAND_OUTPUT_CAP if cap is None else cap) // 2
+        self.head: list[bytes] = []
+        self.head_len = 0
+        self.tail: collections.deque[bytes] = collections.deque()
+        self.tail_len = 0
+        self.dropped = 0
+
+    def add(self, chunk: bytes) -> None:
+        if self.head_len < self.half:
+            self.head.append(chunk)
+            self.head_len += len(chunk)
+            return
+        self.tail.append(chunk)
+        self.tail_len += len(chunk)
+        while self.tail_len - len(self.tail[0]) >= self.half:
+            old = self.tail.popleft()
+            self.tail_len -= len(old)
+            self.dropped += len(old)
+
+    def text(self) -> str:
+        s = b"".join(self.head).decode("utf-8", errors="replace")
+        if self.dropped:
+            s += (f"\n[... {self.dropped} bytes omitted — the command kept "
+                  "running; redirect to a file if you need all of it ...]\n")
+        return s + b"".join(self.tail).decode("utf-8", errors="replace")
+
+
+# R310: what the MODEL sees of a command's output. The 5 MiB capture cap only
+# bounds memory; this bounds context cost. Head + tail, never head alone.
+COMMAND_RESULT_LIMIT = 50_000
+
+
+def _squeeze(out: str, limit: int = COMMAND_RESULT_LIMIT) -> str:
+    if len(out) <= limit:
+        return out
+    half = limit // 2
+    return (out[:half]
+            + f"\n[... {len(out) - limit} chars omitted from the middle ...]\n"
+            + out[-half:])
 
 
 # R272: how often a running command polls the turn's cancel callback — the
@@ -573,10 +689,7 @@ def _run_command_once(command: str, workdir: str | None,
     # accumulated: the point is to keep the pipe empty so the command runs to
     # completion normally. It is deliberately not killed for being verbose —
     # that would change its exit code and lose its side effects.
-    out_chunks: list[bytes] = []
-    err_chunks: list[bytes] = []
-    out_len = err_len = 0
-    truncated = False
+    out_cap, err_cap = _HeadTail(), _HeadTail()
     timed_out = False
     watch = [proc.stdout, proc.stderr]
     deadline = _time.monotonic() + timeout
@@ -599,26 +712,10 @@ def _run_command_once(command: str, workdir: str | None,
             if not chunk:
                 watch.remove(pipe)          # EOF on this pipe
                 continue
-            if pipe is proc.stdout:
-                if out_len < COMMAND_OUTPUT_CAP:
-                    out_chunks.append(chunk)
-                    out_len += len(chunk)
-                else:
-                    truncated = True
-            elif err_len < COMMAND_OUTPUT_CAP:
-                err_chunks.append(chunk)
-                err_len += len(chunk)
-            else:
-                truncated = True
+            (out_cap if pipe is proc.stdout else err_cap).add(chunk)
 
     def _decoded() -> str:
-        s = (b"".join(out_chunks).decode("utf-8", errors="replace")
-             + b"".join(err_chunks).decode("utf-8", errors="replace"))
-        if truncated:
-            s += (f"\n[output truncated at {COMMAND_OUTPUT_CAP} bytes — "
-                  "the command kept running; redirect to a file if you need "
-                  "all of it]")
-        return s
+        return out_cap.text() + err_cap.text()
 
     if cancelled:
         _kill_group(proc, pgid)
@@ -880,7 +977,7 @@ def cancel_command(job_id: str, **_) -> str:
 
 
 def _cancelled_text(e: "CommandCancelled") -> str:
-    partial = str(e)
+    partial = _squeeze(str(e))                                  # R310
     return (partial + "\n" if partial else "") + \
         "[cancelled by user — the command's process group was killed]"
 
@@ -908,8 +1005,11 @@ def run_command(command: str, cwd: str = "", background: bool = False,
         return _cancelled_text(e)
     if code is None:
         head = f"[timeout after {COMMAND_TIMEOUT}s]"
-        return f"{out}\n{head}" if out else head
-    return (out.strip() or "[no output]") + (f"\n[exit {code}]" if code else "")
+        # R310: a timeout is the classic runaway (`yes`, a hung server log),
+        # so it needs the model-facing limit most of all.
+        return f"{_squeeze(out)}\n{head}" if out else head
+    return (_squeeze(out.strip()) or "[no output]") + (
+        f"\n[exit {code}]" if code else "")
 
 
 def wait_until(command: str, cwd: str = "", interval: float = 2.0,
@@ -963,7 +1063,7 @@ def wait_until(command: str, cwd: str = "", interval: float = 2.0,
                                           timeout=max(0.1, remaining), **kw)
         except CommandCancelled as e:                            # R272
             return _cancelled_text(e)
-        shown = out.strip() or "[no output]"
+        shown = _squeeze(out.strip()) or "[no output]"
         if code == 0:
             elapsed = _time.monotonic() - start
             head = (f"[wait_until: succeeded after {attempt} attempt(s), "
@@ -974,7 +1074,7 @@ def wait_until(command: str, cwd: str = "", interval: float = 2.0,
                 then_out, then_code = _run_command_once(then, workdir, **kw)
             except CommandCancelled as e:                        # R272
                 return f"{head}\n{_cancelled_text(e)}"
-            then_shown = then_out.strip() or "[no output]"
+            then_shown = _squeeze(then_out.strip()) or "[no output]"
             then_head = ("[then: timed out]" if then_code is None
                         else f"[then: exit {then_code}]")
             return f"{head}\n{then_head}\n{then_shown}"
@@ -1032,7 +1132,10 @@ SPEC = [
                     "description": "1-based first line to read (optional)"},
          "limit": {"type": "integer",
                    "description": "how many lines to read from offset "
-                                  "(optional)"}},
+                                  "(optional)"},
+         "tail": {"type": "integer",
+                  "description": "read only the LAST n lines (fast on big "
+                                 "logs; optional)"}},
          "required": ["path"]}},
     {"name": "list_dir", "description": "List a directory's entries.",
      "parameters": {"type": "object", "properties": {

@@ -419,7 +419,7 @@ def price_for(model: str) -> tuple[float, float] | None:
 def _is_bare_ip(base_url: str) -> bool:
     """True when the endpoint is a literal private/loopback IP rather than a
     hostname. A LAN reverse proxy (e.g. Caddy) commonly serves a cert issued
-    for its Tailscale/hostname name only — hitting it by bare IP always
+    for its a VPN/hostname name only — hitting it by bare IP always
     mismatches, so we skip TLS verification for that case specifically
     (hostnames, including .ts.net, keep full verification)."""
     host = (urlparse(base_url).hostname or "").lower()
@@ -431,7 +431,7 @@ def _is_bare_ip(base_url: str) -> bool:
 
 
 def _is_lan_host(base_url: str) -> bool:
-    """True for a self-hosted server on the local machine / LAN / tailnet —
+    """True for a self-hosted server on the local machine / LAN / VPN —
     somewhere a connect SHOULD fail fast when it's off. A public API
     (openrouter.ai, …) is not: its TLS handshake can legitimately be slow, so
     it gets a longer connect budget (see `_client`)."""
@@ -451,6 +451,18 @@ def _is_lan_host(base_url: str) -> bool:
 # costs more than a plain read — so below this we send the plain string and
 # skip the whole mechanism. ~4 chars/token, matching tokens.estimate_tokens.
 _CACHE_MIN_CHARS = 4 * 1024
+
+
+def _with_image_parts(m: dict) -> dict:
+    """R381: a user message carrying `images` (data URLs, held in memory only) goes out as OpenAI content parts;
+    every other message is returned untouched."""
+    imgs = m.get("images")
+    if not imgs:
+        return m
+    out = {k: v for k, v in m.items() if k != "images"}
+    out["content"] = [{"type": "text", "text": m.get("content") or ""}] + [
+        {"type": "image_url", "image_url": {"url": u}} for u in imgs]
+    return out
 
 
 def _system_message(system: str, cache: bool) -> dict:
@@ -501,6 +513,12 @@ class OpenAICompatProvider(Provider):
         against OpenRouter/remote than localhost)."""
         with self._http_lock:
             cached = self._http.get(base_url)
+            # R307: a closed pool is never handed out again — every later
+            # request on it raises "client has been closed" forever. Drop it
+            # and build a fresh one below.
+            if cached is not None and cached.is_closed:
+                self._http.pop(base_url, None)
+                cached = None
         if cached is not None:
             return cached
         # connect (TCP + TLS handshake) is bounded separately from the
@@ -511,7 +529,7 @@ class OpenAICompatProvider(Provider):
         # remote gets more room.
         connect = 5 if _is_lan_host(base_url) else 20
         # Happy Eyeballs (RFC 8305): race IPv4/IPv6 and use whichever
-        # connects first, so a dead public-IPv6 route (Tailscale up →
+        # connects first, so a dead public-IPv6 route (a VPN up →
         # blackhole) doesn't stall every handshake for the full timeout
         # (17s vs 0.15s). `retries=2` also retries a transient connect/TLS
         # failure on the winning family — httpcore retries only
@@ -586,7 +604,7 @@ class OpenAICompatProvider(Provider):
         # R290: skip an endpoint that failed its probe recently, while any
         # other is still a candidate. The list is re-probed IN ORDER every
         # time the 10s cache expires — i.e. before nearly every agent round —
-        # and a dead first URL (off-LAN, Tailscale down) costs its whole
+        # and a dead first URL (off-LAN, a VPN down) costs its whole
         # connect budget each time: measured 6.5s per probe (2s × the
         # transport's retries), so a 10-round turn paid ~65s just probing.
         now = time.time()
@@ -637,9 +655,9 @@ class OpenAICompatProvider(Provider):
         # /props is a llama.cpp endpoint; a PUBLIC API (OpenRouter, …) has no
         # such route, so probing it just wastes a slow request (~6s) on the
         # first status render — and it's on the UI thread, so it freezes the
-        # whole app at startup. Only a local/tailnet llama.cpp server has it
+        # whole app at startup. Only a local/VPN llama.cpp server has it
         # — but a gateway that unifies local + remote behind ONE LAN base_url
-        # (aurora-gateway) means `_is_lan_host` alone no longer implies "the
+        # (a gateway) means `_is_lan_host` alone no longer implies "the
         # SELECTED model is the local one": a remote model routed through
         # that same gateway would otherwise get /props's answer for whatever
         # is actually loaded locally, not its own real context window. The
@@ -750,6 +768,32 @@ class OpenAICompatProvider(Provider):
         usd = cost_for(model, inp, out, cached)
         return 0.0 if usd is None else usd
 
+    def serves_vision(self):
+        """R382: the llama-server reports `modalities.vision` on /props (or lists `multimodal`) — true when started with --mmproj.
+        Fail closed: any error says no. Cached for 10 s so a burst of attachments probes once."""
+        now = time.monotonic()
+        if now - getattr(self, "_vision_at", -99.0) < 10:
+            return getattr(self, "_vision", False)
+        ok = False
+        try:
+            base = self.pick_endpoint(cache_ok=True)
+            root = base.rstrip("/")
+            root = root[:-3] if root.endswith("/v1") else root
+            c, h = self._client_for(base), self._auth_headers()
+            props = c.get(root + "/props", headers=h, timeout=5).json()
+            if props.get("sleeping"):   # R412: the idle manager stopped llama-server; it cannot say, which is not a no
+                self._vision_at = -99.0
+                return None
+            ok = bool((props.get("modalities") or {}).get("vision"))
+            if not ok:    # behind a proxy that drops /props: the llama.cpp-native model list carries the capability
+                body = c.get(base.rstrip("/") + "/models", headers=h, timeout=5).json()
+                rows = (body.get("models") or []) + (body.get("data") or [])
+                ok = any("multimodal" in (m.get("capabilities") or []) for m in rows if isinstance(m, dict))
+        except Exception:
+            ok = False
+        self._vision, self._vision_at = ok, now
+        return ok
+
     def _auth_headers(self) -> dict:
         h = {"Content-Type": "application/json"}
         if self.api_key and self.api_key != "none":
@@ -757,7 +801,7 @@ class OpenAICompatProvider(Provider):
         return h
 
     def turn(self, model, messages, system, tools, on_text, cancel) -> TurnResult:
-        # Pick a working endpoint so we fail over when the LAN/Tailscale path
+        # Pick a working endpoint so we fail over when the LAN/a VPN path
         # changes between messages. PIN it in a local: `self.base_url` is also
         # flipped by the UI thread's status-render probes (live_context_limit
         # → pick_endpoint), and a mid-turn flip must not redirect this request
@@ -766,14 +810,13 @@ class OpenAICompatProvider(Provider):
         # R95h: honour the short TTL cache instead of forcing a probe. `turn()`
         # is called once per agent ITERATION, not once per user message, so
         # cache_ok=False meant a 10-iteration turn paid 10 extra probe round
-        # trips — negligible on localhost, real over a tailnet. The 10s TTL
+        # trips — negligible on localhost, real over a VPN. The 10s TTL
         # still re-probes between messages (a human turnaround is longer than
         # that), and a connection failure below explicitly expires the cache
         # (`_working_url_at = 0.0`), so failover is unchanged where it counts.
         base = self.pick_endpoint(cache_ok=True)
-        client = self._client_for(base)
         msgs = ([_system_message(system, self.cache_prompt)]
-                if system else []) + messages
+                if system else []) + [_with_image_parts(m) for m in messages]
         payload = {"model": model, "messages": msgs, "stream": True,
                    "stream_options": {"include_usage": True}}
         if tools:
@@ -790,6 +833,11 @@ class OpenAICompatProvider(Provider):
                       httpx.RemoteProtocolError, httpx.PoolTimeout)
         _ATTEMPTS = 3
         for _attempt in range(_ATTEMPTS):
+            # R307: fetched per attempt, not once per turn: if the pool was
+            # closed under a running request (its ReadError is what sent us
+            # round again), a retry on the same object could only fail with
+            # "client has been closed". `_client_for` hands back a live one.
+            client = self._client_for(base)
             result = TurnResult()
             pending: dict[int, dict] = {}   # index -> {id, name, args-fragments}
             try:

@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aurora</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="/favicon.png">
+<style>
+/* Web App Design Language v1.22, flavour 2 (Paper), wide column. Aurora Lite R369 (the /v2 page; / keeps the Desktop page). */
+:root{
+  color-scheme: light dark;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "DejaVu Sans", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --bg:#f6f4ee; --panel:#fffefb; --view:#ffffff; --fg:#1c1b22; --dim:#6b6878; --line:#d9d5ca; --hover:#f0ede4;
+  --btn:#ffffff; --sel:#3b46c4; --sel-fg:#fff;
+  --accent:#3b46c4; --accent-soft:#ecedfb; --accent-fg:#fff;
+  --ok:#2a7347; --warn:#9c4d00; --bad:#b3261e;
+  --cat-1:#2a66b0; --cat-2:#6f42b5; --cat-3:#0b6e6e; --cat-4:#a3327e; --cat-5:#6b6100; --cat-6:#7a4f3a;
+  --shadow:0 1px 0 rgba(0,0,0,.02), 0 10px 30px -24px rgba(0,0,0,.35);
+  --sp-half:8px; --sp:16px; --sp-2x:32px; --sp-4x:64px;
+  --fs-display:30px; --fs-title:16px; --fs-body:14px; --fs-secondary:13px; --fs-caption:12px; --fs-mono:13px;
+  --r-sm:3px; --r-md:9px; --r-lg:14px;
+  --gutter:var(--sp-2x); --top:var(--sp-2x);   /* app shell: the title block stays on screen, so the top space is 32 px, not 64 */
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#191816; --panel:#22211d; --view:#2b2a25; --fg:#ece9e1; --dim:#aaa598; --line:#3d3a33; --hover:#33312b;
+  --btn:#2b2a25; --sel:#3b46c4; --sel-fg:#fff;
+  --accent:#9aa3f5; --accent-soft:#262a52; --accent-fg:#12132b;
+  --ok:#8fd08f; --warn:#e6a55a; --bad:#ef8b84;
+  --cat-1:#7fb2ee; --cat-2:#b79df0; --cat-3:#5fd0d0; --cat-4:#f08fc8; --cat-5:#cfc35a; --cat-6:#d9a58a;
+  --shadow:0 1px 0 rgba(0,0,0,.2), 0 10px 30px -24px rgba(0,0,0,.8);
+}}
+:root[data-theme="dark"]{color-scheme:dark;
+  --bg:#191816; --panel:#22211d; --view:#2b2a25; --fg:#ece9e1; --dim:#aaa598; --line:#3d3a33; --hover:#33312b;
+  --btn:#2b2a25; --sel:#3b46c4; --sel-fg:#fff;
+  --accent:#9aa3f5; --accent-soft:#262a52; --accent-fg:#12132b;
+  --ok:#8fd08f; --warn:#e6a55a; --bad:#ef8b84;
+  --cat-1:#7fb2ee; --cat-2:#b79df0; --cat-3:#5fd0d0; --cat-4:#f08fc8; --cat-5:#cfc35a; --cat-6:#d9a58a;
+  --shadow:0 1px 0 rgba(0,0,0,.2), 0 10px 30px -24px rgba(0,0,0,.8);
+}
+:root[data-theme="light"]{color-scheme:light}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--fg);font:400 var(--fs-body)/1.4 var(--font-sans);height:100dvh;overflow:hidden}
+button,input,select,textarea{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+:where(p,h1,h2,h3,ul,ol,pre,blockquote){margin:0}
+textarea,img{display:block}
+code,pre{font-family:var(--font-mono);font-size:var(--fs-mono)}
+.sec,.dim{color:var(--dim);font-size:var(--fs-secondary)}
+.cap{font-size:var(--fs-caption);font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--dim)}
+.grow{flex:1 1 auto;min-width:0}
+
+.page{width:100%;max-width:720px;margin-inline:auto;padding:var(--top) var(--gutter) var(--sp);display:flex;flex-direction:column;gap:var(--sp);height:100dvh;overflow:hidden}
+header{display:flex;flex-direction:column;gap:var(--sp-half);flex:none}
+.titleline{display:flex;align-items:center;gap:var(--sp-half)}
+h1{font-size:var(--fs-display);font-weight:600;line-height:1.2;display:flex;align-items:center;gap:var(--sp-half);flex:1 1 auto;min-width:0}
+h1::before{content:"";flex:none;width:8px;height:8px;border-radius:50%;background:var(--accent)}
+.subtitle{font-family:var(--font-mono);font-size:var(--fs-mono);color:var(--dim);overflow-wrap:anywhere}
+.tags{display:flex;flex-wrap:wrap;gap:var(--sp-half);align-items:center}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;background:var(--btn);border:1px solid var(--line);border-radius:var(--r-md);padding:12px 16px;min-width:72px;color:var(--fg);cursor:pointer;flex:none}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg);font-weight:600}
+.btn:disabled,.btn.primary:disabled{background:var(--line);border-color:var(--line);color:var(--dim);font-weight:400;cursor:not-allowed}
+.tag{max-width:100%;overflow:hidden;text-overflow:ellipsis;border:1px solid var(--line);border-radius:var(--r-sm);padding:4px 8px;font-size:var(--fs-secondary);color:var(--dim);white-space:nowrap;background:var(--panel)}
+.tag.busy,.tag.warn{color:var(--warn)}.tag.ok{color:var(--ok)}.tag.bad{color:var(--bad)}
+.tag:empty{display:none}
+#status{cursor:pointer}
+label.tag{display:inline-flex;align-items:center;gap:var(--sp-half);cursor:pointer}
+label.tag input{margin:0;accent-color:var(--accent)}
+#auto-tag.on{color:var(--warn);border-color:var(--warn)}
+input[type=text],textarea{background:var(--view);border:1px solid var(--line);border-radius:var(--r-md);padding:12px;min-width:0;max-width:100%}
+
+main{display:flex;flex-direction:column;gap:var(--sp);flex:1 1 auto;min-height:0}
+#log{display:flex;flex-direction:column;gap:var(--sp-half);flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--bg);padding:var(--sp-half)}
+.msg{border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--sp);background:var(--panel);box-shadow:var(--shadow);overflow-wrap:anywhere;white-space:pre-wrap}
+.msg.user{background:var(--accent-soft);border-color:var(--accent-soft);margin-left:var(--sp-2x)}
+.msg.md{white-space:normal}
+.msg.md>*{margin:0}.msg.md>*+*{margin-top:var(--sp-half)}
+.msg.md h1,.msg.md h2,.msg.md h3,.msg.md h4{line-height:1.25;font-weight:600;font-size:var(--fs-body)}
+.msg.md h1{font-size:var(--fs-title)}
+.msg.md ul,.msg.md ol{padding-left:var(--sp)}
+.msg.md blockquote{border-left:3px solid var(--line);padding-left:var(--sp-half);color:var(--dim)}
+.msg.md hr{border:0;border-top:1px solid var(--line)}
+.msg.md a{color:var(--accent)}
+.msg.md code{background:var(--hover);border-radius:var(--r-sm);padding:0 4px}
+.msg.md pre code{background:none;padding:0}
+.msg.md table{border-collapse:collapse;display:block;overflow-x:auto}
+.msg.md th,.msg.md td{border:1px solid var(--line);padding:4px 8px;text-align:left}
+.msg.md th{background:var(--hover)}
+.msg.note{color:var(--dim);font-size:var(--fs-secondary);background:none;box-shadow:none;border-style:dashed}
+.msg.err{color:var(--bad)}
+.msg pre{background:var(--hover);border:1px solid var(--line);border-radius:var(--r-sm);padding:var(--sp-half);overflow-x:auto;white-space:pre;margin-top:var(--sp-half)}
+#queue{flex:none;display:flex;flex-direction:column;gap:var(--sp-half);border:1px dashed var(--line);border-radius:var(--r-md);padding:var(--sp-half) var(--sp);color:var(--dim);font-size:var(--fs-secondary);background:var(--panel);max-height:20vh;overflow-y:auto}
+#queue .q-item{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+body.hide-tools details.tool{display:none}
+details{border:1px solid var(--line);border-radius:var(--r-md);background:var(--panel);padding:var(--sp-half) var(--sp);font-size:var(--fs-secondary)}
+details summary{cursor:pointer;color:var(--dim);overflow-wrap:anywhere}
+details pre{margin-top:var(--sp-half);white-space:pre-wrap;overflow-wrap:anywhere;max-height:40vh;overflow:auto;background:var(--hover);border-radius:var(--r-sm);padding:var(--sp-half)}
+
+#live{flex:none;display:flex;flex-direction:column;gap:var(--sp-half);color:var(--warn);border:1px solid var(--warn);border-radius:var(--r-md);padding:var(--sp-half) var(--sp);font-size:var(--fs-secondary);background:var(--panel)}
+#live-line{display:flex;align-items:center;gap:var(--sp-half);cursor:pointer}
+#live-line::before{content:"";flex:none;width:8px;height:8px;border-radius:50%;background:var(--warn);animation:pulse 1.2s ease-in-out infinite}
+#live-line::after{content:"";margin-left:auto;border:5px solid transparent;border-top:6px solid currentColor;border-bottom:0}
+#live-line[aria-expanded=true]::after{transform:rotate(180deg)}
+#live-think{max-height:40vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--fg);background:var(--hover);border-radius:var(--r-sm);padding:var(--sp-half)}
+@keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
+
+form#send{flex:none;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:var(--sp);display:flex;flex-direction:column;gap:var(--sp-half)}
+form#send textarea{width:100%;resize:none;font-size:16px;line-height:1.35;max-height:40vh}
+.actions{display:flex;gap:var(--sp-half)}
+.actions .btn{flex:1 1 0;min-width:0}
+
+/* the drawer: right edge, min(560px,100%), one at a time (A6.1); layers 10 bars, 20 drawer */
+#scrim{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:15}
+body:not(.sb-closed) #scrim{display:block}
+aside{position:fixed;top:0;right:0;bottom:0;width:min(560px,100%);z-index:20;background:var(--panel);border-left:1px solid var(--line);box-shadow:0 0 40px rgba(0,0,0,.3);overflow-y:auto;display:flex;flex-direction:column;animation:slide .25s ease-out}
+@keyframes slide{from{transform:translateX(24px);opacity:0}to{transform:none;opacity:1}}
+body.sb-closed aside{display:none}
+.drawer-head{display:flex;align-items:center;gap:var(--sp-half);padding:var(--sp);border-bottom:1px solid var(--line)}
+.drawer-head h2{font-size:var(--fs-title);font-weight:600}
+aside section{border-bottom:1px solid var(--line);display:flex;flex-direction:column}
+aside h2.cap{padding:var(--sp-half) var(--sp);display:flex;align-items:center;gap:var(--sp-half);cursor:pointer;user-select:none;min-height:44px}
+aside h2.cap::before{content:"";flex:none;border:5px solid transparent;border-top:6px solid currentColor;border-bottom:0}
+aside h2.cap[aria-expanded=false]::before{transform:rotate(-90deg)}
+aside h2.cap:hover{color:var(--fg)}
+aside .fold-body{display:flex;flex-direction:column;gap:var(--sp-half);padding:0 var(--sp) var(--sp)}
+aside section.folded .fold-body{display:none}
+aside .cmds{display:flex;gap:var(--sp-half)}
+aside .cmds .btn{flex:1 1 0;min-width:0;padding-inline:var(--sp-half)}
+.btn[aria-pressed=true]{background:var(--accent-soft);border-color:var(--accent);color:var(--fg);font-weight:600}
+.opt{display:flex;align-items:center;gap:var(--sp-half);cursor:pointer;min-height:44px}
+.opt input{flex:none;margin:0;width:20px;height:20px;accent-color:var(--accent)}
+.meter{height:8px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--view);overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:var(--ok)}
+.meter.warn i{background:var(--warn)}.meter.bad i{background:var(--bad)}
+#hint{color:var(--warn);font-size:var(--fs-secondary)}
+#sessions{display:flex;flex-direction:column;font-size:var(--fs-secondary)}
+#sessions div{display:flex;gap:var(--sp-half);overflow:hidden;white-space:nowrap;align-items:center}
+#sessions code{flex:none}
+#sessions .first{color:var(--dim);overflow:hidden;text-overflow:ellipsis}
+#sessions div[role=button]{cursor:pointer;border-radius:var(--r-sm);padding:8px 0;min-height:44px;border-bottom:1px solid var(--line)}
+#sessions div[role=button]:hover{background:var(--hover)}
+#sessions .cur code{color:var(--accent);font-weight:600}
+.token-row{display:flex;gap:var(--sp-half);align-items:stretch}
+.token-row input{flex:1 1 auto;min-width:0;width:100%;font-family:var(--font-mono);font-size:16px}
+.secret{-webkit-text-security:disc}
+
+dialog{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--sp);max-width:min(640px,calc(100vw - 2*var(--sp)));box-shadow:0 10px 40px rgba(0,0,0,.35);z-index:30}
+dialog::backdrop{background:rgba(0,0,0,.4)}
+dialog h3{font-size:var(--fs-title);margin-bottom:var(--sp-half)}
+dialog pre{background:var(--view);border:1px solid var(--line);border-radius:var(--r-sm);padding:var(--sp-half);max-height:45vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin-bottom:var(--sp)}
+dialog .btns{display:grid;grid-template-columns:1fr 1fr 1fr;gap:var(--sp-half)}
+dialog .btns .btn{min-width:0}
+dialog .btns.two{grid-template-columns:1fr 1fr}
+dialog>p{margin-bottom:var(--sp)}
+#view{width:min(820px,calc(100vw - 2*var(--sp)));max-height:calc(100dvh - 2*var(--sp))}
+#view:not([open]){display:none}
+#view[open]{display:flex;flex-direction:column;gap:var(--sp-half)}
+#view .bar{display:flex;align-items:center;gap:var(--sp-half)}
+#view .bar h3{margin:0}
+#view-body{overflow:auto;background:var(--view);border:1px solid var(--line);border-radius:var(--r-md);padding:var(--sp-half) var(--sp);flex:1 1 auto;min-height:0}
+
+@media (max-width:768px){
+  :root{--gutter:var(--sp);--top:var(--sp-2x)}
+  .msg.user{margin-left:var(--sp)}
+  .tags #ctx,.tags #sid{display:none!important}   /* the bar and the menu carry them on a phone */
+  .subtitle{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .subtitle #model{display:block;overflow:hidden;text-overflow:ellipsis}
+}
+@media (max-width:768px),(pointer:coarse){
+  .btn,input,textarea,#status,#live-line,#sid,details summary{min-height:44px}
+  label.tag{min-height:44px}
+  .tag input,.opt input{width:20px;height:20px;min-height:0}
+  #status,#sid,#live-line,details summary{display:flex;align-items:center}
+}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important}}
+</style>
+<script>window.AURORA_SB_OPEN = false; window.AURORA_ENTER_SENDS = true; window.AURORA_LOG_SCROLLS = true;
+window.AURORA_UI_VERSION = '2.4';   // the page's own version (Paper layout); the code version comes from the server
+try { const t = localStorage.getItem('aurora_web_theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}   // before first paint: no flash
+window.AURORA_SB_KEY = 'aurora_web_sidebar_v2'; try { localStorage.removeItem('aurora_web_sidebar_v2'); } catch (e) {}   // the drawer always starts closed</script>
+</head>
+<body>
+<!-- Web App Design Language, flavour 2 (Paper), wide column. Aurora Lite R369. -->
+<div class="page">
+<header>
+  <div class="titleline">
+    <h1>Aurora</h1>
+    <button class="btn" type="button" id="sb-toggle" aria-controls="side" aria-expanded="false">Menu</button>
+  </div>
+  <p class="subtitle"><span id="model">…</span></p>
+  <div class="tags">
+    <span class="tag" id="ctx"></span>
+    <span class="tag" id="sid" title="session id (click to copy)" role="button" tabindex="0" hidden></span>
+    <span class="tag" id="status" title="Tap to show what Aurora is doing">idle</span>
+    <label class="tag" id="auto-tag"><input type="checkbox" id="auto-on"> Auto-approve</label>
+  </div>
+  <div class="meter" id="meter" role="img" aria-label="Context used"><i></i></div>
+  <span id="hint" hidden></span>
+</header>
+<main>
+  <div id="log" aria-live="polite"></div>
+  <div id="queue" hidden></div>
+  <div id="live" hidden><div id="live-line" role="button" tabindex="0" aria-expanded="false" title="Tap to show what Aurora is thinking"></div><pre id="live-think" hidden></pre></div>
+  <form id="send">
+    <textarea id="text" rows="1" aria-label="Message" placeholder="Message Aurora · Enter sends" autocomplete="off"></textarea>
+    <div class="actions">
+      <button class="btn" type="button" id="stop" hidden>Stop</button>
+      <button class="btn primary" type="submit" id="go">Send</button>
+    </div>
+  </form>
+</main>
+</div>
+<div id="scrim"></div>
+<aside id="side" aria-label="Menu">
+  <div class="drawer-head"><div class="grow"><h2>Menu</h2><p class="sec" id="versions">Code <span id="ver-code">…</span> · UI <span id="ver-ui"></span></p></div><button class="btn" type="button" id="drawer-close">Close</button></div>
+  <section data-fold="context">
+    <h2 class="cap fold" role="button" tabindex="0" aria-expanded="true">Context</h2>
+    <div class="fold-body">
+      <span class="sec" id="ctx-detail">no data yet</span>
+    </div>
+  </section>
+  <section data-fold="commands">
+    <h2 class="cap fold" role="button" tabindex="0" aria-expanded="true">Commands</h2>
+    <div class="fold-body">
+      <div class="cmds">
+        <button class="btn cmd" type="button" data-cmd="clear" title="Wipe the history and start fresh">Clear</button>
+        <button class="btn cmd" type="button" data-cmd="compact" title="Fold older messages into a summary">Compact</button>
+        <button class="btn cmd" type="button" data-cmd="context" title="Show the context used">Context</button>
+      </div>
+      <div class="cmds">
+        <button class="btn cmd" type="button" id="diff-btn" title="Show what the last turn changed">Diff</button>
+        <button class="btn cmd" type="button" id="undo-btn" title="Revert just the last change (asks first)">Undo</button>
+      </div>
+      <button class="btn" type="button" id="load-ctx" disabled title="Fill the message with: load <workspace>/context.md">Load context</button>
+    </div>
+  </section>
+  <section data-fold="theme">
+    <h2 class="cap fold" role="button" tabindex="0" aria-expanded="true">Theme</h2>
+    <div class="fold-body">
+      <div class="cmds" role="group" aria-label="Theme">
+        <button class="btn" type="button" data-theme-set="auto" aria-pressed="false">Automatic</button>
+        <button class="btn" type="button" data-theme-set="light" aria-pressed="false">Light</button>
+        <button class="btn" type="button" data-theme-set="dark" aria-pressed="false">Dark</button>
+      </div>
+    </div>
+  </section>
+  <section data-fold="options">
+    <h2 class="cap fold" role="button" tabindex="0" aria-expanded="true">Options</h2>
+    <div class="fold-body">
+      <label class="opt"><input type="checkbox" id="clear-open"> New chat on open (off: continue the last chat)</label>
+      <label class="opt"><input type="checkbox" id="md-on"> Markdown</label>
+      <label class="opt"><input type="checkbox" id="hide-tools"> Hide tool calls</label>
+    </div>
+  </section>
+  <section data-fold="sessions">
+    <h2 class="cap fold" role="button" tabindex="0" aria-expanded="true">Recent sessions</h2>
+    <div class="fold-body"><div id="sessions"><span class="sec">…</span></div></div>
+  </section>
+  <section data-fold="token" data-folded-by-default>
+    <h2 class="cap fold" role="button" tabindex="0" aria-expanded="false">Access token</h2>
+    <div class="fold-body">
+      <div class="token-row">
+        <input type="text" id="token" class="secret" aria-label="Access token" placeholder="bearer token" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-lpignore="true" data-1p-ignore data-form-type="other">
+        <button class="btn" type="button" id="token-save">Save</button>
+      </div>
+    </div>
+  </section>
+</aside>
+<dialog id="view">
+  <div class="bar"><h3 class="grow" id="view-title">Session</h3><button class="btn primary" type="button" id="view-resume" hidden>Resume</button><button class="btn" type="button" id="view-close">Close</button></div>
+  <div class="msg md" id="view-body"></div>
+</dialog>
+<dialog id="approve">
+  <h3 id="ap-title">Approve?</h3>
+  <pre id="ap-body"></pre>
+  <div class="btns">
+    <button class="btn" type="button" data-a="n">Deny</button>
+    <button class="btn" type="button" data-a="s">Stop turn</button>
+    <button class="btn primary" type="button" data-a="y">Approve once</button>
+  </div>
+</dialog>
+<dialog id="confirm">
+  <h3 id="cf-title">Clear the history?</h3>
+  <p class="sec" id="cf-text">The conversation is wiped and the next message starts fresh.</p>
+  <pre id="cf-pre" hidden></pre>
+  <div class="btns two">
+    <button class="btn" type="button" id="cf-no">Cancel</button>
+    <button class="btn primary" type="button" id="cf-yes">Clear</button>
+  </div>
+</dialog>
+<script src="/app.js"></script>
+<script>
+if (matchMedia('(pointer:coarse)').matches && !matchMedia('(pointer:fine)').matches) $('text').placeholder = 'Message Aurora';   // Enter is a new line on a phone
+document.getElementById('ver-ui').textContent = window.AURORA_UI_VERSION + ' (Paper)';
+// Theme: Automatic follows the system (no data-theme), Light / Dark force it; remembered in the browser.
+function setTheme(t) {
+  if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; else { t = 'auto'; delete document.documentElement.dataset.theme; }
+  try { localStorage.setItem('aurora_web_theme', t); } catch (e) {}
+  document.querySelectorAll('[data-theme-set]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.themeSet === t)));
+}
+document.querySelectorAll('[data-theme-set]').forEach(b => b.onclick = () => setTheme(b.dataset.themeSet));
+setTheme((() => { try { return localStorage.getItem('aurora_web_theme') || 'auto'; } catch (e) { return 'auto'; } })());
+// The drawer: the scrim, the Close button and Esc fold it; the Menu button toggles it (app.js).
+$('scrim').onclick = $('drawer-close').onclick = () => sidebar(false);
+addEventListener('keydown', e => { if (e.key === 'Escape' && !document.querySelector('dialog[open]') && !document.body.classList.contains('sb-closed')) sidebar(false); });
+</script>
+</body>
+</html>

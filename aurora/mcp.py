@@ -564,8 +564,8 @@ class MCPManager:
                     f"skipped a mcp_servers entry missing name/command: {c!r}")
                 continue
             # config.yaml is machine-agnostic content shared across hosts with
-            # different home layouts (e.g. macOS ~/Desktop/GitTea/... vs Linux
-            # ~/repositories/...); Popen never does shell-style ~/$VAR
+            # different home layouts (e.g. macOS ~/Desktop/the dev repo/... vs Linux
+            # ~/projects/...); Popen never does shell-style ~/$VAR
             # expansion, so a literal path here only ever worked on the
             # machine it was written on. Expand both here so the same
             # command/args can use ~ or $HOME and travel between machines.

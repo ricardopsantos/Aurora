@@ -21,7 +21,7 @@ def _stringify(content) -> str:
 
 
 def _msg_tokens(m: dict) -> int:
-    n = tokens.estimate_tokens(_stringify(m.get("content")))
+    n = tokens.estimate_tokens(_stringify(m.get("content"))) + 1500 * len(m.get("images") or [])   # R381: flat guess per image
     for tc in (m.get("tool_calls") or []):
         fn = tc.get("function", {})
         n += tokens.estimate_tokens(str(fn.get("arguments", "")))

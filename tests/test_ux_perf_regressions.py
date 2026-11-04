@@ -52,6 +52,8 @@ def _health_with_props(tmp_path, monkeypatch, props):
             return props
     monkeypatch.setattr(httpx, "get", lambda *a, **k: _R())
     prov = e._provider_for(e.current)
+    monkeypatch.setattr(prov, "_client_for", lambda url: type(
+        "C", (), {"get": lambda self, *a, **k: _R()})())
     monkeypatch.setattr(prov, "pick_endpoint", lambda cache_ok=True: prov.base_url)
     return e._provider_health_uncached()
 
@@ -134,3 +136,72 @@ def test_one_status_scan_per_checkpoint(small_cap, monkeypatch):
     (root / "a.py").write_text("2")
     rewind.checkpoint("c1", cwd=str(root))
     assert "ls-files" not in seen and seen.count("status") == 1
+
+
+# ── R297: an unfinished streamed line is visible while it streams ──────────
+def _screen_text(t_):
+    return "\n".join("".join(f[1] for f in line) for line in t_._render_lines())
+
+
+def _streaming(t_):
+    import sys
+    real = sys.stdout
+    sys.stdout = tui._ChatWriter(t_)
+    return real
+
+
+def test_partial_line_is_visible_while_streaming():
+    import sys
+    t_ = _t()
+    real = _streaming(t_)
+    try:
+        t_.fe.begin_turn()
+        for w in "The cache is keyed per provider".split():
+            t_.fe.on_text(w + " ")
+        assert "The cache is keyed per provider" in _screen_text(t_)
+        t_.fe.on_text("and model.\nNext line")
+        text = _screen_text(t_)
+        # the completed line is shown ONCE (the tail was replaced, not kept)
+        assert text.count("The cache is keyed per provider") == 1
+        assert "Next line" in text
+        t_.fe.end_turn()
+        assert _screen_text(t_).count("Next line") == 1
+        assert t_._tail_entry is None
+    finally:
+        sys.stdout = real
+
+
+def test_tool_output_replaces_the_tail_in_order():
+    import sys
+    t_ = _t()
+    real = _streaming(t_)
+    try:
+        t_.fe.begin_turn()
+        t_.fe.on_text("Let me read the file.")
+        t_.fe.on_tool_start("read_file", {"path": "x"})
+        text = _screen_text(t_)
+        assert text.count("Let me read the file.") == 1
+        assert text.index("Let me read the file.") < text.index("read_file")
+    finally:
+        sys.stdout = real
+
+
+def test_tail_render_cache_matches_full_split_with_side_output():
+    import sys
+
+    from prompt_toolkit.formatted_text.utils import split_lines
+    t_ = _t()
+    real = _streaming(t_)
+    try:
+        t_.fe.begin_turn()
+        t_.fe.on_text("partial one")
+        t_.append_side("side answer\n")
+        t_.fe.on_text(" two")
+        t_.fe.on_text(" three\ndone\n")
+        got = [[(f[0], f[1]) for f in ln if f[1]] for ln in t_._render_lines()]
+        ref = [[(f[0], f[1]) for f in ln if f[1]]
+               for ln in split_lines(list(t_._fragments()))]
+        assert got == ref
+        assert _screen_text(t_).count("partial one two three") == 1
+    finally:
+        sys.stdout = real

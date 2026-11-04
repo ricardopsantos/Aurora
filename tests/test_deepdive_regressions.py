@@ -639,7 +639,7 @@ def test_web_fetch_end_to_end_is_fast_on_hostile_html(monkeypatch):
     ("http://192.168.1.1/", True),
     ("http://[::1]/", True),
     ("http://localhost:8080/", True),
-    ("https://example-host.tailnet-name.ts.net:9513/", True),
+    ("https://box.example.ts.net:9513/", True),
     ("http://printer.local/", True),
     ("file:///etc/passwd", True),
 ])
@@ -1119,7 +1119,7 @@ def test_model_health_ollama_unreachable(monkeypatch):
 def test_model_health_local_llamacpp_reachable_and_unreachable(monkeypatch):
     from aurora.providers import openai_compat as oc
     prov = oc.OpenAICompatProvider(
-        "local", {"base_url": "https://example-host.tailnet-name.ts.net:18182/v1"}, 300)
+        "local", {"base_url": "https://box.example.ts.net:18182/v1"}, 300)
     monkeypatch.setattr(prov, "_probe", lambda url: True)
     assert prov.model_health("local") == {"ok": True, "detail": ""}
     monkeypatch.setattr(prov, "_probe", lambda url: False)

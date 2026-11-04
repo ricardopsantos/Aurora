@@ -22,6 +22,7 @@ record can push a part somewhat past the cap before the NEXT record rolls
 to a new one."""
 
 import json
+import os
 import re
 import uuid
 from datetime import UTC, datetime
@@ -73,6 +74,31 @@ def _base_session_ids() -> list[str]:
     session as `<id>.jsonl`, not a second one)."""
     return [p.stem for p in sessions_dir().glob("*.jsonl")
             if not _ROTATED_RE.match(p.name)]
+
+
+def _session_mtimes() -> dict[str, float]:
+    """R395: {session id: freshest mtime across its parts} from ONE directory scan. Listing and
+    searching used to probe every session's parts one by one (`_parts_for` + stat, ~5 syscalls a
+    session) on every sidebar refresh; this is one `scandir` with the stat results it already has."""
+    out: dict[str, float] = {}
+    try:
+        it = os.scandir(sessions_dir())
+    except OSError:
+        return out
+    with it:
+        for e in it:
+            name = e.name
+            if not name.endswith(".jsonl"):
+                continue
+            m = _ROTATED_RE.match(name)
+            sid = m.group(1) if m else name[:-6]
+            try:
+                mt = e.stat().st_mtime
+            except OSError:
+                continue
+            if mt > out.get(sid, -1.0):
+                out[sid] = mt
+    return out
 
 
 def _latest_mtime(session_id: str) -> float:
@@ -198,22 +224,48 @@ class Session:
 
 
 def latest_session_id() -> str | None:
-    ids = _base_session_ids()
-    return max(ids, key=_latest_mtime) if ids else None
+    mts = _session_mtimes()
+    return max(mts, key=mts.get) if mts else None
+
+
+_PROMPTS: dict[str, tuple[float, int]] = {}
+_FIRST: dict[str, tuple[float, str]] = {}            # R392 (P4): first real prompt per session, keyed by mtime
+_SEARCH: dict[tuple[str, float, str], tuple] = {}     # R392 (P5): (sid, mtime, needle) -> hit or ()
+_SEARCH_MAX = 20000
+SEARCH_SCAN_BYTES = 4_000_000   # R416 (P-D): newest bytes of one session a search reads; older text of a huge log is skipped
+
+
+def count_prompts(session_id: str) -> int:
+    """R385: how many messages the user sent in a session (the bootstrap turn is not one).
+    Cached by the session's freshest mtime, so a sidebar refresh re-reads only logs that changed."""
+    mt = _latest_mtime(session_id)
+    hit = _PROMPTS.get(session_id)
+    if hit and hit[0] == mt:
+        return hit[1]
+    n = sum(1 for r in Session(session_id).iter_records(events={"user"}) if not r.get("bootstrap"))
+    _PROMPTS[session_id] = (mt, n)
+    return n
 
 
 def list_sessions(limit: int = 20) -> list[tuple[str, str, str]]:
     """(id, mtime-iso, first-user-message) newest first."""
     out = []
-    ids = sorted(_base_session_ids(), key=_latest_mtime, reverse=True)[:limit]
+    mts = _session_mtimes()
+    ids = sorted(mts, key=mts.get, reverse=True)[:limit]
     for sid in ids:
-        first = ""
-        # skip the bootstrap boilerplate turn — preview the real first task
-        for r in Session(sid).iter_records(events={"user"}):
-            if not r.get("bootstrap"):
-                first = (r.get("text", "") or "")[:60]
-                break
-        mtime = datetime.fromtimestamp(_latest_mtime(sid)).strftime("%Y-%m-%d %H:%M")
+        mt = mts[sid]
+        hit = _FIRST.get(sid)
+        if hit and hit[0] == mt:
+            first = hit[1]
+        else:
+            first = ""
+            # skip the bootstrap boilerplate turn — preview the real first task
+            for r in Session(sid).iter_records(events={"user"}):
+                if not r.get("bootstrap"):
+                    first = (r.get("text", "") or "")[:60]
+                    break
+            _FIRST[sid] = (mt, first)
+        mtime = datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M")
         out.append((sid, mtime, first))
     return out
 
@@ -259,8 +311,8 @@ def last_latency_by_model(session_scan_limit: int = 20) -> dict[str, float]:
     means the newest session to have used a model wins outright — an older
     session is never allowed to overwrite a fresher reading."""
     out: dict[str, float] = {}
-    ids = sorted(_base_session_ids(), key=_latest_mtime, reverse=True)
-    ids = ids[:session_scan_limit]
+    mts = _session_mtimes()
+    ids = sorted(mts, key=mts.get, reverse=True)[:session_scan_limit]
     for sid in ids:
         session_latest: dict[str, float] = {}
         for r in Session(sid).iter_records(events={"assistant"}):
@@ -289,43 +341,67 @@ def usage_all_sessions() -> dict[str, dict]:
     return total
 
 
-def search_sessions(query: str, limit: int = 20) -> list[tuple[str, str, str, str]]:
+def search_sessions(query: str, limit: int = 20, counts: bool = False) -> list[tuple]:
     """(session_id, mtime-iso, event, snippet) across every SESSION on this
     machine, newest session first (R161) — one entry per session id, not
-    per rotated part file (walks every part for the id via `_parts_for`, in
-    order, but still stops at the first hit). Plain case-insensitive
-    substring match over each record's `text`/`output` field — the same
-    unbounded-log-friendly streaming `list_sessions`/`usage_all_sessions`
-    already use, no index to build or keep in sync. `snippet` is the match
-    trimmed to ~120 chars around the hit so a hit inside a large tool output
-    doesn't dump the whole thing."""
+    per rotated part file. Plain case-insensitive substring match over each
+    record's `text`/`output` field. `snippet` is the first match found
+    trimmed to ~120 chars around the hit. R416: at most SEARCH_SCAN_BYTES of
+    each session are read, newest part first. R418 (I1): `counts=True` adds
+    (hits, capped): the records that matched, and whether the cap cut the scan."""
     needle = query.lower()
-    out: list[tuple[str, str, str, str]] = []
-    ids = sorted(_base_session_ids(), key=_latest_mtime, reverse=True)
+    plain = needle.isascii() and not any(c in needle for c in '\\"') and needle.isprintable()
+    out: list[tuple] = []
+    mts = _session_mtimes()
+    ids = sorted(mts, key=mts.get, reverse=True)
     for sid in ids:
         if len(out) >= limit:
             break
-        mtime = datetime.fromtimestamp(_latest_mtime(sid)).strftime("%Y-%m-%d %H:%M")
-        found = False
-        for p in _parts_for(sid):
-            if found:
-                break
-            with open(p, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    try:
-                        r = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    field = r.get("text") if "text" in r else r.get("output")
-                    if not isinstance(field, str) or needle not in field.lower():
-                        continue
+        mt = mts[sid]
+        mtime = datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M")
+        key = (sid, mt, needle)
+        hit = _SEARCH.get(key)
+        if hit is None:
+            if len(_SEARCH) > _SEARCH_MAX:     # R416 (P3): drop the oldest half, not the whole cache
+                for k in list(_SEARCH)[:len(_SEARCH) // 2]:
+                    del _SEARCH[k]
+            hit = _SEARCH[key] = _scan(sid, needle, plain)
+        if hit:
+            out.append((sid, mtime) + (hit if counts else hit[:2]))
+    return out
+
+
+def _scan(sid: str, needle: str, plain: bool) -> tuple:
+    """(event, snippet, hits, capped) of one session, or () when nothing matches."""
+    first, hits, capped = None, 0, False
+    budget = SEARCH_SCAN_BYTES
+    for p in reversed(_parts_for(sid)):   # newest part first, so the byte cap keeps the recent text
+        if budget <= 0:
+            capped = True
+            break
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                budget -= len(line)
+                if budget < 0:
+                    capped = True
+                    break
+                if plain and needle not in line.lower():   # cheap test before parsing the record
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if r.get("event") == "thinking":   # R421: never shown in the chat, so a hit there finds nothing visible
+                    continue
+                field = r.get("text") if "text" in r else r.get("output")
+                if not isinstance(field, str) or needle not in field.lower():
+                    continue
+                hits += 1
+                if first is None:
                     idx = field.lower().index(needle)
                     start = max(0, idx - 40)
-                    snippet = field[start:start + 120].replace("\n", " ").strip()
-                    out.append((sid, mtime, r.get("event", "?"), snippet))
-                    found = True
-                    break   # one hit per session is enough for a search list
-    return out
+                    first = (r.get("event", "?"), field[start:start + 120].replace("\n", " ").strip())
+    return (first + (hits, capped)) if first else ()
 
 
 def resolve_session_id(prefix: str) -> str:
@@ -352,6 +428,24 @@ def resolve_session_id(prefix: str) -> str:
         + ", ".join(matches))
 
 
+def format_tool_call(name: str, args) -> str:
+    """One tool call as copyable text: a shell command is shown as the
+    command itself, any other tool as its JSON arguments. `args` may be the
+    parsed dict or the raw JSON string a provider sent."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args or "{}")
+        except ValueError:
+            return f"→ {name}\n```\n{args}\n```"
+    if isinstance(args, dict) and isinstance(args.get("command"), str):
+        body = args["command"]
+    elif args:
+        body = json.dumps(args, ensure_ascii=False, indent=2)
+    else:
+        return f"→ {name}"
+    return f"→ {name}\n```\n{body}\n```"
+
+
 def export_markdown(session_id: str) -> str:
     s = Session(session_id)
     lines = [f"# Aurora session {session_id}\n"]
@@ -362,5 +456,11 @@ def export_markdown(session_id: str) -> str:
         elif ev == "assistant":
             lines.append(f"## Assistant ({r.get('model', '?')})\n\n{r.get('text', '')}\n")
         elif ev == "tool":
-            lines.append(f"> tool: `{r.get('name')}` → {str(r.get('output', ''))[:200]}\n")
+            out = str(r.get("output", ""))
+            # the log keeps the first 4000 chars (R133b); `chars` is the real size
+            lost = int(r.get("chars") or len(out)) - len(out)
+            if lost > 0:
+                out += f"\n[… {lost} more chars not stored in the session log]"
+            call = format_tool_call(r.get("name"), r.get("args"))
+            lines.append(f"{call}\n\n```\n{out}\n```\n")
     return "\n".join(lines)

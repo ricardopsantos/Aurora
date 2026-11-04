@@ -262,7 +262,7 @@ def test_write_text_preserving_leaves_the_original_on_crash(tmp_path, monkeypatc
     def boom(*a, **k):
         raise OSError("crash mid-write")
 
-    monkeypatch.setattr(paths.os, "replace", boom)
+    monkeypatch.setattr(paths.os, "fsync", boom)     # R322: in-place rewrite
     with pytest.raises(OSError):
         paths.write_text_preserving(target, "half")
     assert target.read_text() == "original"
@@ -275,3 +275,13 @@ def test_write_text_preserving_new_file_is_not_locked_to_0600(tmp_path):
     target = tmp_path / "new.txt"
     paths.write_text_preserving(target, "x")
     assert target.stat().st_mode & 0o044      # group/other readable
+
+
+def test_rewrite_in_place_works_without_posix_fallocate(tmp_path, monkeypatch):
+    import os
+    from aurora import paths
+    f = tmp_path / "a.txt"
+    f.write_text("old")
+    monkeypatch.delattr(os, "posix_fallocate", raising=False)
+    paths._rewrite_in_place(f, "new")
+    assert f.read_text() == "new"

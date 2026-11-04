@@ -11,6 +11,7 @@ Improve the engine → keep these method signatures, the UI is untouched.
 """
 
 import os
+from threading import Lock as _Lock
 import platform
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +28,9 @@ from . import (
 )
 from . import secrets as secretscan
 from .config import load_config, persist_runtime_value
+from . import diagnose
 from .frontend import Frontend
+from .paths import aurora_home, write_text_atomic
 from .providers import make_provider
 from .providers.base import ProviderError, side_completion
 from .session import Session
@@ -69,6 +72,23 @@ def _base_system() -> str:
         "file paths — they often contain spaces or parentheses.")
 
 
+def _unreachable(err: Exception, url: str = "") -> str:
+    """R344: a connection failure as a sentence a person can act on, not
+    `unreachable: [Errno 111] Connection refused`."""
+    why = {
+        "refused": "connection refused — is the server running?",
+        "timeout": "no answer in time (server down?)",
+        "dns": "host name does not resolve",
+    }.get(diagnose.classify(err)) or str(err).strip() or err.__class__.__name__
+    return f"unreachable: {why}"
+
+
+def _health_fail(err: Exception, url: str = "") -> dict:
+    """R345: a failed health result that also carries WHY, for the panel."""
+    return {"ok": False, "detail": _unreachable(err, url),
+            "kind": diagnose.classify(err), "url": url}
+
+
 @dataclass
 class ContextStats:
     model: str
@@ -83,6 +103,8 @@ class ContextStats:
     # remote_context_limits.json) always has cost_usd == 0.0, which is
     # indistinguishable from "genuinely priced, $0 spent so far" without
     # this flag
+    tok_per_s: float | None = None   # R352: session-average generation speed
+    # (output tokens / seconds from first streamed token); None until measured
     local_model: str | None = None   # what the "local" sentinel is actually
     # serving right now (live `/props` name, cached) — the status bar renders
     # `local: <name>`, since "local" alone doesn't say which model is loaded.
@@ -168,6 +190,8 @@ class Engine:
         # R58: hashes of confirmed false positives (secrets.hash_value) —
         # never the raw values, so config.yaml stays safe to commit/share
         self.secret_allowlist: set[str] = set(self.runtime.get("secret_allowlist", []))
+        self.secret_session_keep: set[str] = set()      # R329
+        self.last_health: dict | None = None            # R330
         self.multiline = bool(self.runtime.get("multiline", False))
         # R162: on a hard provider failure, retry the SAME turn against the
         # next configured model with a usable key before giving up — off by
@@ -181,6 +205,19 @@ class Engine:
         # run — the whole point is "stop nagging me right now", not "never
         # ask again on this machine".
         self.auto_approve = False
+        self.plan_mode = False      # R339: session-only, like auto_approve
+        # R348: lines typed while a turn runs, waiting to be read by the model
+        # at the next tool-result boundary (the TUI's UI thread puts, the
+        # worker thread drains).
+        self._steer_notes: list[str] = []
+        self._steer_lock = _Lock()
+        # R340: spend caps in USD (0 = off). The per-session cap is session-only;
+        # the daily cap is persisted in runtime.yaml. `_warned` keeps each 80%
+        # warning to once.
+        self.session_budget = 0.0
+        self.daily_budget = float(self.runtime.get("daily_budget_usd", 0) or 0)
+        self._budget_warned: set[str] = set()
+        self.headless = False   # R314: set by headless.run — keeps --max-steps binding
         self.system = _base_system()
         self.messages: list[dict] = []
         self._used = 0
@@ -191,6 +228,8 @@ class Engine:
         # mutations changed, not the whole project's checkpoint history.
         self.last_turn_diff_base: str | None = None
         self._cost = 0.0
+        self._gen_tokens = 0     # R352: session totals behind the t/s readout
+        self._gen_secs = 0.0
         # R171/I8: whether ANY of the accrued `_cost` came from a round with
         # real pricing — `context_stats`'s `cost_known` used to ask only
         # whether the CURRENT model is priced, so a real accrued $ figure
@@ -202,6 +241,7 @@ class Engine:
         self._key_ok: dict[str, bool] = {}  # provider → key available (/model picker)
         self._provider = None
         self._provider_key = None
+        self._probe_providers: dict = {}   # R308: /model picker probes only
         # R254f: the side channel's own provider (see `_side_provider`),
         # cached on the same terms as the one above and never shared with it
         self._side_provider_obj = None
@@ -289,12 +329,62 @@ class Engine:
             self._provider_key = pkey
         return self._provider
 
+    def probe_provider_for(self, model_entry: dict):
+        """R308: a provider for READ-ONLY probes of any model entry (the
+        `/model` picker's health/latency checks), that never replaces the
+        turn's provider. `_provider_for` rebuilds `self._provider` whenever
+        the entry's provider differs and closes the old one's pools — so a
+        picker walking every model, opened mid-turn, closed the pool the
+        running turn was streaming on (ReadError, then "client has been
+        closed" on the retry). Same provider as the turn: reuse it (no new
+        handshake). Any other: a separate, cached, keyless-if-need-be
+        instance that nothing else holds."""
+        pkey = model_entry.get("provider")
+        if pkey is None:
+            return None
+        if pkey == self._provider_key and self._provider is not None:
+            return self._provider
+        cached = self._probe_providers.get(pkey)
+        if cached is None:
+            pcfg = dict(self.cfg["providers"].get(pkey, {}))
+            env = pcfg.get("api_key_env")
+            if env and not pcfg.get("api_key"):
+                pcfg["api_key"] = keystore.get_key(env, interactive=False) or ""
+            cached = self._probe_providers.setdefault(
+                pkey, make_provider(pkey, pcfg, self.timeout))
+        return cached
+
     def provider_kind(self, model_entry: dict | None = None) -> str:
         e = model_entry or self.current
         return self.cfg["providers"].get(e.get("provider"), {}).get("type", "openai")
 
     def list_models(self) -> list[dict]:
         return self.models
+
+    THINK_LOG_MAX = 20_000   # R421: characters of thinking kept per record (one record per model round)
+
+    def _thinker(self, fe):
+        """R421: the provider's thinking stream, passed on to the front end and kept (capped) for the session log."""
+        live = getattr(fe, "on_think", None)
+        if not hasattr(self, "_thinking"):
+            self._thinking, self._think_len = [], 0
+
+        def on_think(chunk):
+            room = self.THINK_LOG_MAX - self._think_len
+            if room > 0 and chunk:
+                self._thinking.append(chunk[:room])
+            self._think_len += len(chunk or "")
+            if live:
+                live(chunk)
+        return on_think
+
+    def _flush_thinking(self) -> None:
+        """R421: write the thinking streamed since the last flush as one `thinking` record (chars = its real size)."""
+        if not getattr(self, "_thinking", None):
+            return
+        text = "".join(self._thinking)
+        self.session.log("thinking", text=text, chars=self._think_len)
+        self._thinking, self._think_len = [], 0
 
     def switch_model(self, model_entry: dict) -> None:
         """Switch model."""
@@ -511,7 +601,7 @@ class Engine:
                 self.switch_model(entry)
                 provider = self._provider_for(self.current, interactive=True)
                 provider.extra_body = self.current.get("extra_body") or {}
-                provider.on_think = getattr(fe, "on_think", None)
+                provider.on_think = self._thinker(fe)   # R421: also kept for the session log
                 provider.notify = fe.notify
                 provider.cache_prompt = self.cache_enabled()
                 model = self.current.get("model", "")
@@ -545,19 +635,26 @@ class Engine:
                 or "no reply")
         return turn
 
-    def send(self, user_text: str, fe: Frontend, *, bootstrap: bool = False) -> None:
+    def send(self, user_text: str, fe: Frontend, *, bootstrap: bool = False, images: list | None = None) -> None:
         """Run one user turn against the current model, streaming/prompting
         through the front end. Mutates conversation state; logs everything.
         bootstrap=True tags the logged user event so session listings can
         skip the boilerplate prompt when picking a preview line."""
+        state, msg = self.budget_check()          # R340: refuse once over a cap
+        if state != "ok":
+            fe.notify(msg)
+            if state == "stop":
+                return
         if not self.current.get("model"):
             # possible since /model remove (R81) can empty the config
             fe.notify("no model selected — /model to pick one, or "
                       "/model add <url> to add one")
             return
+        self._warn_if_asleep(fe)                  # R343
         provider = self._provider_for(self.current, interactive=True)
-        provider.extra_body = self.current.get("extra_body") or {}
-        provider.on_think = getattr(fe, "on_think", None)
+        # R418 (F5): a front end's one-turn overrides (the web page's temperature) go on top of the model entry's
+        provider.extra_body = {**(self.current.get("extra_body") or {}), **(getattr(self, "turn_overrides", None) or {})}
+        provider.on_think = self._thinker(fe)   # R421: also kept for the session log
         provider.notify = fe.notify
         provider.cache_prompt = self.cache_enabled()
         model = self.current.get("model", "")
@@ -584,9 +681,13 @@ class Engine:
         # Here history still ends on an assistant message: a valid fold point.
         self._maybe_auto_compact(fe)
         user_msg = {"role": "user", "content": user_text}
+        if images:
+            user_msg["images"] = list(images)     # R381: sent to the model as image parts, never written to the log
         self.messages.append(user_msg)
+        self._thinking, self._think_len = [], 0     # R421
         self.session.log("user", text=user_text, model=model,
-                         **({"bootstrap": True} if bootstrap else {}))
+                         **({"bootstrap": True} if bootstrap else {}),
+                         **({"images": len(images)} if images else {}))
         # /diff: capture the checkpoint HEAD as it stood BEFORE this turn's
         # first mutation — must happen here, before run_turn, not after
         self.last_turn_diff_base = rewind.head(".")
@@ -599,13 +700,20 @@ class Engine:
             # capped result and a 4000-char one are indistinguishable on disk.
             on_tool_result=lambda n, o: (
                 fe.on_tool_result(n, o),
+                self._flush_thinking(),               # R421: this round's thinking goes before its tool result
                 self.session.log("tool", name=n, output=o[:4000],
+                                 args=_clip_args(cb.call_args),
                                  chars=len(o),
                                  status=tools.result_status(o)),
                 # R154: the result is in history now — count it now too
                 self._count_tool_output(fe, len(o))),
             approve=fe.approve,
             auto_approve=lambda: self.auto_approve,   # R262
+            plan_mode=lambda: self.plan_mode,         # R339
+            steer=None if self.headless else self.take_steer,           # R348
+            set_auto_approve=lambda on: setattr(self, "auto_approve", on),   # R348
+            budget=self.budget_check,                 # R340
+            auto_continue=lambda: self.auto_approve and not self.headless,   # R314
             ask_continue=fe.ask_continue,
             notify=fe.notify,
             cancelled=fe.cancelled,
@@ -641,6 +749,7 @@ class Engine:
                               self._secret_challenge(fe, ctx, m, source_text=source_text))
                               if self.redact_secrets else None,
             secret_allowlist=self.secret_allowlist,
+            secret_session_keep=self.secret_session_keep,
         )
         before = len(self.messages)
         try:
@@ -692,12 +801,15 @@ class Engine:
         # basis for COST below — that really is billed per round.
         if turn.input_tokens or turn.output_tokens:
             self._used = turn.input_tokens + turn.last_output_tokens
+        self._gen_tokens += turn.gen_tokens
+        self._gen_secs += turn.gen_secs
         # R163: cost is now accrued LIVE, per round, inside `_live_usage` —
         # no end-of-turn addition here (it would double-count what streaming
         # already added; see `_live_usage`'s docstring for why the two are
         # mathematically the same total, not just close).
         # capture the final assistant text for /copy + session log
         if not produced:
+            self._flush_thinking()   # R421: a cancelled turn's thinking is still what the model thought
             return   # nothing to log — see R95e above
         # R143b: on every early-return path (`_flush()` then `return turn` —
         # iteration cap, "stop" at the approval gate, interrupt, secret-stop)
@@ -712,6 +824,7 @@ class Engine:
         last = next((m for m in reversed(self.messages)
                      if m.get("role") == "assistant"), {})
         text = _assistant_text(last)
+        self._flush_thinking()
         self.session.log("assistant", text=text, model=model,
                          input_tokens=turn.input_tokens,
                          output_tokens=turn.output_tokens,
@@ -743,6 +856,16 @@ class Engine:
                          if getattr(self._provider, "extra_body", None)
                          else [])
         self._maybe_auto_compact(fe)
+
+    def add_steer(self, text: str) -> None:
+        """R348: queue a line typed mid-turn for the running turn to read."""
+        with self._steer_lock:
+            self._steer_notes.append(text)
+
+    def take_steer(self) -> list[str]:
+        with self._steer_lock:
+            out, self._steer_notes = self._steer_notes, []
+        return out
 
     def quick_ask(self, user_text: str, on_text, cancel=None) -> str:
         """R253: answer a question against the CURRENT conversation without
@@ -926,14 +1049,123 @@ class Engine:
             self._used = input_tokens + output_tokens
             if hasattr(self._provider, "cost"):
                 model = self.current.get("model", "")
-                self._cost += self._provider.cost(
+                delta = self._provider.cost(
                     model, input_tokens, output_tokens, cached_tokens)
+                self._cost += delta
+                self._ledger_add(delta)           # R340
                 if (getattr(self._provider, "has_pricing", None)
                         and self._provider.has_pricing(model)):
                     self._cost_priced = True
         on_usage = getattr(fe, "on_usage", None)
         if on_usage is not None:
             on_usage(input_tokens, output_tokens)
+
+    _ASLEEP_RECHECK_S = 30.0
+
+    def wake_model(self) -> tuple[bool, str]:
+        """R426: load an idle-unloaded local model now instead of on the next message. An idle manager wakes
+        llama-server only on a completion request (not on /props or /v1/models), so this sends a one-token
+        completion, then reads the loaded model's name so the status shows it at once. A remote model has
+        nothing to wake. Returns (loaded, what to tell the user)."""
+        import time
+        from .providers.base import side_completion
+        if self.current.get("model") != "local":
+            return True, "a remote model needs no waking"
+        provider = self._provider_for(self.current, interactive=False)
+        prev = getattr(provider, "extra_body", None)
+        provider.extra_body = {**(self.current.get("extra_body") or {}), "max_tokens": 1}
+        try:
+            side_completion(provider, "local", "hi")
+        except Exception as e:
+            return False, f"the model did not wake: {e}"
+        finally:
+            provider.extra_body = prev
+        try:
+            name = provider.live_model_name()
+        except Exception:
+            name = None
+        self._live_name_cache[self._provider_key] = (name, time.time())
+        return bool(name), ("awake: " + str(name).split("/")[-1]) if name else "asked it to wake; not loaded yet"
+
+    def _warn_if_asleep(self, fe: Frontend) -> None:
+        """R343: an idle-unloaded local server (the model manager's idle manager answers
+        `/props` with `sleeping: true`) loads the model on the first request, so
+        the reply is slow with no explanation. Say so before sending. Probed with
+        a short deadline and at most once per `_ASLEEP_RECHECK_S` while healthy,
+        so an awake server costs nothing."""
+        import time
+        if self.current.get("model") != "local":
+            return
+        last = getattr(self, "_asleep_checked_at", 0.0)
+        lh = self.last_health or {}
+        if time.monotonic() - last < self._ASLEEP_RECHECK_S and not (
+                lh.get("model") == "local" and str(lh.get("detail", "")).startswith("asleep")):
+            return
+        self._asleep_checked_at = time.monotonic()
+        try:
+            h = self.provider_health(timeout=1.5)
+        except Exception:
+            return
+        if h.get("ok") and str(h.get("detail", "")).startswith("asleep"):
+            fe.notify("the local model is asleep (idle-unloaded) — waking it "
+                      "now; this first reply can take a minute")
+
+    # ── spend caps (R340) ───────────────────────────────────────────────
+    def _ledger_path(self):
+        return aurora_home() / "spend.json"
+
+    def _ledger(self) -> dict:
+        import json
+        try:
+            return json.loads(self._ledger_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def spent_today(self) -> float:
+        import datetime
+        return float(self._ledger().get(datetime.date.today().isoformat(), 0.0))
+
+    def _ledger_add(self, delta: float) -> None:
+        import datetime
+        import json
+        if delta <= 0:
+            return
+        led = self._ledger()
+        day = datetime.date.today().isoformat()
+        led = {k: v for k, v in led.items() if k >= (
+            datetime.date.today() - datetime.timedelta(days=60)).isoformat()}
+        led[day] = round(float(led.get(day, 0.0)) + delta, 6)
+        try:
+            write_text_atomic(self._ledger_path(), json.dumps(led))
+        except OSError:
+            pass
+
+    def set_daily_budget(self, usd: float) -> None:
+        self.daily_budget = max(0.0, usd)
+        self._budget_warned.discard("day")
+        persist_runtime_value(self.cfg, "daily_budget_usd", self.daily_budget)
+
+    def set_session_budget(self, usd: float) -> None:
+        self.session_budget = max(0.0, usd)
+        self._budget_warned.discard("session")
+
+    def budget_check(self) -> tuple[str, str]:
+        """R340: ("ok"|"warn"|"stop", message). Stop at 100% of either cap,
+        warn once per cap at 80%."""
+        worst = ("ok", "")
+        for key, label, spent, cap in (
+                ("session", "session", self._cost, self.session_budget),
+                ("day", "daily", self.spent_today(), self.daily_budget)):
+            if cap <= 0:
+                continue
+            if spent >= cap:
+                return ("stop", f"stopped: {label} spend limit ${cap:.2f} reached "
+                                f"(${spent:.2f} spent) — /budget to change it")
+            if spent >= 0.8 * cap and key not in self._budget_warned:
+                self._budget_warned.add(key)
+                worst = ("warn", f"⚠ {spent / cap * 100:.0f}% of the {label} "
+                                 f"spend limit (${spent:.2f} of ${cap:.2f})")
+        return worst
 
     def _count_tool_output(self, fe: Frontend, chars: int) -> None:
         """R154 (task 1, second half): a tool result enters history NOW but
@@ -1060,6 +1292,13 @@ class Engine:
         return seen[-n] if 0 < n <= len(seen) else ""
 
     # ── context management ──────────────────────────────────────────────
+    def tokens_per_second(self) -> float | None:
+        """R352: average generation speed this session, or None until at
+        least a second of streaming has been measured."""
+        if self._gen_secs < 1.0 or not self._gen_tokens:
+            return None
+        return self._gen_tokens / self._gen_secs
+
     def context_stats(self) -> ContextStats:
         model = self.current.get("model", "")
         if not model:
@@ -1078,7 +1317,8 @@ class Engine:
                 if model == "local" else None)
         return ContextStats(model, self._used, limit, self._cost,
                             self.session.id, compactions=self.compactions,
-                            cost_known=known, local_model=live)
+                            cost_known=known, local_model=live,
+                            tok_per_s=self.tokens_per_second())
 
     def _context_limit_nonblocking(self, provider, model: str) -> int:
         """The context limit for the gauge, WITHOUT ever blocking the caller
@@ -1133,6 +1373,28 @@ class Engine:
             return provider.static_context_limit(model)
         except Exception:
             return 128_000
+
+    def refresh_live_state(self) -> None:
+        """R384: re-read "what is loaded" now, blocking, and overwrite both caches.
+        A turn that just woke an idle-unloaded server leaves a cached "nothing loaded"
+        (up to 120s old) that the page then shows next to a finished reply. Called
+        off the render path, at turn end only, and only for the local model."""
+        import time as _time
+        if self.current.get("model") != "local":
+            return
+        provider = self._provider_for(self.current)
+        key = (self._provider_key, "local")
+        try:
+            name = provider.live_model_name() if hasattr(provider, "live_model_name") else None
+        except Exception:
+            name = None
+        self._live_name_cache[self._provider_key] = (name, _time.time())
+        try:
+            live = provider.context_limit("local")
+        except Exception:
+            live = 0
+        if live:
+            self._limit_cache[key] = (live, _time.time())
 
     def _live_model_name_nonblocking(self, provider) -> str | None:
         """R170j: same nonblocking-cache shape as `_context_limit_nonblocking`
@@ -1354,10 +1616,14 @@ class Engine:
         th.start()
         th.join(timeout)
         if "h" in result:
-            return result["h"]
-        return {"ok": False,
-                "detail": f"health check timed out after {timeout:.0f}s "
-                          "(startup not blocked)"}
+            h = result["h"]
+        else:
+            h = {"ok": False,
+                 "detail": f"health check timed out after {timeout:.0f}s "
+                           "(startup not blocked)"}
+        # R330: remember the last probe so the status bar can flag a dead model
+        self.last_health = {**h, "model": self.current.get("model")}
+        return h
 
     def _provider_health_uncached(self) -> dict:
         provider = self._provider_for(self.current)
@@ -1398,14 +1664,15 @@ class Engine:
         if is_ollama:
             try:
                 if not provider._probe(provider.base_url):
-                    return {"ok": False, "detail": "unreachable"}
+                    return {"ok": False, "detail": "unreachable", "kind": "refused",
+                            "url": provider.base_url}
                 model = self.current.get("model", "?")
                 n_ctx = provider.live_context_limit(model)
                 detail = f"{model} ready, ctx {n_ctx}" if n_ctx \
                     else f"{model} ready, ctx unknown"
                 return {"ok": True, "detail": detail}
             except Exception as e:
-                return {"ok": False, "detail": f"unreachable: {e}"}
+                return _health_fail(e, provider.base_url)
         # /props is llama.cpp-only and reports whatever's actually loaded on
         # the LOCAL backend — meaningless for a real remote model. A gateway
         # that unifies local + remote behind one LAN base_url (aurora-
@@ -1414,8 +1681,9 @@ class Engine:
         # any other selected model must skip the /props probe entirely
         # instead of silently reporting the wrong (locally-loaded) model.
         if self.current.get("model") != "local":
-            return {"ok": bool(provider.api_key),
-                    "detail": "remote API"}
+            if provider.api_key:
+                return {"ok": True, "detail": "remote API"}
+            return {"ok": False, "detail": "no API key set", "kind": "nokey"}
         try:
             import httpx
 
@@ -1429,11 +1697,17 @@ class Engine:
                 if callable(getattr(provider, "_auth_headers", None)) \
                 else ({"Authorization": f"Bearer {provider.api_key}"}
                       if provider.api_key else {})
-            r = httpx.get(f"{base}/props", headers=headers, timeout=5,
-                         verify=not _is_bare_ip(provider.base_url))
+            # R326: the provider's pooled client (keep-alive + the IPv4/IPv6
+            # race), not a bare httpx.get with a fresh TLS handshake per probe
+            if callable(getattr(provider, "_client_for", None)):
+                r = provider._client_for(provider.base_url).get(
+                    f"{base}/props", headers=headers, timeout=5)
+            else:
+                r = httpx.get(f"{base}/props", headers=headers, timeout=5,
+                              verify=not _is_bare_ip(provider.base_url))
             r.raise_for_status()
             props = r.json()
-            # R295: an idle-unloaded server (m7's idle manager, a gateway)
+            # R295: an idle-unloaded server (an idle manager or gateway)
             # answers `{"sleeping": true, "model_path": null}`. That is a
             # healthy backend that loads on the first request — it used to
             # render as "? ready, ctx unknown — /props schema changed?
@@ -1453,7 +1727,26 @@ class Engine:
                                    "schema changed? (llama.cpp upgrade)")}
             return {"ok": True, "detail": f"{model} ready, ctx {n_ctx}"}
         except Exception as e:
-            return {"ok": False, "detail": f"unreachable: {e}"}
+            return _health_fail(e, provider.base_url)
+
+    def diagnosis_for(self, health: dict) -> "diagnose.Diagnosis | None":
+        """R345: cause + fixes for a failed health result of the CURRENT model."""
+        if health.get("ok"):
+            return None
+        cur = self.current
+        pname = cur.get("provider") or ""
+        pcfg = (self.cfg.get("providers") or {}).get(pname, {}) or {}
+        url = health.get("url") or ""
+        bases = pcfg.get("base_url")
+        if not url and bases:
+            url = bases[0] if isinstance(bases, list) else bases
+        return diagnose.diagnose(
+            health.get("kind") or diagnose.classify(health.get("detail", "")),
+            provider=pname, url=url, model=cur.get("model", ""),
+            key_env=pcfg.get("api_key_env", "") or "",
+            detail=health.get("detail", ""),
+            is_ollama=pcfg.get("type") == "ollama",
+            local=cur.get("model") == "local" or pcfg.get("type") == "ollama")
 
     def set_redact_secrets(self, on: bool) -> None:
         self.redact_secrets = on
@@ -1470,6 +1763,12 @@ class Engine:
             fe.notify(f"allowlisted {len(matches)} value(s) — "
                      f"won't be flagged again")
             return "keep"
+        if decision == "keep" and context.startswith("tool:"):
+            # R329: "keep" on a tool's output is remembered for the session,
+            # so reading the same file again does not re-ask. Never persisted,
+            # and not applied to prompts/replies/writes.
+            hashes = {secretscan.hash_value(m.text) for m in matches}
+            self.secret_session_keep |= hashes
         return decision
 
     def add_secret_allowlist_entries(self, values) -> None:
@@ -1584,6 +1883,12 @@ def _close_provider(provider) -> None:
             client.close()
         except Exception:
             pass
+
+
+def _clip_args(args: dict) -> dict:
+    """Tool arguments for the session log: string values capped at 4000
+    chars, like the output beside them (a write_file body is already on disk)."""
+    return {k: (v[:4000] if isinstance(v, str) else v) for k, v in (args or {}).items()}
 
 
 def _assistant_text(msg: dict) -> str:

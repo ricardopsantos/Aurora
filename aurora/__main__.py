@@ -4,6 +4,10 @@
   aurora --continue          resume the most recent session
   aurora --resume ID         resume a specific session
   aurora --classic           inline REPL instead of the full-screen TUI
+  aurora -t "task"           one-shot, non-interactive (-t - reads stdin);
+                             [--yes] [--json] [--max-steps N]; exit 0 ok / 1 incomplete / 2 usage
+  aurora --web               Aurora Lite: a small web chat (R353); [--bind ADDR] [--port N]
+                             [--workspace DIR]; needs AURORA_WEB_TOKEN
   aurora --debug             tint TUI areas red so their bounds are visible
   aurora <config.yaml>       alternate config
   aurora key set [ENV_VAR]   store an API key (keyring / encrypted file)
@@ -15,8 +19,10 @@
                              provider and resets sessions/allowlist/state
 """
 
+import os
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 import yaml
 
@@ -24,7 +30,12 @@ from . import session as sessions
 
 
 def _default_config() -> str:
-    """config.yaml next to the package (repo checkout), else AURORA_HOME."""
+    """AURORA_CONFIG when set (R315), else config.yaml next to the package (repo checkout), else AURORA_HOME."""
+    env = os.environ.get("AURORA_CONFIG")
+    if env:
+        if not Path(env).is_file():
+            sys.exit(f"AURORA_CONFIG is not a file: {env}")
+        return env
     repo = Path(__file__).resolve().parent.parent / "config.yaml"
     if repo.is_file():
         return str(repo)
@@ -32,13 +43,15 @@ def _default_config() -> str:
     home_cfg = aurora_home() / "config.yaml"
     if home_cfg.is_file():
         return str(home_cfg)
-    sys.exit("no config.yaml found (repo root or AURORA_HOME)")
+    sys.exit("no config.yaml found (repo root or AURORA_HOME) — create it with "
+             f"`cp {repo.with_name('config.yaml.example')} {repo}` (or run ./install.sh), "
+             "then adjust providers and models")
 
 
 def _load_raw_config() -> dict:
     try:
-        import yaml
-        return yaml.safe_load(open(_default_config())) or {}
+        from .config import read_raw_config
+        return read_raw_config(_default_config())
     except Exception:
         return {}
 
@@ -158,6 +171,10 @@ def _wipe() -> None:
 
 def main() -> None:
     argv = sys.argv[1:]
+    if argv in (["--version"], ["-V"]):        # R393: what a bug report or SECURITY.md asks for
+        from . import __version__
+        print(f"aurora {__version__}")
+        return
     if argv[:2] == ["key", "set"] or argv[:1] == ["set"]:  # `set` = common typo
         _key_set(argv[2:] if argv[0] == "key" else argv[1:])
         return
@@ -180,6 +197,20 @@ def main() -> None:
         print(text)
         return
 
+    # R311: scripts read a headless run's exit code and stdout, so a usage or
+    # config error exits 2 (1 means "task incomplete") and the `·` status
+    # lines go to stderr, leaving stdout to the answer alone.
+    headless_run = "-t" in argv or "--task" in argv
+
+    def die(msg: str) -> NoReturn:
+        if headless_run:
+            print(msg, file=sys.stderr)
+            sys.exit(2)
+        sys.exit(msg)
+
+    def info(msg: str) -> None:
+        print(msg, file=sys.stderr if headless_run else sys.stdout)
+
     resume = "--continue" in argv
     resume_id = None
     if "--resume" in argv:
@@ -187,15 +218,56 @@ def main() -> None:
         try:
             resume_id = argv[i + 1]
         except IndexError:
-            sys.exit("usage: aurora --resume <session_id>")
+            die("usage: aurora --resume <session_id>")
         argv = argv[:i] + argv[i + 2:]
         resume = False
+    task = None
+    for flag in ("-t", "--task"):
+        if flag in argv:
+            i = argv.index(flag)
+            try:
+                task = argv[i + 1]
+            except IndexError:
+                die("usage: aurora -t <task|-> [--yes] [--max-steps N]")
+            argv = argv[:i] + argv[i + 2:]
+            break
+    max_steps = None
+    if "--max-steps" in argv:
+        i = argv.index("--max-steps")
+        try:
+            max_steps = int(argv[i + 1])
+            if max_steps < 1:
+                raise ValueError
+        except (IndexError, ValueError):
+            die("usage: --max-steps needs a positive integer")
+        argv = argv[:i] + argv[i + 2:]
+    yes = "--yes" in argv
+    as_json = "--json" in argv
+    if task == "-":
+        task = sys.stdin.read()
+    if task is not None and not task.strip():
+        die("aurora -t: empty task")
+    if task is None and (yes or as_json or max_steps is not None):
+        die("--yes, --json and --max-steps only apply with -t/--task")
+    web = "--web" in argv
+    web_opts = {"--bind": "127.0.0.1", "--port": "9592", "--workspace": "."}   # R393: the current directory, no host-specific default
+    for flag in web_opts:
+        if flag in argv:
+            i = argv.index(flag)
+            try:
+                web_opts[flag] = argv[i + 1]
+            except IndexError:
+                die(f"usage: {flag} needs a value")
+            argv = argv[:i] + argv[i + 2:]
+    if not web and any(f in sys.argv for f in web_opts):
+        die("--bind, --port and --workspace only apply with --web")
     classic = "--classic" in argv
     debug = "--debug" in argv
-    argv = [a for a in argv if a not in ("--continue", "--classic", "--debug")]
+    argv = [a for a in argv if a not in ("--continue", "--classic", "--debug",
+                                         "--yes", "--json", "--web")]
     config = argv[0] if argv else _default_config()
     if not Path(config).is_file():
-        sys.exit(f"not a config file: {config}\n"
+        die(f"not a config file: {config}\n"
                  "usage: aurora [--continue] [--resume ID] [--classic] [--debug] [--man] [config.yaml]\n"
                  "       aurora key set [ENV_VAR]")
 
@@ -212,11 +284,11 @@ def main() -> None:
     try:
         engine = Engine(config)
     except yaml.YAMLError as e:
-        sys.exit(f"{config}: not valid YAML\n{e}")
+        die(f"{config}: not valid YAML\n{e}")
     except AuroraHomeError as e:      # R217: an environment mistake, not a bug
-        sys.exit(str(e))
+        die(str(e))
     for warning in engine.extension_warnings:
-        print(f"· {warning}")
+        info(f"· {warning}")
     if resume_id:
         # R248: a typo'd id used to print "resuming session <id> (0 turns)"
         # and then run in a BRAND-NEW session — `resume_from` only adopts the
@@ -225,17 +297,31 @@ def main() -> None:
         # land somewhere else. `/context` has refused an unknown id since
         # R134; the CLI flag that does the same lookup never did.
         if not sessions.Session(resume_id).log_path.exists():
-            sys.exit(f"no session {resume_id} on this machine "
+            die(f"no session {resume_id} on this machine "
                      "(run aurora and use /resume to list them)")
         n = engine.resume_from(resume_id)
-        print(f"· resuming session {resume_id} ({n} turns)")
+        info(f"· resuming session {resume_id} ({n} turns)")
     elif resume:
         last = sessions.latest_session_id()
         if last:
             n = engine.resume_from(last)
-            print(f"· continuing session {last} ({n} turns)")
+            info(f"· continuing session {last} ({n} turns)")
         else:
-            print("· no previous session — starting fresh")
+            info("· no previous session — starting fresh")
+
+    if task is not None:                                       # R311
+        from . import headless
+        sys.exit(headless.run(engine, task, yes=yes, max_steps=max_steps,
+                                     as_json=as_json))
+
+    if web:                                                    # R353
+        from .web.server import serve
+        try:
+            port = int(web_opts["--port"])
+        except ValueError:
+            die("--port needs an integer")
+        serve(engine, web_opts["--bind"], port, web_opts["--workspace"])
+        return
 
     # full-screen TUI (pinned prompt, scrollable chat) on a real terminal;
     # --classic or a non-tty (pipes, CI) falls back to the inline REPL

@@ -52,8 +52,8 @@ _WS = re.compile(r"\n\s*\n\s*\n+")
 _FETCH_CAP = 2_000_000  # bytes — a page this big is never useful past the cap
 
 
-def _strip_script_style(html: str) -> str:
-    """R282: drop <script>/<style> blocks in ONE forward pass.
+def _strip_blocks(html: str, tags: tuple[str, ...]) -> str:
+    """R282: drop `<tag>…</tag>` blocks in ONE forward pass.
 
     Was `re.sub(r"<(script|style)[\\s\\S]*?</\\1>", ...)`: on an opener
     with no closer, the lazy scan runs to the end of the text, and it is
@@ -65,20 +65,67 @@ def _strip_script_style(html: str) -> str:
     low = html.lower()
     out, pos = [], 0
     while True:
-        i_s, i_t = low.find("<script", pos), low.find("<style", pos)
-        starts = [i for i in (i_s, i_t) if i != -1]
-        if not starts:
+        best, tag = -1, ""
+        for t in tags:
+            i = low.find(f"<{t}", pos)
+            if i != -1 and (best == -1 or i < best):
+                best, tag = i, t
+        if best == -1:
             out.append(html[pos:])
             break
-        i = min(starts)
-        out.append(html[pos:i])
-        tag = "script" if i == i_s else "style"
-        close = low.find(f"</{tag}", i)
+        out.append(html[pos:best])
+        close = low.find(f"</{tag}", best)
         if close == -1:
-            break                         # unclosed: the rest is script/style
+            break                         # unclosed: the rest is inside it
         end = low.find(">", close)
         pos = len(html) if end == -1 else end + 1
     return "".join(out)
+
+
+def _strip_script_style(html: str) -> str:
+    return _strip_blocks(html, ("script", "style"))
+
+
+# R338: page furniture that is not the content
+_FURNITURE = ("script", "style", "nav", "footer", "aside", "form", "noscript",
+              "svg", "template", "iframe")
+_BLOCK = re.compile(r"</?(?:p|div|section|article|main|header|h[1-6]|ul|ol|"
+                    r"table|tr|blockquote|pre|figure|figcaption|dl|dt|dd)\b[^>]*>",
+                    re.I)
+_BR = re.compile(r"<br\s*/?>", re.I)
+_LI = re.compile(r"<li\b[^>]*>", re.I)
+_COMMENT = re.compile(r"<!--[\s\S]*?-->")
+
+
+def _main_region(html: str) -> str:
+    """The first <main> or <article> element, when the page has one."""
+    low = html.lower()
+    for tag in ("main", "article"):
+        i = low.find(f"<{tag}")
+        if i == -1:
+            continue
+        j = low.find(">", i)
+        k = low.find(f"</{tag}", j)
+        if j != -1 and k != -1 and k - j > 200:
+            return html[j + 1:k]
+    return html
+
+
+def html_to_text(html: str) -> str:
+    """R338: readable text — navigation, footers, forms and scripts dropped,
+    the <main>/<article> body preferred, block tags kept as line breaks, list
+    items as `- `, entities decoded."""
+    import html as htmllib
+    html = _COMMENT.sub("", html)
+    html = _strip_blocks(html, _FURNITURE)
+    html = _main_region(html)
+    html = _BR.sub("\n", html)
+    html = _LI.sub("\n- ", html)
+    html = _BLOCK.sub("\n", html)
+    text = htmllib.unescape(_TAG.sub("", html))
+    text = "\n".join(re.sub(r"[ \t\r\f\v]+", " ", ln).strip()
+                     for ln in text.split("\n"))
+    return _WS.sub("\n\n", text).strip()
 
 
 _MAX_REDIRECTS = 5
@@ -107,7 +154,12 @@ def web_fetch(url: str, **_) -> str:
     # reach a private host". It used to be "any gated URL", so approving
     # a harmless `https://example.com/search?q=x` let its 302 go to
     # 169.254.169.254 or a LAN admin page.
-    approved_private = tools._private_host(urlsplit(url).hostname or "")
+    # R320: decided WITHOUT DNS, exactly as the approval gate decided it
+    # (`url_needs_approval`). With DNS here, a host the gate did not recognise
+    # as private was still treated as "user approved a private target", which
+    # also switched off the rebinding and redirect guards below.
+    approved_private = tools._private_host(urlsplit(url).hostname or "",
+                                           resolve=False)
     try:
         for _hop in range(_MAX_REDIRECTS + 1):
             # stream with a byte cap — a plain .get() would download an
@@ -119,8 +171,7 @@ def web_fetch(url: str, **_) -> str:
                 # anything from a private peer the user didn't approve.
                 if not approved_private and _peer_is_private(r):
                     return ("[web_fetch blocked: the server resolved to a "
-                            "private/local address — fetch it directly to get "
-                            "an approval prompt]")
+                            "private/local address]")
                 if getattr(r, "is_redirect", False):
                     nxt = urljoin(url, r.headers.get("location", ""))
                     if not approved_private and \
@@ -143,9 +194,13 @@ def web_fetch(url: str, **_) -> str:
             r.encoding or "utf-8", errors="replace")
     except Exception as e:
         return f"[web_fetch error: {e}]"
-    html = _strip_script_style(html)
-    text = _TAG.sub("", html)
-    text = _WS.sub("\n\n", text).strip()
+    ctype = (getattr(r, "headers", None) or {}).get("content-type", "") or ""
+    ctype = ctype.split(";")[0].strip().lower()
+    if ctype == "application/pdf" or buf[:5] == b"%PDF-":
+        return ("[web_fetch: this URL is a PDF — download it and read it with "
+                "a PDF tool; Aurora cannot extract PDF text itself]")
+    text = html_to_text(html) if "html" in ctype or not ctype or "<" in html[:2000] \
+        else html.strip()
     return text[:20_000] + ("\n[truncated]" if len(text) > 20_000 else "")
 
 

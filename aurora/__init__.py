@@ -4,14 +4,14 @@ import json as _json
 import subprocess as _subprocess
 from pathlib import Path as _Path
 
-# Frozen version for any checkout that ISN'T GitTea's own dev repo (a public
+# Frozen version for any checkout that ISN'T the dev repo's own dev repo (a public
 # GitHub clone, or any downstream/production install of it) — such a
 # checkout has its own unrelated git history, so counting ITS commits would
-# produce a meaningless number, not GitTea's real one. scripts/
+# produce a meaningless number, not the dev repo's real one. scripts/
 # github-deploy.sh overwrites this exact line on every deploy to GitHub, so
-# it always reflects GitTea's version at deploy time. Left empty here in
-# GitTea itself — empty means "compute live from git" below.
-_PINNED_VERSION = "1.2.57"
+# it always reflects the dev repo's version at deploy time. Left empty here in
+# the dev repo itself — empty means "compute live from git" below.
+_PINNED_VERSION = "1.3.0"
 
 # 1.2+: the patch number is commits SINCE THE LAST DEPLOY, not the total
 # commit count (that was the 1.1.<total> scheme). VERSION_BASELINE.json

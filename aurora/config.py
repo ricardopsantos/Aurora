@@ -23,6 +23,34 @@ def _expand(value):
     return value
 
 
+def _merge(base, over):
+    """R316: dicts merge key by key, anything else (lists included) is replaced
+    — so an overlay swaps a whole `base_url` list instead of splicing into it."""
+    if isinstance(base, dict) and isinstance(over, dict):
+        out = dict(base)
+        for k, v in over.items():
+            out[k] = _merge(base[k], v) if k in base else v
+        return out
+    return over
+
+
+def read_raw_config(path: str | Path) -> dict:
+    """R316: the config file, with $AURORA_HOME/config.local.yaml merged over it
+    when that exists. The committed config.yaml is shared by every machine; the
+    overlay holds only what one machine does differently (its own llama-server
+    URL, a dropped key), so the repo never has to be edited per machine."""
+    with open(path, encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    from .paths import aurora_home
+    local = aurora_home() / "config.local.yaml"
+    if local.is_file():
+        with open(local, encoding="utf-8") as f:
+            over = yaml.safe_load(f) or {}
+        if isinstance(over, dict) and isinstance(raw, dict):
+            raw = _merge(raw, over)
+    return raw
+
+
 def load_config(path: str | Path) -> dict:
     path = Path(path)
     # R199: encoding pinned, never the locale's. Aurora WRITES this file as
@@ -30,8 +58,7 @@ def load_config(path: str | Path) -> dict:
     # LANG=C it could not read back a config it had written itself — and
     # `/model add` puts OpenRouter's descriptions, which are full of em
     # dashes, straight into it. Same defect R146b fixed in session.py.
-    with open(path, encoding="utf-8") as f:
-        cfg = _expand(yaml.safe_load(f)) or {}
+    cfg = _expand(read_raw_config(path)) or {}
     # R244: `setdefault` does NOT replace a key that exists with a null value,
     # and a bare `runtime:` line in YAML parses as exactly that. Every consumer
     # then does `cfg["runtime"].get(...)` on a None and Aurora refuses to start
@@ -98,31 +125,28 @@ def persist_runtime_value(cfg: dict, key: str, value) -> None:
 
 def persist_model_entry(cfg: dict, entry: dict) -> None:
     """Append one model entry to config.yaml's models: list (/model add).
-    Same raw-text round-trip as persist_runtime_value — ${VARS} elsewhere
-    survive, YAML comments do not. Also appends to the live cfg dict so the
-    running engine sees it without a reload."""
+    R423: edited as text (modelcfg), so every comment in the file survives.
+    Also appends to the live cfg dict so the running engine sees it without a reload."""
+    from . import modelcfg
     path = Path(cfg["_path"])
-    raw = _raw_with_section(path, "models", [])
-    raw["models"].append(dict(entry))
-    write_text_atomic(path, yaml.safe_dump(raw, sort_keys=False,
-                                          allow_unicode=True))
+    write_text_atomic(path, modelcfg.add(path.read_text(encoding="utf-8"), dict(entry)))
     cfg.setdefault("models", []).append(entry)
 
 
 def remove_model_entries(cfg: dict, model_id: str) -> int:
     """Remove every models: entry matching model_id from config.yaml and the
     live cfg list (/model remove). The live list is mutated IN PLACE —
-    Engine.models aliases it. Returns how many entries were removed."""
+    Engine.models aliases it. Returns how many entries were removed.
+    R423: edited as text (modelcfg), so every comment in the file survives."""
+    from . import modelcfg
     path = Path(cfg["_path"])
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    models = raw.get("models") or []
-    kept = [m for m in models if m.get("model") != model_id]
-    removed = len(models) - len(kept)
-    if removed:
-        raw["models"] = kept
-        write_text_atomic(path, yaml.safe_dump(raw, sort_keys=False,
-                                          allow_unicode=True))
+    text = path.read_text(encoding="utf-8")
+    hits = [i for i, m in enumerate(modelcfg.entries(text)) if isinstance(m, dict) and m.get("model") == model_id]
+    for i in reversed(hits):
+        text = modelcfg.delete(text, i)
+    if hits:
+        write_text_atomic(path, text)
         live = cfg.get("models")
         if live is not None:
             live[:] = [m for m in live if m.get("model") != model_id]
-    return removed
+    return len(hits)

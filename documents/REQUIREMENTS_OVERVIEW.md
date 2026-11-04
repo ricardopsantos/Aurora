@@ -1,70 +1,82 @@
-# Aurora — Requirements Overview
+# Aurora requirements overview
 
-Aurora is a micro terminal coding agent (macOS + Linux, synced via git).
+Aurora is a micro coding agent for the terminal and the browser. It runs on
+macOS and Linux.
 
-> **Canonical spec is [`CHANGELOG_TECHNICAL.md`](CHANGELOG_TECHNICAL.md)**
-> (formerly `AURORA.md`). It holds the full numbered requirements (R1–R293+),
-> build plan, and test plan, written before the code and kept in sync with
-> behaviour. This file is a stable high-level index; when the two disagree,
-> `CHANGELOG_TECHNICAL.md` wins. Any behaviour change updates
-> `CHANGELOG_TECHNICAL.md` (and README.md) in the same commit.
+This page is a short map of the requirement groups. The numbered detail lives
+in two places:
 
-## Requirement groups (see CHANGELOG_TECHNICAL.md for the numbered detail)
+- [`CHANGELOG_TECHNICAL.md`](CHANGELOG_TECHNICAL.md): R1 to R293, with the
+  original build plan and test plan.
+- [`REQUIREMENTS.md`](../REQUIREMENTS.md) and the files under
+  [`requirements/`](../requirements/): the newer requirements as testable
+  rules, from R223 up to R440 and beyond. New requirements go here.
 
-- **Providers & models (R1–R5, R223).** OpenAI-compatible providers only
-  (local llama.cpp / Ollama / any OpenAI-compatible server, and OpenRouter).
-  A provider entry's `type: ollama` selects Ollama's own probe and
-  `/api/show` context lookup (R223); everything without a `type:` uses
-  llama.cpp's `/props`. Aurora consumes whatever model is loaded; it never
-  launches or manages the server.
-  `/model` picker; per-model `tools:` flag with graceful degrade to chat.
-- **Coding agent (R6–R11).** Tool loop (read/write/edit/run/list/grep/web).
-  Approval gate on writes & commands (`y`/`n`/`a`, persistent allowlist),
-  diff preview before writes, a per-turn iteration cap, `!cmd` bash passthrough,
-  and `/name` skills.
-- **Context & memory (R12, removed).** Aurora originally had its own
-  built-in `.agentic_context` integration (`context.py`/`memory.py`:
-  bootstraps AGENTS.md + the three indexes + `[CORE]` docs into the system
-  prompt, `/remember`, `/agentic_report`). Removed in favor of the
-  `agentic_context_mcp` MCP server, which exposes the same operations
-  (`read_rules`, `list_index`, `read_doc`, `write_memory`, `stats`, plus
-  tagging/promotion the built-in version never had) as regular
-  approval-gated MCP tools instead of hardcoded Aurora code — see
-  `config.yaml`'s `mcp_servers:`. See `CHANGELOG_TECHNICAL.md` R12 for the
-  historical detail.
-- **TUI & UX.** Esc is the single control key (menu → cancel → exit-ask →
-  clear); no accidental-exit keys; robust request cancellation (reader thread +
-  socket shutdown) so a cancel lands even during prefill. The key is Esc in
-  the TUI (where Ctrl+C only clears the input line) and Ctrl+C in the classic
-  REPL — the cancellation MECHANISM is shared, the key is per front end.
-- **Concurrency while a turn runs (R245, R246, R253, R254).** A turn in flight must
-  not make the session unusable. The model can background a long command and
-  poll it (`run_command(background=True)`/`check_command`/`cancel_command`);
-  the human can run a `!` bash command, a read-only `/command`, `/model`, or
-  ask a question and get an answer, all on a second worker. The boundary is
-  fixed: nothing on that channel writes `engine.messages` or the session, so
-  they keep the single writer their lock-free design assumes. A mid-turn
-  question is therefore answered from a snapshot with no tools, and says so;
-  a mid-turn `/model` defers its switch until the turn ends. What genuinely
-  must wait still waits, but says which command and why. Two standing rules
-  came out of R254's review of that machinery: nothing on the side channel
-  may borrow what the turn configures by assignment or infers from its own
-  output (its provider, its renderer, its think row, its transcript entry),
-  and nothing on it may skip a gate the main path applies — R58's secret
-  scan included.
-- **Resilience.** Every backend probe is time-bounded; unreachable backends
-  degrade gracefully (picker falls back to config models, sends notify to
-  `/model` in ~5s) so Aurora works fully off-LAN with remote providers.
+If this page disagrees with either of them, they're right.
 
-## Operating rules (project-specific)
+## Requirement groups
 
-- Repo = source of truth; runs on macOS + Linux, synced by git.
-- After every shipped feature: `git add + commit + push` to Forgejo
-  (`ricardo/Aurora`) without asking — multi-machine flow.
-- README.md (quick start) and CHANGELOG_TECHNICAL.md (spec) must never drift
-  from actual behaviour; ship doc updates in the same commit.
+- **Providers and models (R1 to R5, R223, R295 to R345).** Aurora works with
+  OpenAI-compatible providers: a local llama.cpp server, Ollama, any other
+  OpenAI-compatible server, and OpenRouter. A provider with `type: ollama`
+  uses Ollama's own health check and `/api/show` for the context size;
+  others use llama.cpp's `/props`. Aurora uses whatever model the server has
+  loaded and never starts or manages the server. The `/model` picker lists
+  every model, can add one from an OpenRouter URL, and marks a sleeping local
+  model as "asleep". Each model has a `tools:` flag; a model without tools
+  falls back to plain chat. A machine can override the shared config with
+  `config.local.yaml`.
+- **The coding agent (R6 to R11).** The tool loop reads, writes, edits, runs
+  commands, lists, greps and searches the web. Writes and commands ask first,
+  with a diff preview, and the answers can be saved as allow or deny rules.
+  Each turn has a step limit. `!` runs a shell command directly, and `/name`
+  runs a skill.
+- **Approvals (R149, R319, R334 to R340).** How far an "always allow" rule
+  reaches depends on how risky the command is. You can also allow for this
+  session only, audit and prune old rules, turn on plan mode, try a task in a
+  throwaway worktree, and set spending caps.
+- **Project context (R12, removed).** Aurora used to load an
+  `.agentic_context` folder itself. That now happens through the
+  `agentic_context_mcp` MCP server, whose tools (`read_rules`, `list_index`,
+  `read_doc`, `write_memory`, `stats`) go through the normal approval prompt.
+  Configure it under `mcp_servers:` in `config.yaml`.
+- **The terminal UI.** Esc is the one control key, pressed twice to confirm
+  cancelling, leaving a mode or quitting. No single key quits by accident.
+  Cancelling works even while the server is still reading the prompt. In
+  the classic REPL the cancel key is Ctrl+C instead; the mechanism is the
+  same.
+- **Working while a turn runs (R245, R246, R253, R254, R348 to R351).** A
+  running turn never locks the session. The model can run a long command in
+  the background and check on it later. You can run a `!` command, a
+  read-only `/command` or `/model`, or ask a side question, all on a second
+  worker. That worker never writes the session history, which keeps a single
+  writer. A side question is answered from a snapshot without tools, and says
+  so; a `/model` switch waits until the turn ends. Nothing on the second
+  worker may skip a check the main path makes, including the secret scan.
+  You can also queue messages, send a line into the running turn, or type
+  `stop` to cancel it.
+- **Sessions and storage (R229 to R296).** Session records, checkpoints in a
+  shadow git repo, atomic writes, compaction and history.
+- **Resilience and performance (R246 to R298, R346, R393).** Every backend
+  check has a time limit. When a backend can't be reached, Aurora explains
+  why and keeps working with the others, so it works away from the home
+  network with remote providers. Background work is bounded. The product
+  contains nothing personal and assumes nothing about the machine it runs on.
+- **Aurora Lite, the web version (R353 to R440).** `aurora --web` serves the
+  same engine as a chat page: chats with folders and downloads, Markdown
+  notes, files, voice, a model menu with a YAML editor, and light and dark
+  themes that work on a phone. It needs a bearer token and starts with
+  auto-approve on. Front ends reach the engine only through
+  `aurora/service.py` (R394).
+
+## Rules for this project
+
+- The repo is the source of truth. Aurora runs on macOS and Linux and is
+  synced with git.
+- The README, the requirements and the technical docs must match what the
+  code does. Ship doc updates in the same commit as the change.
 
 ## Architecture
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) — the Engine/Frontend boundary, module
-map, and data flow.
+[`ARCHITECTURE.md`](ARCHITECTURE.md) covers the boundary between the engine
+and the front ends, the module map and the data flow.

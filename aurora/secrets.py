@@ -95,6 +95,30 @@ class Match:
     text: str
 
 
+_CODE_VALUE = re.compile(
+    r"""^(?:["']{2}|[fFrRbB]["']|None$|True$|False$|null$|\w[\w.]*\()""")
+
+
+def _is_code_value(line: str) -> bool:
+    """R328: the value half of an `Env credential` hit is source code, not a
+    secret — an empty string, an f-string, `None`, or a call such as
+    `password=Condition(lambda: …)`. Real values are bare words or quoted
+    text, so those still match."""
+    _, _, val = line.partition("=")
+    return bool(_CODE_VALUE.match(val.strip()))
+
+
+_WORD_SEG = re.compile(r"^(?:[a-z]{1,12}|[A-Z][a-z]{0,11}|[A-Z]{1,5}|\d{1,3}[a-z]{0,2})$")
+
+
+def _is_word_identifier(token: str) -> bool:
+    """R328: `double-Esc-within-2s` — three or more short, ordinary word-shaped
+    segments joined by `-`/`_` is a name, not random token material (random
+    segments mix case inside one segment)."""
+    segs = re.split(r"[-_]", token)
+    return len(segs) >= 3 and all(_WORD_SEG.match(g) for g in segs)
+
+
 def hash_value(value: str) -> str:
     """SHA-256 of a matched value — what the allowlist stores, never the raw
     value itself. A false positive gets saved to disk/config as this hash,
@@ -207,6 +231,8 @@ def scan(text: str, allowlist: set[str] | None = None) -> list[Match]:
             s, e = m.span()
             if _overlaps(s, e):
                 continue   # overlaps an earlier match — skip, don't double-count
+            if name == "Env credential" and _is_code_value(m.group(0)):
+                continue
             _claim(s, e)
             found.append(Match(name, s, e, m.group(0)))
 
@@ -225,6 +251,8 @@ def scan(text: str, allowlist: set[str] | None = None) -> list[Match]:
                 continue
             if _is_date_or_timestamp(token):
                 continue   # dated filenames / timestamps are not secrets
+            if _is_word_identifier(token):
+                continue   # kebab/snake_case names: `double-Esc-within-2s`
             has_digit = any(c.isdigit() for c in token)
             has_lower = any(c.islower() for c in token)
             has_upper = any(c.isupper() for c in token)

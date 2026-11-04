@@ -35,7 +35,8 @@ from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.completion import Completer, PathCompleter
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
-from prompt_toolkit.filters import Condition
+from prompt_toolkit.filters import Condition, to_filter
+from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
@@ -60,6 +61,14 @@ from .colors import strip_dangerous_escapes as _strip_dangerous_escapes
 from .engine import Engine
 from .paths import aurora_home, write_text_preserving
 
+
+def _fmt_secs(secs: int) -> str:
+    """R313: whole seconds under a minute ("42s"), m:ss from 60s on
+    ("11:49") — "709s" is unreadable at a glance on long local-model runs."""
+    secs = int(secs)
+    return f"{secs}s" if secs < 60 else f"{secs // 60}:{secs % 60:02d}"
+
+
 def _low_chatter_output():
     """prompt_toolkit's `mouse_support=True` always requests mode 1003
     ("any-event" tracking, `output.enable_mouse_support` in
@@ -68,7 +77,7 @@ def _low_chatter_output():
     button is down (drag-to-select in `_ChatControl.mouse_handler`); the
     rest is pure chatter.
 
-    Reported bug: over an SSH session (Mac → m7), moving/dragging the mouse
+    Reported bug: over an SSH session (Mac → the server), moving/dragging the mouse
     over the terminal sometimes typed garbage like `90;13M5;77;18M...` into
     the prompt. That's an unconsumed mouse-tracking escape sequence
     (`\\x1b[<0;90;13M`-shaped) falling through to plain self-insert — it
@@ -108,12 +117,23 @@ def _low_chatter_output():
 
 
 _DOUBLE_CLICK_S = 0.3     # same window prompt_toolkit's BufferControl uses
+# R349: lines that cancel the running turn when typed mid-turn.
+_STOP_WORDS = frozenset({"stop", "/stop"})
+
 # R252: how often a blocking ask re-checks for a confirmed cancel. Same
 # cadence `providers.base.cancellable_sse` polls at, for the same reason —
 # short enough that Esc feels immediate, long enough not to spin.
 _CANCEL_POLL_S = 0.15
 _SCROLL_STEP = 3          # wheel ticks are per-notch; keep it gentle
 _PAGE_STEP = 10
+
+
+# R348: Ctrl+Enter has no key of its own in prompt_toolkit. Terminals that
+# report it send CSI-u (kitty protocol) or xterm's modified-key form; both are
+# mapped onto one otherwise-unused key so it can be bound.
+_CTRL_ENTER_KEY = Keys.F24
+for _seq in ("\x1b[13;5u", "\x1b[27;5;13~"):
+    ANSI_SEQUENCES[_seq] = _CTRL_ENTER_KEY
 
 
 class InputLineBusy(Exception):
@@ -164,11 +184,72 @@ class _SafeCompletionsMenuControl(CompletionsMenuControl):
             return None
         return super().mouse_handler(mouse_event)
 
+    def create_content(self, width, height):
+        """R332: pad every row to the full width. The control paints only the
+        cells it has text for, so the transcript (or the rule above the
+        prompt) showed through to the right of short rows."""
+        from prompt_toolkit.utils import get_cwidth
+        content = super().create_content(width, height)
+        inner = content.get_line
+
+        def get_line(i):
+            frags = list(inner(i))
+            used = sum(get_cwidth(f[1]) for f in frags)
+            if used < width:
+                style = frags[-1][0] if frags else "class:completion-menu"
+                frags.append((style, " " * (width - used)))
+            return frags
+        content.get_line = get_line
+        return content
+
+
+def _ellipsize_middle(text: str, width: int) -> str:
+    """R331: `/tmp/…/ux/work` — keep the head and the tail of a long path."""
+    if width < 8 or len(text) <= width:
+        return text
+    keep = width - 1
+    head = keep // 3
+    return text[:head] + "…" + text[len(text) - (keep - head):]
+
+
+def _clip_frags(frags: list, width: int) -> list:
+    """R331: cut each row of a formatted-text status bar at `width` columns with
+    a trailing `…`, instead of letting the terminal wrap or chop it mid-word.
+    Click handlers (3rd tuple item) are kept on the fragments that survive."""
+    out, col = [], 0
+    dropping = False
+    for frag in frags:
+        style, text = frag[0], frag[1]
+        rest = frag[2:]
+        pieces = text.split("\n")
+        for i, piece in enumerate(pieces):
+            if i:
+                out.append(("", "\n"))
+                col, dropping = 0, False
+            if dropping or not piece:
+                continue
+            room = width - col
+            if len(piece) <= room:
+                out.append((style, piece, *rest))
+                col += len(piece)
+            elif style.endswith("hint"):
+                # a hint row loses WHOLE hints from the right, never half of one
+                while out and out[-1][1].strip() in ("·", ""):
+                    col -= len(out.pop()[1])
+                if col + 2 <= width:
+                    out.append((style, " …"))
+                col, dropping = width, True
+            else:
+                out.append((style, piece[:max(room - 1, 0)] + "…", *rest))
+                col, dropping = width, True
+    return out
+
 
 def _completions_menu() -> CompletionsMenu:
     """A CompletionsMenu whose control is crash-guarded (see above)."""
     menu = CompletionsMenu(max_height=10, scroll_offset=1)
     menu.content.content = _SafeCompletionsMenuControl()
+    menu.content.dont_extend_width = to_filter(False)   # R332: fill the row
     return menu
 
 
@@ -569,6 +650,8 @@ class TuiFrontend(ui.TerminalFrontend):
         self._think_marker_shown = False      # never let the marker logic fire
         self._stream_len += len(chunk)
         super().on_text(chunk)
+        if self.render_md:
+            self._tui.set_stream_tail(self._mdbuf)            # R297
 
     def on_usage(self, input_tokens: int, output_tokens: int) -> None:
         self._live_in += input_tokens
@@ -687,6 +770,7 @@ class Tui:
         # (fragment index, char offset) where line i begins; `_split_line`
         # is the first line that must be recomputed (a large sentinel when
         # everything is current).
+        self._tail_entry = None    # R297: provisional unfinished-line entry
         self._lines: list = []
         self._line_starts: list = []
         self._split_line = 0
@@ -977,6 +1061,9 @@ class Tui:
         # renders through. Same strip, same CSI-colors-untouched behavior.
         s = _strip_dangerous_escapes(s)
         with self._lock:
+            # R297: real output supersedes the provisional stream tail —
+            # remove it first so this text lands where the tail was
+            self._drop_tail_locked()
             # plain output (tool start/result, notices) means the request
             # moved past its thinking phase — close the live row, or a
             # tool-only round (no on_text) leaves it "thinking…" forever
@@ -991,6 +1078,54 @@ class Tui:
                 self._line_counts.append(None)
                 self._dirty(len(self._chat) - 1)
                 self._evict_locked()          # R152
+        try:
+            self.app.invalidate()
+        except Exception:
+            pass
+
+    def _drop_tail_locked(self) -> None:
+        """R297: remove the provisional stream-tail entry, if any. Caller
+        holds `self._lock`. Entries after it (rare: side output) shift down
+        one index, so their render caches — whose click handlers close over
+        their index — are rebuilt along with the flatten from here."""
+        tail = self._tail_entry
+        if tail is None:
+            return
+        self._tail_entry = None
+        for i in range(len(self._chat) - 1, -1, -1):
+            if self._chat[i] is tail:
+                del self._chat[i]
+                del self._cache[i]
+                del self._line_counts[i]
+                for j in range(i, len(self._cache)):
+                    self._cache[j] = None
+                    self._line_counts[j] = None
+                self._dirty_from = i if self._dirty_from is None \
+                    else min(self._dirty_from, i)
+                return
+
+    def set_stream_tail(self, text: str) -> None:
+        """R297: show the streamed-but-unfinished line NOW. Markdown renders
+        whole lines only, so `on_text` holds the partial tail back — a model
+        writing a long paragraph showed nothing at all for seconds (every
+        token of it buffered), which reads as a stalled stream. The tail is
+        drawn raw as the last entry and replaced the moment the line
+        completes (`append` drops it first)."""
+        text = _strip_dangerous_escapes(text)
+        with self._lock:
+            tail = self._tail_entry
+            if not text:
+                self._drop_tail_locked()
+            elif tail is not None and self._chat and self._chat[-1] is tail:
+                tail["text"] = text
+                self._dirty(len(self._chat) - 1)
+            else:
+                self._drop_tail_locked()
+                tail = self._tail_entry = {"kind": "tail", "text": text}
+                self._chat.append(tail)
+                self._cache.append(None)
+                self._line_counts.append(None)
+                self._dirty(len(self._chat) - 1)
         try:
             self.app.invalidate()
         except Exception:
@@ -1053,6 +1188,7 @@ class Tui:
             # outlives the state it describes is the bug, not the symptom.
             self._open_think_items = []
             self._open_think = False
+            self._tail_entry = None                           # R297
             self._cache.clear()
             self._line_counts.clear()
             self._dirty_from = None
@@ -1254,7 +1390,7 @@ class Tui:
             frags = _linkify_fragments(
                 _merge_char_runs(ANSI(item["text"]).__pt_formatted_text__()))
             return self._linkify_filenames(frags)
-        if isinstance(item, dict) and item.get("kind") == "side":
+        if isinstance(item, dict) and item.get("kind") in ("side", "tail"):
             # R254c/d: its own kind purely so it can never be merged into a
             # neighbouring string entry — rendered like ordinary chat text
             return _linkify_fragments(
@@ -1262,8 +1398,8 @@ class Tui:
         import time
         secs = int(item["dt"] if item["done"]
                    else time.monotonic() - item.get("t0", time.monotonic()))
-        state = (f"thinking… {secs}s" if not item["done"]
-                 else f"thought for {secs}s")
+        state = (f"thinking… {_fmt_secs(secs)}" if not item["done"]
+                 else f"thought for {_fmt_secs(secs)}")
         if item["text"]:      # expandable — same header info as the toolbar
             arrow = "▾" if item["open"] else "▸"
             hint = "click to hide" if item["open"] else "click to read"
@@ -1782,9 +1918,10 @@ class Tui:
         # R256: "copy last" was ambiguous in the one way that mattered — it
         # takes the whole turn (prompt, thinking, every reply), and a user
         # who wanted just the answer had no row for it. Both are named now.
-        "last": "copy last (full)",
-        "response": "copy last (response)",
-        "session": "copy whole session transcript",
+        "response": "copy last turn: answer only",
+        "last": "copy last turn: prompt + replies",
+        "turn": "copy last turn: everything",
+        "session": "copy whole session",
         "id": "copy session id",
         "selected": "copy selected",
     }
@@ -1821,8 +1958,9 @@ class Tui:
             # `_resolve_menu` (R171c) — this used to duplicate that with its
             # own `_copy_menu_draft`, which only ever became a no-op restore.
             self._copy_menu_sel = sel if sel.strip() else ""
-            options = [("last", self._COPY_LABELS["last"]),
-                       ("response", self._COPY_LABELS["response"]),
+            options = [("response", self._COPY_LABELS["response"]),
+                       ("last", self._COPY_LABELS["last"]),
+                       ("turn", self._COPY_LABELS["turn"]),
                        ("session", self._COPY_LABELS["session"]),
                        ("id", self._COPY_LABELS["id"])]
             if self._copy_menu_sel:
@@ -1834,7 +1972,7 @@ class Tui:
             # a selection the user just made is almost certainly why they
             # clicked copy — start on it. Order stays fixed either way, so
             # the digit shortcuts never change meaning between clicks.
-            default = len(options) - 2 if self._copy_menu_sel else 0
+            default = len(options) - 2 if self._copy_menu_sel else 1
             self._open_ui_menu("copy:", options, self._resolve_copy_menu,
                                default_index=default)
         return handler
@@ -1889,6 +2027,17 @@ class Tui:
             else:
                 how = clipboard.copy(text)
                 self._sel_notice = (f"final reply copied — {how}",
+                                    time.monotonic())
+            self.app.invalidate()
+            return
+        if key == "turn":
+            text = ui._outbound(ui._raw_last_response_text(
+                self.engine, self.fe, everything=True))
+            if not text:
+                self._sel_notice = ("nothing to copy yet", time.monotonic())
+            else:
+                how = clipboard.copy(text)
+                self._sel_notice = (f"whole last turn copied — {how}",
                                     time.monotonic())
             self.app.invalidate()
             return
@@ -2015,7 +2164,7 @@ class Tui:
                 self._route_submitted_line("/cost")
         return handler
 
-    def _route_submitted_line(self, line: str) -> None:
+    def _route_submitted_line(self, line: str, force: bool = False) -> None:
         """R253: decide which of the two workers a submitted line goes to.
 
         Idle (the common case) — everything goes to `_inbox` exactly as
@@ -2034,11 +2183,25 @@ class Tui:
         The last case is the point of the whole split: those genuinely have
         to wait, because they write the conversation the running turn owns.
         Before this, everything looked like that case."""
+        if line.startswith("/ask ") and line[5:].strip():
+            line = line[5:].strip() if not self._busy else line   # idle: just a prompt
         if not self._busy:
             self._inbox.put(line)
             return
+        # R349: a bare "stop" typed mid-turn is a cancel, not a prompt. It used
+        # to queue behind the running turn, so a looping turn never saw it.
+        if line.strip().lower() in _STOP_WORDS:
+            self.fe.cancel_event.set()
+            self._side_cancel.set()
+            self.append(dim("  (stopping — cancel requested)\n"))
+            return
         if line.startswith("/"):
             cmd, _, arg = line[1:].partition(" ")
+            if cmd.strip().lower() == "ask" and arg.strip():
+                # R348: the old busy-prompt behaviour, now explicit
+                self._note_if_side_busy()
+                self._side_inbox.put(("ask", arg.strip()))
+                return
             if ui.side_safe_command(line):
                 self._note_if_side_busy()
                 self._side_inbox.put(("cmd", line))
@@ -2052,20 +2215,18 @@ class Tui:
                             "cancels that turn.)\n"))
             self._inbox.put(line)
             return
-        if self._side_busy:
-            # R257: R254a re-validated `_busy` at the far end, which stopped
-            # prompts being LOST — but a prompt sent to a channel that is
-            # already chewing on something waits there, outside the main
-            # queue, and a prompt typed LATER goes straight to an idle main
-            # worker and runs first. Measured: A typed while busy ran after
-            # B typed after it. The side channel's whole value is running
-            # NOW; when it can't, a prompt belongs in the main queue, in the
-            # order it was typed.
-            self.append(dim("  (queued — the quick-check channel is busy, "
-                            "so this keeps its place in line)\n"))
-            self._inbox.put(line)
+        # R348: Ctrl+Enter (or Ctrl+Space) puts a mid-turn line straight into
+        # the running turn — the model reads it with the next tool result.
+        # Plain Enter queues it as the next prompt; `/ask <text>` is the side
+        # question.
+        if force:
+            self.engine.add_steer(line)
+            self.append(dim("  (injected — the model reads it with the next tool "
+                            "result)\n"))
             return
-        self._side_inbox.put(("ask", line))
+        self.append(dim("  (queued as the next prompt — Ctrl+Enter or Ctrl+Space "
+                        "injects into the running turn instead)\n"))
+        self._inbox.put(line)
 
     # R253 removed `_note_if_busy()`. It printed one generic
     # "(queued — still running previous command)" for every line submitted
@@ -2073,6 +2234,61 @@ class Tui:
     # a plain prompt both reported as stuck with no reason and no recourse.
     # Most of those lines now don't queue at all, and the ones that still
     # must say WHY in `_route_submitted_line`.
+
+    def _inject_queued(self) -> bool:
+        """R351: Ctrl+Enter on an empty line makes whatever is queued behind
+        the running turn enter NOW. Plain prompts are injected into the turn;
+        side-safe `/commands` and `!` lines run on the side channel; a command
+        that rewrites the session (`/clear`, `/compact`, …) cannot run beside
+        the turn, so the turn is cancelled and the queue runs next, in order
+        (plain prompts then wait their turn too: a cancel drops injections).
+        Returns True if anything moved."""
+        if not self._busy:
+            return False
+        lines = []
+        while True:
+            try:
+                lines.append(self._inbox.get_nowait())
+            except queue.Empty:
+                break
+        if not lines:
+            return False
+
+        def side(line):
+            if line.startswith("!"):
+                return ("bash", line[1:])
+            if line.startswith("/"):
+                cmd, _, arg = line[1:].partition(" ")
+                if ui.side_safe_command(line):
+                    return ("cmd", line)
+                if cmd.strip().lower() == "model" and not arg.strip():
+                    return ("model", line)
+            return None
+
+        must_wait = any(line.startswith("/") and side(line) is None for line in lines)
+        keep, injected, ran = [], 0, 0
+        for line in lines:
+            target = side(line)
+            if target is not None:
+                self._note_if_side_busy()
+                self._side_inbox.put(target)
+                ran += 1
+            elif must_wait or line.startswith("/"):
+                keep.append(line)
+            else:
+                self.engine.add_steer(line)
+                injected += 1
+        for line in keep:
+            self._inbox.put(line)
+        if must_wait:
+            self.fe.cancel_event.set()
+            self.append(dim("  (cancelling the turn — the queued command changes "
+                            "the session, so it runs next)\n"))
+        elif injected:
+            self.append(dim(f"  (injected {injected} queued prompt"
+                            f"{'s' if injected > 1 else ''} — the model reads "
+                            "them with the next tool result)\n"))
+        return True
 
     def _note_if_side_busy(self) -> None:
         """The side channel's own "you're behind something" note (R245): a
@@ -2921,7 +3137,7 @@ class Tui:
         # deliberately not filtered: beating the swallow is their whole job.
         _no_menu = Condition(lambda: self._menu_options is None)
 
-        def _submit(event, line: str):
+        def _submit(event, line: str, force: bool = False):
             """Submit/answer the current input line under the normal single-
             line keymap; called by Enter and by Alt+Enter (multiline submit)."""
             buf = self.input.buffer
@@ -2960,7 +3176,10 @@ class Tui:
                 return
             self.append(f"\n{CYAN}{BOLD}> {RESET}{line}\n")
             self.scroll_end()
-            self._route_submitted_line(line)
+            if force:
+                self._route_submitted_line(line, True)
+            else:
+                self._route_submitted_line(line)
 
         @kb.add("enter", filter=_no_editor)
         def _(event):
@@ -2972,10 +3191,36 @@ class Tui:
             if st and st.current_completion:      # menu open → accept entry
                 buf.apply_completion(st.current_completion)
                 return
+            # R347: typing a command name and exactly ONE suggestion fits —
+            # Enter chooses it. A command that needs no parameters runs; one
+            # that takes parameters (or is destructive, or is a skill) is only
+            # typed in, with a trailing space, and waits for the user.
+            only = self._sole_command_completion()
+            if only is not None:
+                name = only.lstrip("/")
+                if name in ui.COMMAND_INFO and name not in ui.TYPED_ONLY_COMMANDS:
+                    buf.reset()
+                    _submit(event, "/" + name)
+                else:
+                    buf.text = "/" + name + " "
+                    buf.cursor_position = len(buf.text)
+                return
             if self.engine.multiline:
                 buf.insert_text("\n")
                 return
             _submit(event, ui._expand_newlines(buf.text))
+
+        # R348: force the line into the running turn. Ctrl+Space reaches every
+        # terminal; Ctrl+Enter only those that report it (kitty, WezTerm,
+        # iTerm2/xterm with modified-key reporting on) — the rest send a plain
+        # Enter, which cannot be told apart.
+        @kb.add(Keys.ControlAt, filter=_no_editor & _no_menu)
+        @kb.add(_CTRL_ENTER_KEY, filter=_no_editor & _no_menu)
+        def _(event):
+            if self._question is None and not self._bash_mode:
+                if not self.input.buffer.text.strip() and self._inject_queued():
+                    return
+                _submit(event, ui._expand_newlines(self.input.buffer.text), True)
 
         @kb.add("escape", "enter", filter=_no_editor)
         def _(event):
@@ -3173,6 +3418,8 @@ class Tui:
                 # with no on-screen reminder is exactly how someone leaves
                 # it on past the task they turned it on for.
                 aa = "  ⚠ auto-approve ON" if self.engine.auto_approve else ""
+                if getattr(self.engine, "plan_mode", False):
+                    aa += "  ✎ plan mode"
                 # R155: the session id is no longer rendered on the bar — it
                 # moved into the copy picker, which reads it from
                 # engine.session.id at pick time
@@ -3184,10 +3431,17 @@ class Tui:
                     if text.strip():
                         draft_tokens = f"↑{ui.estimate_tokens(text)}"
                 draft_part = f" - {draft_tokens}" if draft_tokens else ""
+                # R352: session-average generation speed, once measured
+                tps_part = f" │ {s.tok_per_s:.0f} t/s" if getattr(s, "tok_per_s", None) else ""
                 mode_click = (self._leave_bash_mode_click() if self._bash_mode
                               else self._enter_bash_mode_click())
+                lh = getattr(self.engine, "last_health", None)
+                down = bool(lh) and not lh.get("ok") \
+                    and lh.get("model") == self.engine.current.get("model")
                 frags = [("class:status", " "),
-                         ("class:status.id", self._short_model(s.model, s.local_model),
+                         ("class:status.busy" if down else "class:status.id",
+                          ("✘ " if down else "")
+                          + self._short_model(s.model, s.local_model),
                           self._open_model_picker())]
                 if s.cost_known:
                     # R168: the price is now its own clickable/underlined
@@ -3209,7 +3463,7 @@ class Tui:
                          ("class:status.id",
                           f"ctx {used}/{s.limit / 1000:.0f}k "
                           f"- {s.pct:.0f}%", self._cost_tree_click()),
-                         ("class:status", f"{draft_part} │ "),
+                         ("class:status", f"{draft_part}{tps_part} │ "),
                          ("class:status.id", mode_txt, mode_click),
                          ("class:status", " │ "),
                          # R155: one button, a picker behind it — replaces
@@ -3305,7 +3559,7 @@ class Tui:
                 phase_text = self._running_note or f"{self._phase or 'working'}…"
                 frags.append(("class:status.busy",
                               f" {frame} {phase_text} "
-                              f"{secs}s (Tap ESC twice to cancel){tok_bit}"))
+                              f"{_fmt_secs(secs)} (Tap ESC twice to cancel){tok_bit}"))
                 # R253: the side channel was invisible — `_side_busy` was set
                 # and read but never rendered, so a `!`/`/status`/side-turn
                 # running concurrently looked like nothing was happening
@@ -3345,7 +3599,7 @@ class Tui:
                     ("class:status.hint", "? Help", self._toggle_help_click()),
                     ("class:status.hint", " · Esc cancel/clear/exit"),
                 ])
-            return frags
+            return _clip_frags(frags, self._cols())
 
 
         # R212: the renderer is a closure over this method's locals; bind it
@@ -3390,7 +3644,9 @@ class Tui:
                 Window(FormattedTextControl(self._status_render), height=3,
                        style="class:status"),
             ]),
-            floats=[Float(xcursor=True, ycursor=True,
+            # R332: full width, so no transcript text shows through on either
+            # side of the menu
+            floats=[Float(left=0, width=lambda: self._cols(), ycursor=True,
                           content=_completions_menu())])
 
         # --debug tints the two non-interactive areas so their bounds are
@@ -3461,7 +3717,8 @@ class Tui:
     # ── worker: the session thread (all command/turn code runs here) ─────
     def _worker(self):
         engine, fe = self.engine, self.fe
-        self._banner()
+        health = self._banner()
+        ui._offer_model_picker(engine, fe, health)
 
         import time as _t
         bp_text, bp_source = bootstrap.load(".")
@@ -3533,6 +3790,18 @@ class Tui:
             finally:
                 self._busy, self._phase = False, ""
                 self._esc_armed = None
+                # R348: lines typed mid-turn that no tool result carried to the
+                # model (the turn ended first) become the next prompt, in
+                # order. A cancelled turn drops them, saying so.
+                left = engine.take_steer() if hasattr(engine, "take_steer") else []
+                if left:
+                    if self.fe.cancel_event.is_set():
+                        self.append(dim("  (turn cancelled — dropped what you typed "
+                                        f"meanwhile: {' / '.join(left)})\n"))
+                    else:
+                        self.append(dim("  (typed mid-turn, not read in time — "
+                                        "sending it as the next prompt)\n"))
+                        self._inbox.put(" / ".join(left))
                 # R252: a cancel belongs to the line it cancelled. Left set,
                 # it makes the next line's very first question answer itself
                 # (see `_await_answer`). `_send_turn` clears it per turn; a
@@ -3739,6 +4008,35 @@ class Tui:
         else:
             self.append_side(dim("(no answer)") + "\n")
 
+    def _sole_command_completion(self):
+        """R347: the full `/name` that the bare `/word` fragment completes to
+        when exactly one suggestion fits (and it is not already complete), else
+        None. Not in bash mode, with a question open, or once a space is typed."""
+        if self._bash_mode or self._question is not None or self._secret:
+            return None
+        doc = self.input.buffer.document
+        text = doc.text_before_cursor
+        if not text.startswith("/") or any(c.isspace() for c in text):
+            return None
+        try:
+            from prompt_toolkit.completion import CompleteEvent
+            found = list(self.input.completer.get_completions(doc, CompleteEvent()))
+        except Exception:
+            return None
+        if len(found) != 1:
+            return None
+        c = found[0]
+        full = (text[:len(text) + c.start_position] + c.text).strip()
+        if not full.startswith("/"):
+            full = "/" + full
+        return None if full == text else full
+
+    def _cols(self) -> int:
+        try:
+            return max(20, self.app.output.get_size().columns)
+        except Exception:
+            return 80
+
     def _banner(self):
         import os
 
@@ -3747,10 +4045,12 @@ class Tui:
         engine = self.engine
         h = engine.provider_health()
         mark = f"{GREEN}✔{RESET}" if h["ok"] else f"{RED}✘{RESET}"
+        cols = self._cols()
         info_lines = [f"{CYAN}{BOLD}Aurora{RESET} {dim(version)}",
                       f"  model    {BOLD}{engine.current.get('model')}{RESET}  "
                       f"{mark} {dim(h['detail'])}",
-                      f"  cwd      {os.getcwd()}",
+                      *ui.diagnosis_lines(engine, h),
+                      f"  cwd      {_ellipsize_middle(os.getcwd(), cols - 11)}",
                       f"  session  {engine.session.id}"
                       + (dim(f"  ({len(engine.messages)} messages resumed)")
                          if engine.messages else "")]
@@ -3758,9 +4058,11 @@ class Tui:
         if n_ext:
             info_lines.append(f"  extensions  {n_ext} tool"
                               f"{'s' if n_ext != 1 else ''} loaded"
-                              + dim("  (/extensions for details)"))
+                              + (dim("  (/extensions for details)")
+                                 if cols >= 70 else ""))
         info_lines.append("")
         self.append("\n".join(info_lines) + "\n")
+        return h
 
     # ── run ───────────────────────────────────────────────────────────────
     def run(self):

@@ -1,13 +1,67 @@
 # Changelog
 
-Aurora's version is `1.2.<commits since the last deploy>` (the `1.0.` prefix
-was used through release 1.0.185, R114 bumped it to `1.1.<total commit
-count>`, and the patch number switched from a running total to a per-release
-counter — reset at deploy time — as of 1.2.0), pinned at the point each
-release was published — check `aurora --man` or `python3 -c "import aurora;
-print(aurora.__version__)"` for what you're actually running. For the full
-numbered requirements record, see `CHANGELOG_TECHNICAL.md` (formerly
-`AURORA.md`).
+Aurora's version is `1.2.<commits since the last published release>`. To see
+which version you're running, use `aurora --man` or
+`python3 -c "import aurora; print(aurora.__version__)"`. Older releases used
+`1.0.<n>` and `1.1.<n>`; the entries below keep the numbers they had. The
+numbered requirements are in `CHANGELOG_TECHNICAL.md` (R1 to R293) and in
+`REQUIREMENTS.md` with `requirements/` (the newer ones).
+
+## 1.3.0 (2026-11-04)
+
+Changes since 1.2.57.
+
+The biggest change is a web version of Aurora. The terminal also gained
+plan mode, trial runs, spending caps and better ways to work while a turn is
+running.
+
+### Added
+- **Aurora Lite, the web version.** `aurora --web` serves the same agent as a
+  chat page for a desktop or a phone. It has a sidebar of chats with search,
+  folders, rename and download as HTML; Markdown notes in Personal, Work and
+  Skills tabs that you can send to Aurora as context; file attachments
+  (documents, pictures, music and video) with Input and Outputs lists and
+  previews; voice input and read aloud; a model menu that can wake a sleeping
+  local model, refresh prices and edit the model list as YAML; and light and
+  dark themes. It needs a bearer token (`AURORA_WEB_TOKEN`) and starts with
+  auto-approve on. See the README for setup. (R353 to R440)
+- **Plan mode.** `/plan on` lets Aurora read and search but not change
+  anything, so it writes a plan first. (R339)
+- **Trial runs.** `/try <task>` runs a task in a throwaway copy of your
+  project and lets you apply, discard or keep the result. (R342)
+- **Spending caps.** `/budget` sets a limit per session or per day. (R340)
+- **Allow for this session.** A new answer at the approval prompt allows a
+  call until Aurora exits, without saving a rule. The prompt also shows the
+  rule that "always" would save, and `/allowlist audit` and `prune` clean up
+  old rules. (R334 to R336)
+- **Working while a turn runs.** Enter queues your next message, Ctrl+Enter
+  sends it into the running turn, and typing `stop` cancels. (R348 to R351)
+- **Generation speed** in tokens per second on the status bar. (R352)
+- **JSON output for one-shot runs:** `aurora -t "task" --json`. (R337)
+- **Per-machine settings** in `AURORA_HOME/config.local.yaml`, merged over
+  the shared config. (R315, R316)
+- An "+ add a model…" row in the `/model` picker. (R341)
+
+### Changed
+- A local server that unloaded its model shows as "asleep", and Aurora warns
+  before the slow first reply. An unreachable backend is explained, with the
+  likely cause and what to try. (R295, R343 to R345)
+- `web_fetch` returns readable text, and asks before fetching a private or
+  local address. (R300, R320, R338)
+- The secret scan skips source code and ordinary names, so it flags fewer
+  false positives. (R328)
+- A model that keeps repeating the same tool call is stopped after three
+  rounds. (R350)
+- Aurora contains nothing personal and assumes nothing about the machine it
+  runs on; the deploy files are templates. (R346, R393)
+
+### Fixed
+- Edits to an existing file work on macOS again; the space reservation that
+  needs Linux is skipped there.
+- Many robustness and safety fixes from audits and deep dives, including
+  edits that keep a file's inode, command output that keeps both its start
+  and its end, and a keyring that never answers no longer freezing Aurora.
+  See `requirements/` for the full list.
 
 ## 1.2.57 (2026-09-29)
 
@@ -357,7 +411,7 @@ to it, so the client's failure modes matter more. Full detail in
   for Ns" row already does the same thing, for any past turn, not just the
   latest. Classic (non-TUI) sessions lose the ability to review past
   reasoning after the fact as a result.
-- The LlamaDesk integration is removed — it required a `llamadesk:` config
+- The the model manager integration is removed — it required a `model-manager:` config
   block nobody had configured. Aurora's local-model support is unaffected.
 - `/model` add/remove, prompt caching, per-session `/cost`, concurrent
   read-only tool calls, and a 429 rate limit getting its own automatic

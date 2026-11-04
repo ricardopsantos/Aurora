@@ -67,3 +67,32 @@ def test_engine_does_no_terminal_io():
                     and node.func.id in {"input", "print"}):
                 offenders.append(f"{path.name}:{node.lineno} calls {node.func.id}()")
     assert not offenders, "engine doing terminal I/O:\n" + "\n".join(offenders)
+
+
+def test_web_imports_core_only_via_service():
+    """R394: aurora/web/ reaches the core only through aurora.service (the front-end
+    contract). Relative imports are resolved too (the R90a lesson): `from .. import
+    session`, `from ..session import X` and `from ..providers.base import Y` all count."""
+    web = pathlib.Path(__file__).resolve().parent.parent / "aurora" / "web"
+    offenders = []
+    for path in sorted(web.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom):
+                level, mod = node.level or 0, node.module or ""
+                if level == 1:
+                    continue                                  # sibling module inside aurora/web
+                if level >= 2:
+                    targets = [mod] if mod else [a.name for a in node.names]
+                elif mod == "aurora" or mod.startswith("aurora."):
+                    rest = mod[len("aurora."):] if mod != "aurora" else ""
+                    targets = [rest] if rest else [a.name for a in node.names]
+                else:
+                    continue                                  # stdlib / third party
+                for t in targets:
+                    if t.split(".")[0] not in ("service", "web"):
+                        offenders.append(f"{path.name}:{node.lineno} imports core module {t!r}")
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name.startswith("aurora.") and a.name.split(".")[1] not in ("service", "web"):
+                        offenders.append(f"{path.name}:{node.lineno} imports {a.name}")
+    assert not offenders, "aurora/web must import the core only via aurora.service:\n" + "\n".join(offenders)

@@ -637,7 +637,7 @@ def test_add_rule_persists_for_a_realistic_mcp_call_with_no_path_arg():
 
 def test_add_deny_rule_persists_for_a_realistic_mcp_call_with_no_path_arg():
     approve.save_deny({})
-    args = {"repo": "ricardopsantos/Aurora"}
+    args = {"repo": "example/repo"}
     rule = approve.add_deny_rule("mcp_github_delete_repo", args)
     assert rule == "*"
     assert approve.is_denied("mcp_github_delete_repo", args)
@@ -1757,6 +1757,47 @@ def test_agent_loop_nudge_does_not_fire_when_the_result_changed(tmp_path, monkey
     assert not any("you already ran this exact call" in r for r in results)
 
 
+def test_agent_loop_stops_a_model_that_ignores_the_repeat_nudge(monkeypatch):
+    """R350: identical call + identical result for REPEAT_ROUNDS_STOP rounds in
+    a row ends the turn; the nudge alone let a model re-read one file 80 times."""
+    monkeypatch.setattr(tools, "run_tool", lambda name, args, **_k: "same output")
+    calls = [TurnResult(text="", tool_calls=[ToolCall(str(i), "read_file",
+             {"path": "/x"})], stop_reason="tool_use") for i in range(20)]
+    prov = FakeProvider(calls)
+    log = []
+    msgs = [{"role": "user", "content": "go"}]
+    agent.run_turn(prov, "m", msgs, "sys", _cb(log=log), 99, True)
+    results = [e[2] for e in log if e[0] == "result"]
+    assert len(results) == agent.REPEAT_ROUNDS_STOP + 1
+
+
+def test_gen_speed_counts_from_first_streamed_token(monkeypatch):
+    """R352: generation seconds start at the first streamed chunk, so a slow
+    prompt-processing phase does not drag the tokens/second down."""
+    clock = [100.0]
+    monkeypatch.setattr(agent, "_gen_clock", lambda: clock[0])
+
+    class P(FakeProvider):
+        def turn(self, model, messages, system, tools, on_text, cancel):
+            clock[0] += 5.0          # prefill: nothing streamed yet
+            on_text("hi")
+            clock[0] += 2.0          # generation
+            return TurnResult(text="hi", stop_reason="end", output_tokens=100)
+
+    t = agent.run_turn(P([]), "m", [{"role": "user", "content": "go"}], "sys",
+                       _cb(), 5, True)
+    assert t.gen_tokens == 100 and t.gen_secs == pytest.approx(2.0)
+
+
+def test_engine_tokens_per_second_needs_a_second_of_data(tmp_path):
+    from aurora.engine import Engine
+    e = Engine.__new__(Engine)
+    e._gen_tokens, e._gen_secs = 10, 0.5
+    assert e.tokens_per_second() is None
+    e._gen_tokens, e._gen_secs = 200, 4.0
+    assert e.tokens_per_second() == 50.0
+
+
 # ── R120: denylist wins over the approval prompt ────────────────────────────
 def test_agent_denylist_match_never_prompts(tmp_path):
     approve.save({"run_command": [], "write_file": [], "edit_file": []})
@@ -2460,13 +2501,13 @@ def test_unreachable_message_classifies_remote_by_public_hostname():
 
 
 def test_unreachable_message_never_leaks_a_local_hostname():
-    # a LAN/tailnet provider's base_url can bake in a personal hostname
-    # (e.g. a Tailscale MagicDNS name) — the notice must say "local backend"
+    # a LAN/VPN provider's base_url can bake in a personal hostname
+    # (e.g. a VPN's magic DNS name) — the notice must say "local backend"
     # generically, never the actual host, and never the raw config-key name
     log = []
     agent.run_turn(
         _UnreachableProvider("my-private-name",
-                            "https://someone-box.example-tailnet.ts.net:18182/v1"),
+                            "https://someone-box.example-vpn.ts.net:18182/v1"),
         "m", [{"role": "user", "content": "ls"}], "s",
         _cb(log=log), 5, True)
     notices = [e[1] for e in log if e[0] == "notify"]
@@ -3181,6 +3222,27 @@ def test_completer_still_notices_a_newly_added_skill(tmp_path, monkeypatch):
     os.utime(sk, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
     names = {c.text for c in comp.get_completions(Document("/ze"), None)}
     assert names == {"zeta", "zebra"}
+
+
+def test_completer_offers_substring_matches_after_prefix_matches(tmp_path, monkeypatch):
+    """R318: `/ert` offers a command that only CONTAINS "ert", and prefix
+    matches still come first."""
+    from prompt_toolkit.document import Document
+
+    from aurora import ui
+    sk = tmp_path / "skills"
+    sk.mkdir()
+    _mk_skill(sk, "qwertyuio")
+    _mk_skill(sk, "ertzzz")
+    monkeypatch.chdir(tmp_path)
+    comp = ui.SlashCompleter(str(tmp_path))
+    names = [c.text for c in comp.get_completions(Document("/ert"), None)]
+    assert names[0] == "ertzzz"
+    assert "qwertyuio" in names
+    # the completion replaces exactly what was typed
+    c = next(c for c in comp.get_completions(Document("/ert"), None)
+             if c.text == "qwertyuio")
+    assert c.start_position == -3
 
 
 # ── last-model persistence ─────────────────────────────────────────────────
@@ -5671,7 +5733,9 @@ def test_diff_preview_matches_replace_all(tmp_path):
         return sum(1 for line in diff.splitlines()
                    if line.startswith("-") and not line.startswith("---"))
 
-    assert changed(approve.diff_preview("edit_file", args)) == 1
+    # R324: without replace_all a non-unique `old` is refused, so the preview
+    # says so instead of showing a one-line change
+    assert "will fail" in approve.diff_preview("edit_file", args)
     assert changed(approve.diff_preview(
         "edit_file", {**args, "replace_all": True})) == 3
     # and the preview is the truth: the real edit changes exactly that many
@@ -5944,7 +6008,7 @@ def test_run_command_output_is_bounded_for_a_runaway_command(monkeypatch):
     monkeypatch.setattr(tools, "COMMAND_OUTPUT_CAP", 256 * 1024)
     out, code = tools._run_command_once("yes ABCDEFGHIJKLMNOP", None, timeout=2)
     assert len(out) < 2 * 1024 * 1024, f"captured {len(out)} bytes"
-    assert "output truncated" in out
+    assert "bytes omitted" in out
     assert code is None                      # still reported as a timeout
 
 
@@ -5966,7 +6030,7 @@ def test_run_command_keeps_draining_past_the_cap(tmp_path):
     finally:
         _t.COMMAND_OUTPUT_CAP = old
     assert code == 7, f"command did not complete cleanly (code={code})"
-    assert "output truncated" in out
+    assert "bytes omitted" in out
 
 
 def test_run_command_warns_when_final_reap_itself_times_out(monkeypatch):
@@ -7495,7 +7559,7 @@ def test_context_tree_never_presents_reasoning_as_additive(tmp_path, monkeypatch
 
 def test_context_tree_estimates_thinking_when_unreported(tmp_path, monkeypatch):
     """Local llama.cpp streams reasoning_content but reports no
-    reasoning_tokens — without the char fallback every m7 turn reads as
+    reasoning_tokens — without the char fallback every local turn reads as
     zero thinking. Marked `~` because it IS an estimate, and placed BESIDE
     out: rather than inside it: a backend that declines to count reasoning
     never promised it folded it into the completion total, and asserting it
@@ -9743,8 +9807,68 @@ def test_the_two_copy_last_commands_are_both_registered():
     /copy-response is just the reply, and the blurbs must say which."""
     from aurora import ui
     assert "copy-last" in ui.COMMAND_INFO and "copy-response" in ui.COMMAND_INFO
-    assert "FULL" in ui.COMMAND_INFO["copy-last"]
+    assert "prompt, thinking, every reply" in ui.COMMAND_INFO["copy-last"]
     assert "final reply" in ui.COMMAND_INFO["copy-response"]
+    assert "command and full output" in ui.COMMAND_INFO["copy-turn"]
+
+
+def _tool_turn_with_commands():
+    return [
+        {"role": "user", "content": "disk?"},
+        {"role": "assistant", "content": "checking",
+         "tool_calls": [{"id": "1", "type": "function", "function": {
+             "name": "run_command", "arguments": '{"command": "df -h /home"}'}}]},
+        {"role": "tool", "content": "line\n" * 20000},      # 100KB, past any cap
+        {"role": "assistant", "content": "152G free"},
+    ]
+
+
+def test_copy_turn_shows_the_command_and_the_whole_output(tmp_path, monkeypatch):
+    """R317: "copy last (full)" showed `→ run_command` and nothing of what ran
+    or what it printed."""
+    from aurora import ui
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = _tool_turn_with_commands()
+    out = ui._last_turn_everything_text(e)
+    assert "→ run_command\n```\ndf -h /home\n```" in out
+    assert out.count("line\n") == 20000 and "truncated" not in out
+    assert out.index("checking") < out.index("df -h") < out.index("152G free")
+
+
+def test_copy_last_still_leaves_tool_output_out(tmp_path, monkeypatch):
+    from aurora import ui
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = _tool_turn_with_commands()
+    out = ui._last_turn_answer_text(e)
+    assert "line\n" not in out and "df -h" not in out
+
+
+def test_copy_turn_does_not_reach_into_the_previous_turn(tmp_path, monkeypatch):
+    from aurora import ui
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.messages[:] = _tool_turn() + _tool_turn_with_commands()
+    assert "earlier answer" not in ui._last_turn_everything_text(e)
+
+
+def test_session_export_carries_the_command_and_flags_unstored_output(tmp_path, monkeypatch):
+    """R317: the whole-session copy dropped the command and clipped output to
+    200 chars. The log stores 4000 (R133b); what is past that is said, not
+    silently cut."""
+    from aurora import session as sessionmod
+    e = _mk_engine(tmp_path, monkeypatch)
+    e.session.log("user", text="disk?", model="m")
+    e.session.log("tool", name="run_command", args={"command": "df -h /home"},
+                  output="x" * 4000, chars=4500, status="ok")
+    md = sessionmod.export_markdown(e.session.id)
+    assert "df -h /home" in md and "x" * 4000 in md
+    assert "500 more chars not stored" in md
+
+
+def test_the_tool_log_records_the_arguments_that_ran(tmp_path, monkeypatch):
+    from aurora import engine, session as sessionmod
+    assert engine._clip_args({"command": "ls", "n": 3}) == {"command": "ls", "n": 3}
+    assert len(engine._clip_args({"content": "y" * 9000})["content"]) == 4000
+    assert engine._clip_args(None) == {}
 
 
 def test_explain_is_the_only_caller_that_opts_into_reasoning(tmp_path, monkeypatch):
@@ -9758,3 +9882,33 @@ def test_explain_is_the_only_caller_that_opts_into_reasoning(tmp_path, monkeypat
                 inspect.getsource(engine.Engine._maybe_auto_compact)
                 if hasattr(engine.Engine, "_maybe_auto_compact") else ""):
         assert "reasoning_fallback" not in src
+
+
+def test_auto_approve_skips_the_iteration_cap_prompt():
+    asked = []
+    tc = lambda i: TurnResult(text="", tool_calls=[ToolCall(str(i), "read_file",
+                   {"path": "/nonexistent"})], stop_reason="tool_use")
+    prov = FakeProvider([tc(1), tc(2), tc(3), TurnResult(text="done", stop_reason="end")])
+    cb = _cb()
+    cb.ask_continue = lambda i: asked.append(i) or True
+    cb.auto_continue = lambda: True
+    agent.run_turn(prov, "m", [{"role": "user", "content": "go"}], "sys", cb, 2, True)
+    assert asked == []
+    asked.clear()
+    prov = FakeProvider([tc(1), tc(2), tc(3), TurnResult(text="done", stop_reason="end")])
+    cb.auto_continue = lambda: False
+    agent.run_turn(prov, "m", [{"role": "user", "content": "go"}], "sys", cb, 2, True)
+    assert asked == [2]
+
+
+def test_auto_continue_backstops_at_max_rounds(monkeypatch):
+    monkeypatch.setattr(agent, "AUTO_CONTINUE_MAX_ROUNDS", 3)
+    asked = []
+    tc = lambda i: TurnResult(text="", tool_calls=[ToolCall(str(i), "read_file",
+                   {"path": "/nonexistent"})], stop_reason="tool_use")
+    prov = FakeProvider([tc(1), tc(2), tc(3), tc(4), TurnResult(text="done", stop_reason="end")])
+    cb = _cb()
+    cb.ask_continue = lambda i: asked.append(i) or True
+    cb.auto_continue = lambda: True
+    agent.run_turn(prov, "m", [{"role": "user", "content": "go"}], "sys", cb, 1, True)
+    assert asked and asked[0] == 3

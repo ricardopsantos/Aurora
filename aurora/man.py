@@ -14,9 +14,9 @@ from .colors import BOLD, CYAN, DIM, GREEN, RESET, YELLOW
 # this (it looks up one key directly) — this only controls the full page.
 COMMAND_ORDER = [
     "model", "compact", "clear", "reset", "copy", "copy-last", "copy-response",
-    "copy-all",
+    "copy-turn", "copy-all",
     "redact", "status", "cost", "context", "cache", "autocompact",
-    "fallback", "auto-approve", "thinking", "markdown", "multiline", "allowlist",
+    "fallback", "auto-approve", "plan", "budget", "try", "thinking", "markdown", "multiline", "allowlist",
     "denylist", "rewind", "undo", "diff", "commit", "resume", "search",
     "sessions", "export", "skills", "extensions", "bootstrap",
     "nano", "help", "quit", "exit",
@@ -85,11 +85,19 @@ def _entries(B, C, D, G, Y, R):
     SSH-safe). R256: a turn that used tools is a chain (narrate, call,
     narrate, call, answer), and this used to copy only its final message,
     which on a long turn is usually a short wrap-up — the substantive reply
-    was dropped. Tool OUTPUT is still left out; one result can be 60KB.
+    was dropped. Tool OUTPUT is still left out; one result can be 60KB —
+    {C}/copy-turn{R} is the copy that includes it.
     This is the one place either the prompt or the thinking is ever
     copyable; {C}/copy{R} and {C}/copy-all{R} both leave thinking out. Want
     just the answer? {C}/copy-response{R}. Also reachable as
-    "copy last (full)" in the status bar's {C}copy{R} picker.""",
+    "copy last turn: prompt + replies" in the status bar's {C}copy{R} picker.""",
+
+"copy-turn": f"""Copy the LAST turn with EVERYTHING — what {C}/copy-last{R}
+    takes (prompt, thinking, every reply) plus, for each tool call, the
+    command that ran (or the call's arguments) and its output IN FULL, no
+    cap (OSC52, SSH-safe). Reach for it when the output is the point; a
+    result can be 60KB. Also reachable as "copy last turn: everything" in
+    the status bar's {C}copy{R} picker.""",
 
 "copy-response": f"""Copy just the model's FINAL reply from the last turn —
     no prompt, no thinking, no tool markers (OSC52, SSH-safe). The narrow
@@ -97,12 +105,15 @@ def _entries(B, C, D, G, Y, R):
     {C}/copy{R} it skips a trailing tool-call-only message, so a turn stopped
     at the approval gate still copies the last thing the model actually
     said instead of an empty string, and it never reaches back into the
-    previous turn to find one. Also reachable as "copy last (response)" in
+    previous turn to find one. Also reachable as "copy last turn: answer only" in
     the status bar's {C}copy{R} picker.""",
 
-"copy-all": f"""Copy the WHOLE chat — every question and answer, in order —
-    to the clipboard (OSC52, SSH-safe). Thinking is never included. Also
-    reachable as "copy whole session transcript" in the status bar's
+"copy-all": f"""Copy the WHOLE session — every question and answer, plus each
+    tool's command and output — to the clipboard (OSC52, SSH-safe). Thinking
+    is never included. Output comes from the session log, which stores the
+    first 4000 chars of each result; a longer one ends in a note saying how
+    much was not stored (use {C}/copy-turn{R} for the last turn in full).
+    Also reachable as "copy whole session" in the status bar's
     {C}copy{R} picker.""",
 
 "redact": f"""Secret detection in prompts and tool output — API keys, bearer
@@ -180,6 +191,29 @@ def _entries(B, C, D, G, Y, R):
     silently switches the current model, exactly as if you'd picked it
     from {C}/model{R} yourself.""",
 
+"try": f"""{C}/try{R} {G}<task>{R}  Runs the task in a throwaway {C}git worktree{R} (a copy
+    of HEAD plus your uncommitted and untracked changes, kept under
+    {Y}AURORA_HOME/try/{R}), then shows the diff and asks: apply it to your
+    real tree, discard it, or keep the sandbox. Your tree is untouched until
+    you say apply. The model works with relative paths inside the copy; an
+    absolute path into the original tree is not sandboxed. Needs a git repo
+    with at least one commit. Complements {C}/rewind{R}, which undoes changes
+    after the fact.""",
+
+"budget": f"""{C}/budget{R} shows spend. {C}/budget 2{R} caps THIS session at $2
+    (session-only); {C}/budget day 5{R} caps each calendar day at $5 across all
+    sessions (persisted in runtime.yaml); {C}off{R} clears. A warning appears at
+    80%; at 100% the turn stops before its next tool call runs and new
+    messages are refused until the cap is raised. Only priced (paid) models
+    accrue spend. Daily totals are kept in {Y}AURORA_HOME/spend.json{R}.""",
+
+"plan": f"""{G}on|off{R}, SESSION-ONLY. With plan mode on the model can still
+    read, search and fetch, but any tool call that would need approval
+    (writes, edits, commands, MCP tools) is refused with "[plan mode — not
+    run]" — even one an allowlist rule would have run. It reads and
+    explores, then writes a plan; {C}/plan off{R} lets it act. The status
+    bar shows {Y}✎ plan mode{R} while it is on.""",
+
 "auto-approve": f"""{G}on|off{R}, SESSION-ONLY — always starts back OFF on a
     fresh run, unlike {C}/fallback{R}/{C}/multiline{R} above. While ON,
     every tool call that would normally stop and ask (write/edit a file,
@@ -220,7 +254,12 @@ def _entries(B, C, D, G, Y, R):
     sudo sh python curl{R} … and anything using a shell operator) match the
     EXACT command only, so allowing {C}rm -rf ./build{R} never allows
     {C}rm -rf /{R}. Everything else stores a two-token prefix (e.g.
-    {C}git push{R}). Persisted in {Y}AURORA_HOME/allowlist.yaml{R}.""",
+    {C}git push{R}). Persisted in {Y}AURORA_HOME/allowlist.yaml{R}.
+    The approval prompt shows what {G}a{R} would save before you pick it, and
+    offers {G}t{R} to allow it for this session only (memory, never saved;
+    listed here under "this session only").
+    {C}/allowlist audit{R} lists duplicate, legacy single-token and
+    exact-only rules; {C}/allowlist prune{R} removes them after a y/N.""",
 
 "denylist": f"""Show tool calls always denied by policy — added via the
     {G}d{R} ("always DENY") option at any approval prompt. A denylist match
@@ -388,6 +427,7 @@ def man_page() -> str:
 
 {B}SYNOPSIS{R}
     {C}aurora{R} [{Y}--continue{R}] [{Y}--resume ID{R}] [{Y}--classic{R}] [{Y}--debug{R}] [{G}config.yaml{R}]
+    {C}aurora{R} {Y}-t{R} {G}"task"{R} [{Y}--yes{R}] [{Y}--json{R}] [{Y}--max-steps{R} {G}N{R}] [{G}config.yaml{R}]
     {C}aurora{R} {Y}key set{R} [{G}ENV_VAR{R}]
     {C}aurora{R} {Y}key status{R} [{G}ENV_VAR{R}]
     {C}aurora{R} {Y}key clear{R} [{G}ENV_VAR{R}{Y}|--all{R}]
@@ -421,6 +461,19 @@ def man_page() -> str:
     {Y}--continue{R}    Resume the most recent session.
     {Y}--resume{R} {G}ID{R}    Resume a specific session ID (shown on quit).
     {Y}--classic{R}     Inline REPL instead of the full-screen TUI.
+    {Y}-t{R}, {Y}--task{R} {G}TEXT{R}  One-shot, never prompts (cron/CI/another agent). {G}-{R} reads the
+                 task from stdin. Only the answer goes to stdout, progress to
+                 stderr. Exit 0 = finished, 1 = incomplete (a gated call was
+                 denied, step cap, secret stop, provider failure), 2 = usage
+                 or config error. Anything
+                 not on the allowlist is DENIED; the denylist always wins.
+    {Y}--yes{R}         With -t: approve every gated call that isn't denylisted.
+                 Only for disposable environments.
+    {Y}--json{R}        With -t: stdout is ONE JSON object — ok, exit_code,
+                 reply, reasons, model, session, cost_usd, context_tokens
+                 and tool_calls [{{name, args, result}}] — instead of the
+                 streamed answer. Progress still goes to stderr.
+    {Y}--max-steps{R} {G}N{R}  With -t: tool-loop cap for this run.
     {Y}--debug{R}       Tint the TUI areas to show their bounds: chat and
                  status bar red (distinct shades); the input line is left
                  untinted.

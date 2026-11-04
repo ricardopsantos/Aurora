@@ -1,0 +1,18 @@
+# summary: example systemd unit for `aurora --web`: loopback only, put a TLS reverse proxy in front; copy to /etc/systemd/system/aurora-web.service and replace the YOUR_* values.
+[Unit]
+Description=Aurora Web (aurora --web)
+After=network-online.target
+
+[Service]
+User=YOUR_USER
+# AURORA_WEB_TOKEN=<a long random string> must be set here (EnvironmentFile) or the server refuses to start.
+EnvironmentFile=/etc/aurora-web.env
+WorkingDirectory=/home/YOUR_USER/YOUR_WORKSPACE
+ExecStart=/home/YOUR_USER/Aurora/.venv/bin/python -m aurora --web --bind 127.0.0.1 --port 9592 --workspace /home/YOUR_USER/YOUR_WORKSPACE
+Restart=on-failure
+# a missing AURORA_WEB_TOKEN exits 1 on purpose: do not spin
+RestartPreventExitStatus=1
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,14 +1,15 @@
-# Aurora — Keys
+# Aurora keys
 
-Full detail behind the [README](../README.md)'s quick-start.
+The full detail behind the quick start in the [README](../README.md).
 
-Secrets, all stored via `aurora key set` (env var → OS keyring →
-encrypted file — never plaintext on disk):
+Store secrets with `aurora key set`. Aurora looks for them in an environment
+variable, then the OS keyring, then an encrypted file. It never stores them
+on disk in plain text.
 
 | Key | What it unlocks | Where to get it |
 |---|---|---|
-| `LLAMA_API_KEY` | your local llama.cpp server, if it requires one | wherever you configured it (leave unset if your server needs no key) |
-| — | Ollama (`type: ollama` in `config.yaml`) | no key needed at all — omit `api_key_env` entirely |
+| `LLAMA_API_KEY` | Your local llama.cpp server, if it needs a key | Wherever you set it up. Leave it unset if your server needs no key. |
+| (none) | Ollama (`type: ollama` in `config.yaml`) | No key needed. Leave out `api_key_env`. |
 | `OPENROUTER_API_KEY` | OpenRouter models (paid) | [openrouter.ai/keys](https://openrouter.ai/keys) |
 
 ```bash
@@ -16,19 +17,20 @@ aurora key set                    # LLAMA_API_KEY (default)
 aurora key set OPENROUTER_API_KEY
 aurora key status                 # is a key set, and where from? (no ENV_VAR = every key this config uses)
 aurora key clear [ENV_VAR]        # remove a stored key (--all for every one configured)
-aurora wipe                       # delete AURORA_HOME — logs out of every provider, resets sessions/allowlist/state
+aurora wipe                       # delete AURORA_HOME: logs out of every provider, resets sessions/allowlist/state
 ```
 
-If you'd rather not type a key in, `config.yaml`'s `key_fetch:` block lets
-`aurora key set` run a command of your choosing (e.g. an `ssh` to wherever
-the value lives) and store its output — approve with `y` and it's stored
-without copy-pasting. See the commented example in `config.yaml`.
+If you'd rather not type a key, the `key_fetch:` block in `config.yaml` lets
+`aurora key set` run a command you choose (for example an `ssh` to wherever
+the value lives) and store its output. Approve with `y` and it's stored
+without copying and pasting. See the commented example in
+`config.yaml.example`.
 
-If the encrypted-file store is in use and you mistype its passphrase while
-adding a key, Aurora refuses and writes nothing — `not stored — the existing
-key store could not be decrypted`. That is deliberate: it used to replace the
-whole store with just the key being added, re-encrypted under the typo, and
-report success. Re-run the command and enter the right passphrase.
+With the encrypted-file store, a wrong passphrase while adding a key stores
+nothing. Aurora says `not stored — the existing key store could not be
+decrypted` and leaves the store as it was. Run the command again with the
+right passphrase. An empty passphrase is refused, and a new one is asked for
+twice.
 
-No OpenRouter key? Aurora still works — only the paid remote models are
-unusable; pick your local model with `/model`.
+Without an OpenRouter key Aurora still works, but you can't use the paid
+remote models; pick your local model with `/model`.

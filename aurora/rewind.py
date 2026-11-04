@@ -484,7 +484,7 @@ def covers(path: str, cwd: str = ".") -> bool:
 
 def _in_nested_repo(target: Path, root: Path) -> bool:
     """R274: is `target` inside a git repository nested BELOW the checkpoint
-    root (a sub-repo when Aurora runs from ~/repositories or ~, a submodule,
+    root (a sub-repo when Aurora runs from ~/projects or ~, a submodule,
     a vendored checkout)? `git add -A` records such a directory as a gitlink
     (mode 160000) — a commit pointer, not its files — so no checkpoint holds
     their content and /rewind cannot restore them. Checked from the target's
