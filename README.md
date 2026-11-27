@@ -244,7 +244,7 @@ Everything except this README is in [documents/](documents/):
   bootstrap prompt.
 
 At the repo root, [REQUIREMENTS.md](REQUIREMENTS.md) and the files under
-[requirements/](requirements/) hold the current requirements (up to R582) as
+[requirements/](requirements/) hold the current requirements (up to R583) as
 testable rules. New requirements go there.
 
 The README, the requirements and `ARCHITECTURE.md` must match the code. Any change in behaviour ships with its doc update in the same commit.

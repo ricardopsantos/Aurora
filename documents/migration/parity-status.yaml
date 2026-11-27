@@ -559,3 +559,4 @@ R554: "NOT_APPLICABLE: shared or front end; tested in tests/test_review_r536_r55
 R555: "NOT_APPLICABLE: shared or front end; tested in tests/test_review_r536_r555.py"
 R556: "NOT_APPLICABLE: shared or front end; tested in tests/test_review_r536_r555.py"
 R582: "NOT_APPLICABLE: release versioning (VERSION_BASELINE.json, read by aurora/__init__.py)"
+R583: "NOT_APPLICABLE: installer (install.sh), the same for both cores"

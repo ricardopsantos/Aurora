@@ -885,3 +885,13 @@ Asked for 2026-11-27: the release that moves the agent loop to Rust is 2.0.0, no
 scheme ends here.
 
 Tests: `tests/test_version_scheme.py`.
+
+## R583 - The one-line install asks on the terminal
+
+Found 2026-11-27 by the 2.0.0 installer check: under `curl -fsSL .../bootstrap-install.sh | bash` the installer's stdin
+is the download pipe, so its first `read` (the data folder) hit the end of the pipe and `set -e` stopped the install
+right after `config.yaml`, with no message: no venv, no Rust core, no `aurora` link. `install.sh` now reads from
+`/dev/tty` when stdin is not a terminal and one exists, so the questions, the key menu and `aurora key set` reach the
+user. With no terminal at all (CI, a pipe with no tty), each `read` falls back to its default instead of failing.
+
+Tests: `tests/test_install_tty_r583.py`.

@@ -9,7 +9,11 @@ if [ ! -f config.yaml ] && [ -f config.yaml.example ]; then
     echo "→ created config.yaml from config.yaml.example — edit it for your own providers/models"
 fi
 
-read -rp "Aurora data dir [~/.aurora]: " DATA_DIR
+# R583: under `curl ... | bash` stdin is the download pipe, so the questions below would hit its end and stop the
+# install (set -e). Ask on the terminal instead; with no terminal at all, take the defaults.
+if [ ! -t 0 ] && { : </dev/tty; } 2>/dev/null; then exec </dev/tty; fi
+
+read -rp "Aurora data dir [~/.aurora]: " DATA_DIR || DATA_DIR=""
 DATA_DIR="${DATA_DIR:-$HOME/.aurora}"
 DATA_DIR="${DATA_DIR/#\~/$HOME}"
 mkdir -p "$DATA_DIR"
@@ -47,7 +51,7 @@ if echo "$KEY_LINES" | grep -q ': not set$' \
         && ! echo "$KEY_LINES" | grep -qv ': not set$'; then
     echo "No API key is configured yet:"
     echo "$KEY_LINES" | sed 's/^/  /'
-    read -rp "Set one up now? [y/N] " SETUP_KEY
+    read -rp "Set one up now? [y/N] " SETUP_KEY || SETUP_KEY=""
     if [[ "$SETUP_KEY" =~ ^[Yy]$ ]]; then
         KEY_NAMES="$(echo "$KEY_LINES" | cut -d: -f1)"
         if [ "$(echo "$KEY_NAMES" | wc -l)" -eq 1 ]; then

@@ -7,6 +7,14 @@ which version you're running, use `aurora --man` or
 numbered requirements are in `CHANGELOG_TECHNICAL.md` (R1 to R293) and in
 `REQUIREMENTS.md` with `requirements/` (the newer ones).
 
+## 2.0.1 (2026-11-27)
+
+### Fixed
+- **The one-line install works again.** `curl ... | bash` stopped right after
+  creating `config.yaml`, with no message, because the installer's questions
+  read the download instead of the keyboard. It now asks on the terminal, and
+  takes the defaults when there is none. (R583)
+
 ## 2.0.0 (2026-11-27)
 
 This is Aurora 2.0: the agent loop now runs in Rust. Bash
