@@ -117,7 +117,7 @@ def test_serve_pins_the_local_model_without_touching_remembered_state(app, monke
 
 def test_slash_commands_are_refused(app):
     code, d = call(app, "/api/send", {"text": "/model foo"})
-    assert code == 400 and "disabled" in d["error"]
+    assert code == 400 and "not run on the web" in d["error"] and "model menu" in d["error"]   # R458
     assert "user" not in types(app)
 
 
@@ -315,8 +315,8 @@ def test_session_events_keep_their_own_event_id(app):
     assert all(isinstance(i, int) for i in ids) and ids == sorted(ids)
 
 
-def test_r357_auto_approve_is_on_by_default_and_switchable(app):
-    assert WebSession(app.e).auto is True          # the default for a real `aurora --web` (R392: kept on the web session)
+def test_r357_r474_auto_approve_is_off_by_default_and_switchable(app):
+    assert WebSession(app.e).auto is False         # R474: a real `aurora --web` asks until the switch is turned on
     app.s.auto = False
     assert call(app, "/api/state")[1]["auto_approve"] is False
     assert call(app, "/api/auto", {"on": "yes"})[0] == 400
@@ -953,7 +953,7 @@ def test_r389_notes_create_save_list_read_delete_and_survive_bad_input(app):
     nid = d["id"]
     assert code == 200 and len(nid) == 12
     first = call(app, "/api/notes")[1]["notes"][0]
-    assert first == {"id": nid, "title": "Shopping list", "preview": "milk eggs", "updated": first["updated"], "type": "personal"}   # R422: every note has a type
+    assert first == {"id": nid, "title": "Shopping list", "preview": "milk eggs", "updated": first["updated"], "created": first["created"], "type": "personal"}   # R422: every note has a type; R467: and its creation time
     assert call(app, "/api/notes/" + nid)[1]["text"] == "milk\neggs"
     assert (app.tmp / "home" / "web-notes" / f"{nid}.txt").read_text() == "milk\neggs"           # plain .txt on disk
     assert call(app, "/api/notes/save", {"id": nid, "title": "", "text": "x"})[0] == 200

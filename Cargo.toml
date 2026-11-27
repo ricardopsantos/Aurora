@@ -1,0 +1,51 @@
+# Aurora 2.0: the Rust core, built beside the Python release (documents/migration/).
+# Python `aurora` stays the stable product and the compatibility oracle until
+# every requirement in documents/migration/03-FEATURE-PARITY.md is verified.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+aurora-core = { path = "crates/aurora-core" }
+aurora-storage = { path = "crates/aurora-storage" }
+aurora-providers = { path = "crates/aurora-providers" }
+aurora-tools = { path = "crates/aurora-tools" }
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+fernet = { version = "0.2", default-features = false, features = ["rustcrypto"] }
+futures-util = "0.3"
+libc = "0.2"
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+fancy-regex = "0.20"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "signal", "sync", "fs", "net"] }
+tokio-util = "0.7"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+# keys.enc's 600 000 PBKDF2 rounds take seconds in an unoptimised test build
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One-line Aurora install: curl -fsSL <raw-url>/bootstrap-install.sh | bash
 # Clones the repo (or updates it, if already present) then runs install.sh,
-# which sets up the venv + PATH symlink. Set AURORA_DIR to change where the
+# which sets up the venv + PATH symlink and builds the Rust core (aurora-rs)
+# when cargo is installed; re-running it after an update rebuilds it. Set AURORA_DIR to change where the
 # repo is cloned (default: ~/Aurora).
 set -euo pipefail
 

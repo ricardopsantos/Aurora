@@ -101,14 +101,27 @@ def _fernet(passphrase: str):
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
     salt_path = aurora_home() / "keys.salt"
+    if not salt_path.exists() and (aurora_home() / _ENC_FILE).exists():
+        # R551: a fresh salt would derive another key and the store could never be opened again; say why instead
+        raise ValueError("keys.salt is missing next to the encrypted key store; restore it from a backup")
     if not salt_path.exists():
         # R201: same atomic+mode path as the store itself. A salt is not
         # secret, but a half-written one is worse than none: it would derive
         # a different key and make an existing store undecryptable.
         write_bytes_atomic(salt_path, os.urandom(16), mode=0o600)
-    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
-                     salt=salt_path.read_bytes(), iterations=600_000)
-    return Fernet(base64.urlsafe_b64encode(kdf.derive(passphrase.encode())))
+    salt = salt_path.read_bytes()
+    import hashlib
+    key = (hashlib.sha256(passphrase.encode()).digest(), salt)
+    hit = _fernet_cache.get("k")
+    if hit and hit[0] == key:                  # R552: 600 000 rounds once, not for each read and save
+        return hit[1]
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000)
+    f = Fernet(base64.urlsafe_b64encode(kdf.derive(passphrase.encode())))
+    _fernet_cache["k"] = (key, f)
+    return f
+
+
+_fernet_cache: dict = {}
 
 
 def _encfile_load(passphrase: str) -> dict:

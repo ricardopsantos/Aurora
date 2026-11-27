@@ -11,6 +11,7 @@ import threading
 import time
 from pathlib import Path
 
+from . import guard
 from . import patch as patchmod
 from .patch import not_found_hint as _not_found_hint
 from .paths import write_text_preserving
@@ -52,7 +53,7 @@ def _private_host(host: str, resolve: bool = True) -> bool:
     fetch re-checks the address it actually connects to."""
     import ipaddress
     import socket
-    host = (host or "").strip("[]").lower()
+    host = (host or "").strip("[]").rstrip(".").lower()     # R565: `localhost.` is localhost
     if not host:
         return True
     if host == "localhost" or host.endswith((".local", ".ts.net", ".internal",
@@ -343,6 +344,19 @@ def find_files(pattern: str, path: str = ".", _cancel=None, **_) -> str:
 GREP_TIMEOUT = 30
 
 
+# R450 (S9): also the ssh agent socket (`ssh-add -L`, `ssh host` as the user), database URLs/DSNs and personal access tokens
+_SECRET_ENV = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE|CREDENTIAL|_KEY$|_PASS$|^SSH_AUTH_SOCK$|"
+                         r"^DATABASE_URL$|_DSN$|^DSN$|(^|_)PAT$)", re.I)
+
+
+def _tool_env() -> dict:
+    """R448: the environment every command the agent runs inherits, minus anything that looks like a secret. The agent's own
+    process keeps its keys (it needs them for the model); the shell commands it runs never see them, so a prompt injection
+    that runs `env` finds nothing to leak."""
+    import os
+    return {k: v for k, v in os.environ.items() if not _SECRET_ENV.search(k)}
+
+
 def grep(pattern: str, path: str = ".", **_) -> str:
     try:
         excludes = [f"--exclude-dir={d}" for d in GREP_PRUNE]
@@ -354,7 +368,7 @@ def grep(pattern: str, path: str = ".", **_) -> str:
         # pipe in a TextIOWrapper whose `.read(n)` blocks until n chars have
         # arrived — see the read loop below for why that broke the timeout.
         proc = subprocess.Popen(
-            ["grep", "-rnIE", *excludes, "--", pattern, str(_resolve(path))],
+            ["grep", "-rnIE", *excludes, *guard.grep_excludes(), "--", pattern, str(_resolve(path))],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         # R96m: read stdout INCREMENTALLY and stop once we have enough,
         # instead of subprocess.run(capture_output=True) — that buffers
@@ -514,6 +528,11 @@ def edit_file(path: str, old: str, new: str, replace_all: bool = False,
     text, crlf = _read_for_edit(p)                              # R269
     n = text.count(old)
     if n == 0:
+        fixed = patchmod.whitespace_edit(text, old, new)        # R457
+        if fixed is not None:
+            write_text_preserving(p, _restore_newlines(fixed, crlf))
+            return (f"[edited {path} — `old` matched once with different "
+                    "indentation/spacing; `new` was re-indented to match]")
         return ("[error: `old` text not found — it must match exactly"
                 + _not_found_hint(text, old) + "]")
     if n > 1 and not replace_all:
@@ -557,6 +576,43 @@ COMMAND_TIMEOUT = 300
 def set_command_timeout(seconds: float) -> None:
     global COMMAND_TIMEOUT
     COMMAND_TIMEOUT = max(1, int(seconds))
+
+
+# R475: the sandbox the model's commands run in (aurora/sandbox.py), or None. SANDBOX_WANTED: a front end asked for
+# one; SANDBOX_PROBLEM: why it could not have it (then the web page asks before every command).
+_SANDBOX = None
+SANDBOX_WANTED = False
+SANDBOX_PROBLEM = ""
+
+
+def enable_sandbox(policy) -> str:
+    """Box the model's commands from now on. Returns "" or why this machine cannot (commands then run unboxed)."""
+    global _SANDBOX, SANDBOX_WANTED, SANDBOX_PROBLEM
+    from . import sandbox
+    SANDBOX_WANTED = True
+    ok, why = sandbox.check(policy)
+    _SANDBOX, SANDBOX_PROBLEM = (policy, "") if ok else (None, why)
+    return SANDBOX_PROBLEM
+
+
+def disable_sandbox() -> None:
+    global _SANDBOX, SANDBOX_WANTED, SANDBOX_PROBLEM
+    _SANDBOX, SANDBOX_WANTED, SANDBOX_PROBLEM = None, False, ""
+
+
+def sandbox_active() -> bool:
+    return _SANDBOX is not None
+
+
+def _popen_command(command: str, workdir: str | None, env: dict, sandbox: bool) -> dict:
+    """Popen keyword arguments for one shell command: in the box when there is one (R475), as before otherwise."""
+    import os
+    if sandbox and _SANDBOX is not None:
+        from . import sandbox as sb
+        ws = os.getcwd()
+        return dict(args=sb.argv(_SANDBOX, command, ws, _shell_executable(), os.path.abspath(workdir or ws)),
+                    shell=False, cwd=workdir, env=sb.env(env))
+    return dict(args=command, shell=True, cwd=workdir, executable=_shell_executable(), env=env)
 
 
 # R194: how much of a command's output is held in memory. `communicate()` had
@@ -614,10 +670,12 @@ COMMAND_RESULT_LIMIT = 50_000
 def _squeeze(out: str, limit: int = COMMAND_RESULT_LIMIT) -> str:
     if len(out) <= limit:
         return out
-    half = limit // 2
-    return (out[:half]
-            + f"\n[... {len(out) - limit} chars omitted from the middle ...]\n"
-            + out[-half:])
+    # R566: the halves add up to `limit` (an odd limit lost a character; limit 1 made `out[-0:]`, the whole text)
+    front = (limit + 1) // 2
+    back = limit - front
+    return (out[:front]
+            + f"\n[... {len(out) - front - back} chars omitted from the middle ...]\n"
+            + (out[len(out) - back:] if back else ""))
 
 
 # R272: how often a running command polls the turn's cancel callback — the
@@ -629,9 +687,18 @@ class CommandCancelled(Exception):
     """Internal: `_run_command_once` saw its cancel callback go true."""
 
 
+def _shell_executable() -> str | None:
+    """R452: the shell every command runs in. `shell=True` alone means
+    `/bin/sh`, which is dash on Debian: no brace expansion, `[[ ]]`, arrays,
+    `source` or `$'…'`. bash when it is installed, else the platform `sh`."""
+    import shutil
+    return shutil.which("bash")
+
+
 def _run_command_once(command: str, workdir: str | None,
                       timeout: float | None = None,
-                      cancel=None) -> tuple[str, int | None]:
+                      cancel=None, on_chunk=None,
+                      env: dict | None = None, sandbox: bool = True) -> tuple[str, int | None]:
     """Run one shell command to completion (or `timeout`, default
     COMMAND_TIMEOUT), process-group-safe (R95c). Returns (raw combined
     stdout+stderr, returncode) — returncode is None on a timeout.
@@ -643,7 +710,12 @@ def _run_command_once(command: str, workdir: str | None,
     (which needs the REAL exit code to decide whether to keep polling —
     parsing that back out of run_command's own display text would be
     fragile and is exactly the kind of thing that silently breaks the
-    moment the text format changes)."""
+    moment the text format changes).
+
+    R452: `on_chunk(text)` (optional) receives each piece of output as it is
+    read, decoded incrementally, so bash mode can show it live; the return
+    value is unchanged. `env` replaces the default `_tool_env()` (bash mode
+    passes its own carried-over environment)."""
     if timeout is None:
         timeout = COMMAND_TIMEOUT
     # R95c: own the whole process GROUP. `subprocess.run(shell=True,
@@ -666,7 +738,8 @@ def _run_command_once(command: str, workdir: str | None,
     # owned by prompt_toolkit): a command that reads stdin — a REPL, a y/N
     # prompt, `git commit` without -m — fought the TUI for keystrokes or
     # blocked until COMMAND_TIMEOUT. EOF is the honest answer: nobody can type.
-    proc = subprocess.Popen(command, shell=True, cwd=workdir,
+    # R475: `sandbox=False` only for what the user typed (bash mode); the model's commands are boxed when a box is on
+    proc = subprocess.Popen(**_popen_command(command, workdir, _tool_env() if env is None else env, sandbox),
                             stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
@@ -690,6 +763,11 @@ def _run_command_once(command: str, workdir: str | None,
     # completion normally. It is deliberately not killed for being verbose —
     # that would change its exit code and lose its side effects.
     out_cap, err_cap = _HeadTail(), _HeadTail()
+    decoders = {}
+    if on_chunk is not None:
+        import codecs
+        decoders = {id(p): codecs.getincrementaldecoder("utf-8")(errors="replace")
+                    for p in (proc.stdout, proc.stderr)}
     timed_out = False
     watch = [proc.stdout, proc.stderr]
     deadline = _time.monotonic() + timeout
@@ -713,6 +791,13 @@ def _run_command_once(command: str, workdir: str | None,
                 watch.remove(pipe)          # EOF on this pipe
                 continue
             (out_cap if pipe is proc.stdout else err_cap).add(chunk)
+            if on_chunk is not None:
+                piece = decoders[id(pipe)].decode(chunk)
+                if piece:
+                    try:
+                        on_chunk(piece)
+                    except Exception:
+                        pass         # a display callback must never stop the drain
 
     def _decoded() -> str:
         return out_cap.text() + err_cap.text()
@@ -812,6 +897,7 @@ class _BackgroundJob:
         self.truncated = False
         self.done = False
         self.returncode: int | None = None
+        self.lingering = False                # R567: a process it started still holds its output open
 
 
 def _bg_drain(job: "_BackgroundJob") -> None:
@@ -821,9 +907,22 @@ def _bg_drain(job: "_BackgroundJob") -> None:
     records its exit code once both pipes hit EOF and the process reaps."""
     import os
     import select
+    # R567: the job is done when its shell exits, not when its pipes close: `server & echo started` left a child
+    # holding them, so the job read "still running" forever and kept one of the MAX_BACKGROUND_JOBS slots. Output
+    # still arriving after the exit is kept; a short grace lets the last lines land first.
     watch = [job.proc.stdout, job.proc.stderr]
-    while watch:
-        ready, _, _ = select.select(watch, [], [])
+    exited_at = None
+    while watch or not job.done:
+        if exited_at is None and job.proc.poll() is not None:
+            exited_at = time.monotonic()
+        if exited_at is not None and not job.done and (not watch or time.monotonic() - exited_at >= _BG_EXIT_GRACE):
+            with job.lock:
+                job.done, job.returncode, job.lingering = True, job.proc.returncode, bool(watch)
+            continue
+        if not watch:
+            job.proc.wait()
+            continue
+        ready, _, _ = select.select(watch, [], [], 0.1 if exited_at is not None else 0.25)
         for pipe in ready:
             chunk = os.read(pipe.fileno(), 65536)
             if not chunk:
@@ -842,15 +941,16 @@ def _bg_drain(job: "_BackgroundJob") -> None:
                         job.err_len += len(chunk)
                     else:
                         job.truncated = True
-    job.proc.wait()
     for pipe in (job.proc.stdout, job.proc.stderr):
         try:
             pipe.close()
         except OSError:
             pass
     with job.lock:
-        job.done = True
-        job.returncode = job.proc.returncode
+        job.lingering = False
+
+
+_BG_EXIT_GRACE = 0.3     # R567: seconds output may still arrive after the job's shell exited
 
 
 def _bg_output(job: "_BackgroundJob") -> str:
@@ -889,7 +989,7 @@ def _start_background(command: str, workdir: str | None) -> str:
                     "one finish, before starting another]")
         job_id = f"bg{_BG_NEXT_ID}"
         _BG_NEXT_ID += 1
-    proc = subprocess.Popen(command, shell=True, cwd=workdir,
+    proc = subprocess.Popen(**_popen_command(command, workdir, _tool_env(), True),   # R452, R475
                             stdin=subprocess.DEVNULL,           # R271
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
@@ -913,7 +1013,7 @@ def _kill_all_background_jobs() -> None:
         jobs = list(_BG_JOBS.values())
     for job in jobs:
         with job.lock:
-            if job.done:
+            if job.done and not job.lingering:
                 continue
         _kill_group(job.proc, job.pgid)
 
@@ -970,7 +1070,7 @@ def cancel_command(job_id: str, **_) -> str:
     if job is None:
         return f"[error: no such background job: {job_id}]"
     with job.lock:
-        if job.done:
+        if job.done and not job.lingering:
             return f"[{job_id}] already finished (exit {job.returncode}) — nothing to cancel"
     _kill_group(job.proc, job.pgid)
     return f"[{job_id}] kill signal sent"
@@ -1380,6 +1480,9 @@ _CANCELLABLE = {"run_command", "wait_until", "find_files"}   # R292
 
 
 def run_tool(name: str, args: dict, cancel=None) -> str:
+    blocked = guard.check(name, args)       # R450: web mode only
+    if blocked:
+        return blocked
     for table in (RUNNERS, _EXTENSION_RUNNERS):
         if name in table:
             try:

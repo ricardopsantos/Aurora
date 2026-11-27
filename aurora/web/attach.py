@@ -7,14 +7,18 @@ import re
 import zipfile
 from xml.etree import ElementTree as ET
 
+from .. import service
+
 MAX_ATTACH = 20_000_000       # bytes accepted per file
 MAX_TEXT = 150_000            # characters of extracted text per file
 MAX_ZIP_PART = 30_000_000     # uncompressed size of one office part (zip-bomb guard)
+MAX_ZIP_TOTAL = 100_000_000   # R450 (P1): ... and of all the parts of one office file together
 IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
 # R420: music and video are stored unchanged, never read into the chat; the agent gets the path (e.g. to tag music)
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".oga", ".opus", ".wma", ".aiff", ".aif"}
 VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi"}
 MAX_MEDIA = 200_000_000       # bytes accepted for one audio/video file (it is held in memory once while saved)
+MAX_PIXELS = 50_000_000       # R520: a picture larger than this is refused before it is decoded (a decompression bomb)
 MAX_SIDE = 1568               # longest edge sent to the model; the original on the user's machine is untouched
 
 
@@ -25,6 +29,14 @@ class Unsupported(Exception):
 def _ext(name: str) -> str:
     m = re.search(r"\.[A-Za-z0-9]+$", name)
     return m.group(0).lower() if m else ""
+
+
+def _open_zip(data: bytes) -> zipfile.ZipFile:
+    z = zipfile.ZipFile(io.BytesIO(data))
+    if sum(i.file_size for i in z.infolist()) > MAX_ZIP_TOTAL:
+        z.close()
+        raise Unsupported("the file is too large once unpacked")
+    return z
 
 
 def _zip_xml(z: zipfile.ZipFile, part: str) -> ET.Element:
@@ -39,7 +51,7 @@ def _local(tag: str) -> str:
 
 
 def _docx(data: bytes) -> str:
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
+    with _open_zip(data) as z:
         root = _zip_xml(z, "word/document.xml")
     paras = []
     for p in root.iter():
@@ -50,18 +62,21 @@ def _docx(data: bytes) -> str:
 
 
 def _pptx(data: bytes) -> str:
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
+    with _open_zip(data) as z:
         slides = sorted((n for n in z.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
                         key=lambda n: int(re.search(r"(\d+)\.xml", n).group(1)))
-        out = []
+        out, size = [], 0
         for i, n in enumerate(slides, 1):
+            if size > MAX_TEXT:                    # R523: past the cut, the rest is never shown
+                break
             texts = [t.text or "" for t in _zip_xml(z, n).iter() if _local(t.tag) == "t"]
             out.append(f"--- slide {i} ---\n" + "\n".join(x for x in texts if x))
+            size += len(out[-1]) + 1
     return "\n".join(out)
 
 
 def _xlsx(data: bytes) -> str:
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
+    with _open_zip(data) as z:
         shared = []
         if "xl/sharedStrings.xml" in z.namelist():
             for si in _zip_xml(z, "xl/sharedStrings.xml"):
@@ -72,8 +87,10 @@ def _xlsx(data: bytes) -> str:
                 names[i] = sh.get("name", f"sheet{i}")
         sheets = sorted((n for n in z.namelist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)),
                         key=lambda n: int(re.search(r"(\d+)\.xml", n).group(1)))
-        out = []
+        out, size = [], 0
         for n in sheets:
+            if size > MAX_TEXT:                    # R523: the text is cut at MAX_TEXT anyway: stop parsing sheets
+                break
             idx = int(re.search(r"(\d+)\.xml", n).group(1))
             out.append(f"--- sheet {names.get(idx, idx)} ---")
             for row in _zip_xml(z, n).iter():
@@ -90,11 +107,12 @@ def _xlsx(data: bytes) -> str:
                     else:
                         cells.append(v.text if v is not None and v.text else "")
                 out.append("\t".join(cells).rstrip("\t"))
+                size += len(out[-1]) + 1
     return "\n".join(out)
 
 
 def _odf(data: bytes) -> str:
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
+    with _open_zip(data) as z:
         root = _zip_xml(z, "content.xml")
     out = []
     for e in root.iter():
@@ -121,9 +139,8 @@ def _pdf(data: bytes) -> str:
 
 def _html(data: bytes) -> str:
     t = data.decode("utf-8", "replace")
-    t = re.sub(r"(?is)<(script|style)\b.*?</\1>", "", t)
-    t = re.sub(r"(?i)<br\s*/?>|</(p|div|li|tr|h\d)>", "\n", t)
-    return html.unescape(re.sub(r"<[^>]+>", "", t))
+    # R450 (B2): one forward pass; the regexes that were here go quadratic on unclosed tags (64 kB took 4.3 s)
+    return html.unescape(service.html_to_plain(t))
 
 
 def _rtf(data: bytes) -> str:
@@ -152,7 +169,12 @@ def _image(data: bytes, name: str) -> str:
     except ImportError:
         return f"data:{mime};base64," + base64.b64encode(data).decode()
     try:
-        im = Image.open(io.BytesIO(data))
+        im = Image.open(io.BytesIO(data))          # lazy: reads the header only
+    except Exception:
+        raise Unsupported("the picture could not be read")
+    if im.size[0] * im.size[1] > MAX_PIXELS:       # R520: checked before the pixels are decoded
+        raise Unsupported(f"the picture is too large ({im.size[0]}×{im.size[1]}; at most {MAX_PIXELS // 1_000_000} megapixels)")
+    try:
         im.load()
     except Exception:
         raise Unsupported("the picture could not be read")
@@ -225,12 +247,9 @@ def outputs_dir():
     return d
 
 
-def save_original(name: str, data: bytes) -> str:
-    """R406: the attached bytes, unchanged (EXIF and all), as a file the agent's tools can open; returns its path.
-    Files in input older than INPUT_KEEP_DAYS are removed on the way."""
-    import os
+def _input_folder():
+    """R406: the input folder, created; files in it older than INPUT_KEEP_DAYS are removed on the way."""
     import time
-    import uuid
     d = input_dir()
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
     cut = time.time() - INPUT_KEEP_DAYS * 86400
@@ -240,11 +259,50 @@ def save_original(name: str, data: bytes) -> str:
                 old.unlink()
         except OSError:
             pass
+    return d
+
+
+def _input_name(d, name: str):
+    import time
+    import uuid
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)[-80:] or "file"
-    f = d / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}-{safe}"
+    return d / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}-{safe}"
+
+
+def save_original(name: str, data: bytes) -> str:
+    """R406: the attached bytes, unchanged (EXIF and all), as a file the agent's tools can open; returns its path."""
+    import os
+    f = _input_name(_input_folder(), name)
     fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as out:
         out.write(data)
+    return str(f)
+
+
+STREAM_CHUNK = 1 << 20
+
+
+def save_stream(name: str, rfile, n: int) -> str:
+    """R510: an audio/video upload of `n` bytes copied from `rfile` to input in 1 MB chunks, so a 200 MB file never
+    sits in memory. A short read (the client went away) removes the partial file and raises OSError."""
+    import os
+    f = _input_name(_input_folder(), name)
+    fd = os.open(f, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            left = n
+            while left > 0:
+                got = rfile.read(min(left, STREAM_CHUNK))
+                if not got:
+                    raise OSError("the upload ended early")
+                out.write(got)
+                left -= len(got)
+    except BaseException:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+        raise
     return str(f)
 
 
@@ -253,9 +311,16 @@ def files(kind: str = "input") -> list:
     d = folder(kind)
     if not d.is_dir():
         return []
-    out = [{"name": f.name, "path": str(f), "size": f.stat().st_size, "mtime": int(f.stat().st_mtime),
-            "image": _ext(f.name) in IMAGE_TYPES, "preview": preview_kind(f.name)}
-           for f in d.iterdir() if f.is_file()]
+    out = []
+    for f in d.iterdir():
+        try:                                   # R450 (B3): a file deleted while the page lists them is skipped, not a 500
+            if not f.is_file():
+                continue
+            st = f.stat()
+        except OSError:
+            continue
+        out.append({"name": f.name, "path": str(f), "size": st.st_size, "mtime": int(st.st_mtime),
+                    "image": _ext(f.name) in IMAGE_TYPES, "preview": preview_kind(f.name)})
     return sorted(out, key=lambda u: (-u["mtime"], u["name"]))
 
 
@@ -280,11 +345,33 @@ def file_path(name: str, kind: str = "input"):
     return f if f.parent == d and f.is_file() else None   # resolve(): a symlink out of the folder is refused
 
 
+_THUMBS: dict[tuple, bytes] = {}
+THUMB_CACHE = 256                 # R521: thumbnails kept, keyed by file, mtime, size and side
+
+
 def thumbnail(f, side: int = 96):
-    """R410: a small preview (PNG bytes) of a saved picture, or None; the saved file itself is never changed."""
+    """R410: a small preview (PNG bytes) of a saved picture, or None; the saved file itself is never changed.
+    R521: kept per file version, so opening Files again does not decode every picture again; a JPEG is decoded at a
+    reduced scale (draft), and a picture over MAX_PIXELS gets no preview instead of being decoded."""
     ext = _ext(f.name)
     if ext not in IMAGE_TYPES and ext != ".pdf":
         return None
+    try:
+        st = f.stat()
+    except OSError:
+        return None
+    key = (str(f), st.st_mtime_ns, st.st_size, side)
+    if key in _THUMBS:
+        return _THUMBS[key]
+    out = _thumbnail(f, ext, side)
+    if out is not None:
+        while len(_THUMBS) >= THUMB_CACHE:
+            _THUMBS.pop(next(iter(_THUMBS)))
+        _THUMBS[key] = out
+    return out
+
+
+def _thumbnail(f, ext: str, side: int):
     try:
         from PIL import Image, ImageOps
         if ext == ".pdf":                    # R414: the first page stands for the document
@@ -293,7 +380,12 @@ def thumbnail(f, side: int = 96):
                 return None
             im = Image.open(io.BytesIO(page))
         else:
-            im = ImageOps.exif_transpose(Image.open(f))
+            im = Image.open(f)
+            if im.size[0] * im.size[1] > MAX_PIXELS:
+                return None
+            if im.format == "JPEG":
+                im.draft("RGB", (side * 2, side * 2))
+            im = ImageOps.exif_transpose(im)
         im.thumbnail((side, side))
         buf = io.BytesIO()
         im.convert("RGBA").save(buf, "PNG")
@@ -334,10 +426,13 @@ def preview_text(f) -> dict:
     kind = preview_kind(f.name)
     if kind not in ("markdown", "document", "text"):
         raise Unsupported("no text preview for this type")
-    data = f.read_bytes()
     if kind == "document":
-        text = process(f.name, data)["text"]
+        if f.stat().st_size > MAX_ATTACH:          # R522: refused before it is read, not after
+            raise Unsupported(f"larger than {MAX_ATTACH // 1_000_000} MB")
+        text = process(f.name, f.read_bytes())["text"]
     else:
+        with open(f, "rb") as fh:                  # R522: only what the preview can show is read, not the whole file
+            data = fh.read(PREVIEW_TEXT_MAX * 4 + 1)
         text = _plain(data[:PREVIEW_TEXT_MAX * 4])
     return {"kind": "markdown" if kind == "markdown" else "text", "text": text[:PREVIEW_TEXT_MAX], "cut": len(text) > PREVIEW_TEXT_MAX}
 
@@ -402,10 +497,15 @@ def media_text(kind: str, name: str, size: int, path: str) -> str:
             "(e.g. read or write its tags), and save changed copies under workspace/outputs.]")
 
 
+def clean_name(name: str) -> str:
+    """The upload's file name as shown and stored: no control characters or slashes, at most 120 characters."""
+    return re.sub(r"[\x00-\x1f/\\]", "_", name or "file")[:120] or "file"
+
+
 def process(name: str, data: bytes) -> dict:
     """{kind:'text', name, text, cut}, {kind:'image', name, data_url} or {kind:'media', name, media} (R420);
     raises Unsupported with a plain reason."""
-    name = re.sub(r"[\x00-\x1f/\\]", "_", name or "file")[:120] or "file"
+    name = clean_name(name)
     if not data:
         raise Unsupported("the file is empty")
     if len(data) > max_attach(name):

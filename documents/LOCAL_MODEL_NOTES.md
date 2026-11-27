@@ -4,8 +4,10 @@ The detail behind the quick start in the [README](../README.md), for anyone
 running a local llama.cpp or Ollama server.
 
 - Aurora starts on the last model you used on this machine (saved in
-  `AURORA_HOME/state.yaml`). The first time, it starts on the first entry
-  under `models:`, which in `config.yaml.example` is the local model.
+  `AURORA_HOME/state.yaml`). The first time, the terminal starts with no
+  model and asks you to pick one with `/model` (R578); piped input, `-t` and
+  `--web` use the first entry under `models:`, which in
+  `config.yaml.example` is the local model.
 - `model: local` means whatever model your local server has loaded right now.
 - Every request shows a timed row in the chat (`✻ thinking… Ns`, then
   `thought for Ns`), even for models that don't produce reasoning. When there

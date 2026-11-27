@@ -197,3 +197,76 @@ Part of the index in [`../REQUIREMENTS.md`](../REQUIREMENTS.md); numbers are sha
    `test_an_already_tracked_file_that_grows_is_dropped`,
    `test_one_status_scan_per_checkpoint`.
 
+
+- **R479 — The Rust core reads and writes Aurora's files in Python's formats (owner, 2026-11-24).**
+  `aurora-storage` finds AURORA_HOME the same way (`$AURORA_HOME`, then `~/.aurora-path`, then `~/.aurora`) and makes it
+  private (R450); loads `config.yaml` with `${VAR}` expansion and `config.local.yaml` laid over it (maps merge, lists
+  replace) to the same parsed value as `aurora.config.load_config`; writes session JSONL line by line exactly as
+  Python does (`json.dumps(..., ensure_ascii=False)` spacing, an isoformat UTC `ts`, a lock per append, a new part
+  past 5 MiB), so `Session.iter_records`, `usage_by_model`, `export_markdown` and `latest_session_id` read a Rust
+  session unchanged; and opens `keys.enc` (Fernet, PBKDF2-SHA256 600 000 rounds, `keys.salt`) written by
+  `aurora.keystore`, asking for the passphrase at most once. Environment variables win over the file, as in Python.
+  The OS keyring and saving keys are not ported yet. YAML 1.1 words (`yes`, `on`) are strings here and booleans in
+  PyYAML; `config.yaml.example` parses the same. Tests: `cargo test -p aurora-storage` (a `keys.enc` fixture made by
+  Python's own code); `tests/test_rust_compat_r482.py` (config and sessions, Python as the oracle).
+
+- **R487 — The Rust core resumes a Python session (R20, R128, R170c, R248) (owner, 2026-11-26).**
+  `aurora-rs --continue` picks the session whose freshest log part changed last; `--resume ID` picks one by id and
+  refuses an unknown id with exit 2. The history is rebuilt as Python's `Engine.resume_from` does it: flat
+  `user`/`assistant` text, same-role neighbours merged, a dangling last prompt dropped, and new turns appended to the
+  same log (no fork). Tests: `cargo test -p aurora-storage session`; `tests/test_rust_resume_r487.py` (both Auroras
+  resume the same seeded log and send the model the same messages).
+
+- **R488 — The Rust core reads and trusts bootstrap prompts as Python does (R286) (owner, 2026-11-26).**
+  `aurora-storage::bootstrap` ports `aurora/bootstrap.py`'s storage half: a project's `.aurora/bootstrap.md` wins over
+  `AURORA_HOME/bootstrap.md`, an empty file is skipped, a URL-sourced prompt keeps its URL in the `.source` sidecar,
+  saves are atomic, and a project prompt needs trust per exact content in `trusted_bootstraps.json` (byte-identical to
+  the file Python writes). Downloading a URL and the startup question belong to the front ends (phase 6). Tests:
+  `cargo test -p aurora-storage bootstrap`; `tests/test_rust_bootstrap_r488.py` (each side honours the other's trust).
+
+- **R492 — The Rust core folds history as Python does (R14, R118, R154, R156, R159, R202, R222, R229) (owner, 2026-11-26).**
+  `aurora-core::compact` ports `compact.py` (cut only at a user message or a tool-calling assistant message, flatten,
+  head-and-tail clip with the marker's length reserved). The agent keeps Python's live gauge: the last request's prompt
+  and reply, plus tool output estimated at 4 characters a token, and a resumed history counted the same way. At or
+  above `runtime.auto_compact_threshold_pct` (default 80) of the context limit, it folds before a new prompt and,
+  mid-turn, at a round boundary before the next request: it asks the current model for a summary (no tools, no system
+  prompt) of everything older than `compact_keep_recent_tokens`, falls back to a clipped flatten when that fails, and
+  logs the same `compact` record. The context limit is the model's entry in `remote_context_limits.json`, else the
+  provider's `context_limit:`, else 128 000; llama.cpp's live `/props` size is not read yet. Bad numbers in the config
+  fall back to the defaults with Python's warning. Tests: `cargo test -p aurora-core compact`;
+  `tests/test_rust_compact_r492.py` (fold before the prompt, failed summary, mid-turn fold: same requests, same record).
+
+- **R494 — The Rust core checkpoints approved mutations as Python does (R47, R151, R181, R193, R273, R275, R296, R450) (owner, 2026-11-26).**
+  `aurora-storage::rewind` ports the turn-time half of `aurora/rewind.py`. Right before an approved or allowlisted
+  gated call runs, the work tree is committed to the same shadow repository (`AURORA_HOME/checkpoints/<sha1(cwd)[:16]>`)
+  with the same `[tool] prompt` label, excludes and large-file handling. A call with a `path` snapshots that file's
+  bytes into `last-mutation.json`; any other gated call clears it. The home folder and `/` get no checkpoints. Pruning
+  every 50 checkpoints and the daily sweep of stale repos are ported too. `/rewind`, `/undo` and `/diff` come with the
+  front ends, and Python's versions already work on what the Rust core recorded. Tests: `cargo test -p aurora-storage
+  rewind`; `tests/test_rust_rewind_r494.py` (same commits, tree, excludes and snapshot as Python; Python's `undo`
+  reverts a Rust write byte for byte; a command clears the file snapshot).
+
+- **R498 — config.yaml's YAML 1.1 booleans read as in PyYAML; deliberate differences listed (review note N3) (owner, 2026-11-26).**
+  `serde_yaml_ng` reads YAML 1.2, so an unquoted `yes`/`no`/`on`/`off` used to be a string in Rust and a boolean in
+  Python. This mattered: `runtime.sandbox: off` is `False` in Python, which `sandbox.mode_from` turns into `web`
+  (boxing on), but Rust read the string and turned the sandbox off. Those words in values are now booleans unless
+  quoted. Keys stay strings. `documents/migration/06-DELIBERATE-DIFFERENCES.md` lists every place the Rust core
+  differs from Python on purpose (D1–D7), each with the test that pins it. Tests: `cargo test -p aurora-storage
+  yaml11`; `tests/test_rust_compat_r482.py::test_config_parses_like_python` (the words added to the compared config).
+
+- **R503 — The nightly run compares both cores every night (review note N5) (owner, 2026-11-26).**
+  `tools/nightly/` holds `aurora-nightly.sh` and a systemd user service and timer, 03:30 every night, catching up
+  after downtime. It pulls `aurora-2` (or tests a dirty tree as it is), builds, runs clippy, the Rust tests and the
+  full Python suite, whose differential tests run the same fixtures through Python and Rust, then the live tests (R502)
+  when `~/.config/aurora-nightly.env` turns them on. One log per night in `~/.cache/aurora-nightly`, kept for 30
+  nights, ending `result: PASS|FAIL`; a failed night fails the unit. Test: `tests/test_nightly_r503.py` (the script runs
+  each step, records a failing one, and exits non-zero; the timer is daily and persistent).
+
+- **R508 — Aurora 2.0: the Rust loop is the default (phase 7) (owner, 2026-11-26).**
+  `rustcore.wanted` is true unless `runtime.core: python` (or `AURORA_CORE=python`) asks for the Python loop. A turn
+  the Rust core cannot take (plan mode, pictures, no `aurora-rs`) runs on Python quietly; only a user who asked for
+  `core: rust` is told. `install.sh` builds `aurora-rs` (`cargo build --release`) when a Rust toolchain is there and
+  says that Aurora runs its Python loop when it is not. The test suite's turns run on the Rust loop by default
+  (direct loop calls too, R507), and the nightly's second run forces `AURORA_CORE=python`, so both loops stay tested
+  for the release that keeps Python's. Tests: `tests/test_rust_default_r508.py` (the default, the opt-out, the quiet
+  fallback, the told fallback); the whole suite on each core.

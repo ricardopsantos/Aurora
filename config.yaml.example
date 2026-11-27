@@ -23,7 +23,8 @@ providers:
     type: ollama
     base_url: http://localhost:11434/v1
 
-# first entry = the model Aurora starts on
+# first entry = the default for -t, piped input and --web; the terminal asks
+# you to pick a model the first time (R578) and remembers it
 models:
   - provider: local
     model: local            # whatever your local server currently has loaded
@@ -40,6 +41,13 @@ models:
     tools: true
 
 runtime:
+  # R508 (Aurora 2.0): which agent loop runs each turn. `rust` (the default)
+  # uses the `aurora-rs` core that install.sh builds; `python` keeps the
+  # Python loop. Without `aurora-rs` Aurora uses the Python loop anyway
+  # (looked up as AURORA_RS, then PATH, then target/release, then target/debug).
+  # The AURORA_CORE environment variable overrides this. Setting `rust`
+  # explicitly also shows a notice whenever a turn falls back to Python.
+  # core: python
   max_iterations: 10
   web_search: true
   timeout: 300
@@ -84,6 +92,19 @@ runtime:
   # SHA-256 hashes of secret-scan hits you chose to allow. Managed by
   # `/redact allowlist [clear]`; never put the secrets themselves here.
   secret_allowlist: []
+  # R475: run the model's shell commands in a sandbox (bubblewrap on Linux,
+  # sandbox-exec on macOS): the machine read-only apart from the workspace,
+  # Aurora's workspace/ folder, ~/.cache and a private /tmp; ssh keys,
+  # credentials, Aurora's keys, the Docker socket and the user's D-Bus hidden.
+  # web: the web page's commands (default); all: the terminal's too; off.
+  # Commands you type in bash mode are never sandboxed.
+  sandbox: web
+  # false: no network inside the sandbox at all.
+  sandbox_network: true
+  # More folders the sandbox may write, e.g. [~/repositories].
+  sandbox_writable: []
+  # More files or folders it must not see, e.g. [~/.config/my-app].
+  sandbox_hide: []
 
 # R119: MCP (Model Context Protocol) servers, stdio transport only. Each
 # server's tools are exposed to the model as mcp_<name>_<tool>, gated by the
@@ -113,6 +134,14 @@ runtime:
 #     command: /path/to/AgenticContext/mcp_server/.venv/bin/python
 #     args: ["-m", "agentic_context_mcp.server", "/path/to/.agentic_context"]
 #     timeout: 45
+#   - name: memory          # only the tools you list are shown to the model (R449);
+#     command: /path/to/memory-server   # leave `tools:` out to expose them all
+#     tools: [remember, recall]
+#   - name: mnemosyne      # optional episodic memory, see documents/MCP_SERVERS.md
+#     command: /path/to/mnemosyne-venv/bin/mnemosyne
+#     args: ["mcp"]
+#     timeout: 90
+#     tools: [mnemosyne_remember, mnemosyne_recall, mnemosyne_get, mnemosyne_forget]
 
 # `aurora key set <VAR>` offers to run these (shown first, needs a "y") and
 # stores the printed value in the keystore. No secret lives in this file.

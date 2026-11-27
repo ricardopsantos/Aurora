@@ -60,6 +60,8 @@ PATTERNS: list[tuple[str, re.Pattern]] = [
                 r"[A-Za-z0-9_]*(?:API[_-]?KEY|SECRET|TOKEN|PASSWORD|PASSWD)"
                 r"[A-Za-z0-9_]*"
                 r"|[A-Za-z0-9_]+PWD[A-Za-z0-9_]*"
+                # R450 (B5): names that END in PASS (MYAPP_DBPASS=), as the command env filter already treats _PASS
+                r"|(?-i:[A-Z0-9_]+PASS|[a-z0-9_]+_pass)(?=[ \t]*=)"
                 r")[ \t]*=[ \t]*\S+")),
 ]
 
@@ -227,14 +229,16 @@ def scan(text: str, allowlist: set[str] | None = None) -> list[Match]:
         guard = _LITERAL_GUARD.get(name)
         if guard is not None and not any(lit in text for lit in guard):
             continue
-        for m in pat.finditer(text):
+        # R450 (S2): /proc/<pid>/environ separates entries with NUL, not newline, so the line-anchored
+        # "Env credential" pattern saw one giant line. Same length, so offsets stay valid.
+        for m in pat.finditer(text.replace("\0", "\n") if name == "Env credential" and "\0" in text else text):
             s, e = m.span()
             if _overlaps(s, e):
                 continue   # overlaps an earlier match — skip, don't double-count
             if name == "Env credential" and _is_code_value(m.group(0)):
                 continue
             _claim(s, e)
-            found.append(Match(name, s, e, m.group(0)))
+            found.append(Match(name, s, e, text[s:e]))
 
     for m in _CANDIDATE_RE.finditer(text):
         s, e = m.span()

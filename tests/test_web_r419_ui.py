@@ -18,6 +18,7 @@ def test_r419_prev_next_wrap_and_esc_chain(browser, app, w, h, mobile):
     page.on("pageerror", lambda e: errors.append(str(e)))
     page.add_init_script("localStorage.setItem('aurora_web_token', 't0k');")
     page.goto(app.base + "/"); page.wait_for_selector("#model:not(:empty)")
+    page.wait_for_function("document.getAnimations().length === 0")   # R451: let the sidebar finish sliding before asking if it is visible
     if mobile and not page.is_visible("#files-btn"):
         page.click("#sb-toggle")
     page.click("#files-btn"); page.click("#fl-tabs .tab[data-kind=outputs]")
@@ -39,10 +40,11 @@ def test_r419_prev_next_wrap_and_esc_chain(browser, app, w, h, mobile):
     page.wait_for_function(f"document.getElementById('pv-h').textContent === '{order[2]}'")
     page.keyboard.press("Escape")                                        # 1st Esc: the preview only
     page.wait_for_selector("#preview", state="hidden")
-    assert page.is_visible("#files") and "Back to chat" in page.locator("#new-chat").inner_text()
+    assert page.is_visible("#files") and "Back to chat" in page.locator("#new-chat").text_content()
     page.keyboard.press("Escape")                                        # 2nd Esc: back to the chat
     page.wait_for_selector("#log", state="visible")
-    assert "New Chat" in page.locator("#new-chat").inner_text()
+    assert "New Chat" in page.locator("#new-chat").text_content()
+    page.wait_for_function("document.getAnimations().length === 0")   # R451: let the sidebar finish sliding before asking if it is visible
     if mobile and not page.is_visible("#notes-btn"):
         page.click("#sb-toggle")
     page.click("#notes-btn"); page.wait_for_selector("#notes.panel[open]")

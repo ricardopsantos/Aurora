@@ -1520,6 +1520,7 @@ def _cb(approve_ans="y", cont=True, log=None, secret_ans=None):
 
 
 # ── R154: mid-turn compaction ───────────────────────────────────────────────
+@pytest.mark.python_loop  # Python's mid-turn fold hook; Rust folds itself (test_rust_compact_r492)
 def test_maybe_compact_runs_between_rounds_and_never_before_the_first():
     """The callback exists so the fold happens BEFORE the request that would
     overflow. It must not fire on the first request of a turn (nothing new to
@@ -1540,6 +1541,7 @@ def test_maybe_compact_runs_between_rounds_and_never_before_the_first():
     assert calls_at == [1, 2]
 
 
+@pytest.mark.python_loop  # Python's mid-turn fold hook; Rust folds itself (test_rust_compact_r492)
 def test_a_mid_turn_fold_is_seen_by_the_rest_of_the_turn(tmp_path, monkeypatch):
     """The subtle half: `run_turn` holds the SAME list object for the whole
     turn, so a compaction that REBINDS engine.messages would leave the loop
@@ -1688,6 +1690,7 @@ def test_agent_runs_tool_then_finishes(tmp_path):
     assert prov.calls == 2
 
 
+@pytest.mark.python_loop  # fakes Python's clock; Rust measures its own (R499 done payload)
 def test_turn_records_the_last_successful_request_latency(monkeypatch):
     """/model's picker (feature request, 2026-07-27) reads a cached latency
     from the session log — it has to actually be measured somewhere first.
@@ -1701,6 +1704,7 @@ def test_turn_records_the_last_successful_request_latency(monkeypatch):
     assert t.last_request_latency == pytest.approx(0.25)
 
 
+@pytest.mark.python_loop  # fakes Python's clock; Rust measures its own (R499 done payload)
 def test_turn_latency_is_the_last_round_not_the_sum(monkeypatch):
     """A multi-round turn's latency must reflect the LAST completed round —
     "how is this model doing right now" — not an accumulated total across
@@ -1736,6 +1740,7 @@ def test_agent_loop_nudge_fires_on_a_true_repeat(tmp_path, monkeypatch):
     assert any("you already ran this exact call" in r for r in results)
 
 
+@pytest.mark.python_loop  # fakes Python's tool output; Rust: agent::tests::the_repeat_nudge_needs_the_same_call_and_the_same_result
 def test_agent_loop_nudge_does_not_fire_when_the_result_changed(tmp_path, monkeypatch):
     """The same call two rounds running, but the file/command changed in
     between (write -> test -> fix -> re-test) — the nudge must NOT claim an
@@ -1771,6 +1776,7 @@ def test_agent_loop_stops_a_model_that_ignores_the_repeat_nudge(monkeypatch):
     assert len(results) == agent.REPEAT_ROUNDS_STOP + 1
 
 
+@pytest.mark.python_loop  # fakes Python's clock; Rust measures its own (R507)
 def test_gen_speed_counts_from_first_streamed_token(monkeypatch):
     """R352: generation seconds start at the first streamed chunk, so a slow
     prompt-processing phase does not drag the tokens/second down."""
@@ -1975,6 +1981,7 @@ def test_agent_deny_option_persists_and_stops_future_prompts(tmp_path):
 
 
 # ── R103: "explain" at the approval gate ───────────────────────────────────
+@pytest.mark.python_loop  # D8: explain is not in aurora-core/1
 def test_agent_explain_option_asks_the_model_then_reasks(tmp_path):
     """Choosing "e" must get a model-written explanation (a separate,
     tool-free completion), notify() it, then re-present the SAME
@@ -2005,6 +2012,7 @@ def test_agent_explain_option_asks_the_model_then_reasks(tmp_path):
     assert ("notify", "this writes 'hi' to o.txt") in log
 
 
+@pytest.mark.python_loop  # D8: explain is not in aurora-core/1
 def test_agent_explain_can_loop_more_than_once(tmp_path):
     """Nothing caps re-asking "e" multiple times in a row before a real
     decision is made."""
@@ -2204,8 +2212,11 @@ def test_agent_scans_write_file_content_and_redacts_before_the_write(tmp_path):
     # the SAME ToolCall object is what a real provider's assistant_message()
     # would have serialized into history — mutated in place before that
     # happens, so the stored record never carried the raw secret either
-    assert secret not in call.arguments["content"]
-    assert "<secret>" in call.arguments["content"]
+    # (on the Rust loop the object stays Python's; the history is what counts)
+    from tests.conftest import on_rust_loop
+    stored = json.dumps(msgs) if on_rust_loop() else call.arguments["content"]
+    assert secret not in stored
+    assert "<secret>" in stored
 
 
 def test_agent_write_file_secret_stop_never_writes(tmp_path):
@@ -3406,8 +3417,12 @@ def test_an_exception_escaping_run_turn_still_pops_the_user_message(
             return 0.0
 
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _Prov())
-    with pytest.raises(ProviderError):
+    from aurora import rustcore
+    if rustcore.wanted(e):              # D9: the Rust loop reports the failed retry as a provider error instead
         e.send("q1", _FEQuiet())
+    else:
+        with pytest.raises(ProviderError):
+            e.send("q1", _FEQuiet())
     assert [m["role"] for m in e.messages] == []
 
 
@@ -3932,6 +3947,7 @@ def test_context_stats_never_blocks_on_a_slow_backend(tmp_path, monkeypatch):
 
     e = _mk_engine(tmp_path, monkeypatch)
     monkeypatch.setattr(e, "_provider_for", lambda *a, **k: _SlowProv())
+    before = threading.active_count()      # other tests may leave daemon threads behind
 
     t0 = time.monotonic()
     s = e.context_stats()
@@ -3943,7 +3959,7 @@ def test_context_stats_never_blocks_on_a_slow_backend(tmp_path, monkeypatch):
     # repeated renders while it is in flight stay fast and spawn no new probes
     for _ in range(5):
         assert e.context_stats().limit == 8_000
-    assert threading.active_count() < 20
+    assert threading.active_count() <= before + 2       # one probe, not one per render
 
     # once it lands, the live value takes over
     deadline = time.monotonic() + 6
@@ -4468,8 +4484,12 @@ def test_malformed_retry_error_leaves_no_nudge_in_history():
 
     from aurora.providers.base import ProviderError
     msgs = [{"role": "user", "content": "hi"}]
-    with pytest.raises(ProviderError):
+    from tests.conftest import on_rust_loop
+    if on_rust_loop():                                   # D9: reported as a provider error, not raised
         agent.run_turn(MalformThenError(), "m", msgs, "s", _cb(), 5, True)
+    else:
+        with pytest.raises(ProviderError):
+            agent.run_turn(MalformThenError(), "m", msgs, "s", _cb(), 5, True)
     # the corrective nudge must not survive a failed retry — it would sit in
     # history as a second consecutive user message and poison the next send
     assert [m["role"] for m in msgs] == ["user"]
@@ -9802,14 +9822,14 @@ def test_copy_response_never_reaches_into_the_previous_turn(tmp_path, monkeypatc
     assert e.last_turn_final_reply() == ""
 
 
-def test_the_two_copy_last_commands_are_both_registered():
-    """The pair has to be discoverable: /copy-last is the full turn,
-    /copy-response is just the reply, and the blurbs must say which."""
-    from aurora import ui
-    assert "copy-last" in ui.COMMAND_INFO and "copy-response" in ui.COMMAND_INFO
-    assert "prompt, thinking, every reply" in ui.COMMAND_INFO["copy-last"]
-    assert "final reply" in ui.COMMAND_INFO["copy-response"]
-    assert "command and full output" in ui.COMMAND_INFO["copy-turn"]
+def test_the_copy_variants_are_one_command_with_the_old_names_as_aliases():
+    """R453 (#12): one discoverable `/copy <what>`; the old names still work
+    but are not listed."""
+    from aurora import man, ui
+    for old in ("copy-last", "copy-turn", "copy-response", "copy-all"):
+        assert old not in ui.COMMAND_INFO and old in ui.COPY_ALIASES
+    for what in ("turn", "full", "all", "bash", "last"):
+        assert what in ui.COMMAND_INFO["copy"] and f"/copy {what}" in man.command_man("copy")
 
 
 def _tool_turn_with_commands():
@@ -9912,3 +9932,40 @@ def test_auto_continue_backstops_at_max_rounds(monkeypatch):
     cb.auto_continue = lambda: True
     agent.run_turn(prov, "m", [{"role": "user", "content": "go"}], "sys", cb, 1, True)
     assert asked and asked[0] == 3
+
+
+def test_model_picker_labels_each_local_row_with_its_own_loaded_model(
+        tmp_path, monkeypatch, capsys):
+    """Each `local` row must show what ITS backend has loaded, read fresh when
+    the picker opens — not the current provider's (possibly stale) cached name."""
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path / "home"))
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("""
+providers:
+  local: {type: openai, base_url: "http://x"}
+  lan2: {type: openai, base_url: "http://y"}
+models:
+  - {model: local, provider: local}
+  - {model: local, provider: lan2}
+""")
+    from aurora import ui
+    from aurora.engine import Engine
+    e = Engine(str(cfg))
+
+    class _P:
+        def __init__(self, name):
+            self.name = name
+
+        def live_model_name(self):
+            return self.name
+
+    provs = {"local": _P("small.gguf"), "lan2": _P("big.gguf")}
+    monkeypatch.setattr(e, "probe_provider_for",
+                        lambda m: provs[m.get("provider")])
+    # a stale cache entry for the current provider must be overwritten on open
+    e._live_name_cache[e._provider_key] = ("stale.gguf", 0)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")
+    ui._pick_model(e, ui.TerminalFrontend())
+    out = capsys.readouterr().out
+    assert "big.gguf" in out and "small.gguf" in out
+    assert "stale.gguf" not in out

@@ -180,6 +180,44 @@ def not_found_hint(text: str, old: str) -> str:
     return ""
 
 
+def _ws_key(line: str) -> str:
+    return " ".join(line.split())
+
+
+def _indent(line: str) -> str:
+    return line[:len(line) - len(line.lstrip(" \t"))]
+
+
+def whitespace_edit(text: str, old: str, new: str) -> str | None:
+    """R457: `text` with `old` replaced by `new` when `old` is not in `text`
+    as written but matches exactly ONE run of whole lines once indentation
+    and runs of spaces/tabs are ignored; None otherwise. `new` is re-indented
+    the way the match is: its lines' leading `old` indentation is swapped for
+    the file's. Small local models miss an exact anchor mostly on whitespace,
+    and each retry is a full slow round trip; a unique match is not a guess."""
+    want = old.strip("\n").split("\n")
+    keys = [_ws_key(ln) for ln in want]
+    if not any(keys):
+        return None
+    lines = text.split("\n")
+    n = len(want)
+    hits = [i for i in range(len(lines) - n + 1)
+            if [_ws_key(ln) for ln in lines[i:i + n]] == keys]
+    if len(hits) != 1:
+        return None
+    i = hits[0]
+    k = next(j for j, key in enumerate(keys) if key)
+    old_ind, file_ind = _indent(want[k]), _indent(lines[i + k])
+    out = []
+    for ln in new.strip("\n").split("\n") if new.strip("\n") else []:
+        if ln.strip() and old_ind and ln.startswith(old_ind):
+            ln = file_ind + ln[len(old_ind):]
+        elif ln.strip() and not old_ind and file_ind:
+            ln = file_ind + ln
+        out.append(ln)
+    return "\n".join(lines[:i] + out + lines[i + n:])
+
+
 def _hunk_hint(text: str, old: str) -> str:
     if old in text:     # substring hit that _line_anchored rejected (R281)
         return " (the text exists, but only inside a longer line)"

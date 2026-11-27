@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from .paths import write_text_atomic
+from .paths import file_lock, write_text_atomic
 
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -92,9 +92,10 @@ def load_state() -> dict:
 
 
 def save_state_values(**values) -> None:
-    st = load_state()
-    st.update(values)
-    write_text_atomic(_state_path(), yaml.safe_dump(st, sort_keys=False))
+    with file_lock(_state_path()):        # R530: the terminal and the web page change different keys of one file
+        st = load_state()
+        st.update(values)
+        write_text_atomic(_state_path(), yaml.safe_dump(st, sort_keys=False))
 
 
 def _raw_with_section(path: Path, key: str, empty):

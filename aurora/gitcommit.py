@@ -70,18 +70,24 @@ def is_repo(cwd: str = ".") -> bool:
         return False
 
 
+def _out(cwd: str, *args: str) -> str:
+    """R541: stdout of a read-only git call, '' when git is missing or slower than the timeout (it raised)."""
+    try:
+        return _git(cwd, *args, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def staged_diff(cwd: str = ".") -> str:
     """`git diff --staged` — empty string when nothing is staged."""
-    r = _git(cwd, "diff", "--staged", check=False)
-    return r.stdout
+    return _out(cwd, "diff", "--staged")
 
 
 def unstaged_summary(cwd: str = ".") -> str:
     """`git status --porcelain` — what `stage_all` WOULD add. Shown to the
     user before asking whether to auto-stage, so "stage everything and
     commit" is never a silent surprise about which files that includes."""
-    r = _git(cwd, "status", "--porcelain", check=False)
-    return r.stdout
+    return _out(cwd, "status", "--porcelain")
 
 
 def stage_all(cwd: str = ".") -> None:
@@ -102,8 +108,7 @@ def stage_all(cwd: str = ".") -> None:
 def recent_log(cwd: str = ".", n: int = 5) -> str:
     """The last `n` commit subjects — style reference for the draft prompt,
     same idea as showing an LLM a few examples before asking for one more."""
-    r = _git(cwd, "log", f"-{n}", "--format=%s", check=False)
-    return r.stdout
+    return _out(cwd, "log", f"-{n}", "--format=%s")
 
 
 def draft_message(engine, diff: str, recent: str) -> str:

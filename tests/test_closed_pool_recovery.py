@@ -3,7 +3,10 @@ retried on until the turn dies with "client has been closed"."""
 
 import json
 import socket
+import sys
 import threading
+
+import pytest
 
 from aurora.providers import make_provider
 
@@ -46,6 +49,9 @@ def _server(on_first_chat):
     return srv.getsockname()[1], chats
 
 
+# close() from another thread does not wake a read already blocked in poll() on macOS,
+# so this simulation only reproduces the failure (and the recovery) on Linux
+@pytest.mark.skipif(sys.platform == "darwin", reason="closing a socket under a blocked read does not wake it on macOS")
 def test_turn_recovers_when_its_pool_is_closed_mid_request():
     holder = {}
     port, chats = _server(lambda: [c.close() for c in list(holder["p"]._http.values())])

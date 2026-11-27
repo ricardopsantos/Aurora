@@ -108,7 +108,10 @@ class _Doc:
 
 
 def _parse(text: str) -> dict:
-    d = yaml.safe_load(text) or {}
+    try:
+        d = yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:       # R556: a broken config.yaml is an EditError the caller shows, not a crash
+        raise EditError(f"config.yaml is not valid YAML ({str(e).splitlines()[0]}); edit it by hand") from e
     if not isinstance(d, dict):
         raise EditError("config.yaml is not a mapping")
     return d

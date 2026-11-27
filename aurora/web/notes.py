@@ -51,13 +51,25 @@ def _index() -> dict:
                 text = f.read_text(encoding="utf-8", errors="replace")
                 d[f.stem] = {"title": "", "preview": _preview(text), "updated": f.stat().st_mtime}
         _write(path, json.dumps(d, ensure_ascii=False))
-    return {k: v for k, v in d.items() if isinstance(k, str) and _ID.match(k) and isinstance(v, dict)}
+    out = {k: v for k, v in d.items() if isinstance(k, str) and _ID.match(k) and isinstance(v, dict)}
+    for v in out.values():           # R574: a hand-edited index: a non-number "updated" broke the listing's sort and
+        for f in ("updated", "created"):   # every save (TypeError, a 500); a non-text title broke the search
+            if f in v and (isinstance(v[f], bool) or not isinstance(v[f], (int, float)) or v[f] != v[f]):
+                v[f] = 0
+        if "title" in v and not isinstance(v["title"], str):
+            v["title"] = str(v["title"])
+        if "preview" in v and not isinstance(v["preview"], str):
+            del v["preview"]
+        if isinstance(v.get("pos"), bool) or (isinstance(v.get("pos"), float) and v["pos"] != v["pos"]):
+            del v["pos"]
+    return out
 
 
 def _write(path, text: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    # R513: created 0600 from the first byte (mkstemp), fsynced, then renamed; a fixed `.tmp` name written first
+    # and chmod-ed after was readable by others for a moment and shared by two writers
+    from ..service import write_text_atomic
+    write_text_atomic(path, text)
 
 
 def _title(t: str) -> str:
@@ -105,8 +117,7 @@ def listing(q: str = "", kind: str = "") -> list[dict]:
     kind = kind if kind in TYPES else ""
     with _lock:
         idx = _index()
-        if _ordered(idx):
-            _write(_dir() / "index.json", json.dumps(idx, ensure_ascii=False))
+        dirty = _ordered(idx)
         out = []
         for k, v in idx.items():
             if kind and _type(v) != kind:
@@ -115,16 +126,26 @@ def listing(q: str = "", kind: str = "") -> list[dict]:
             text = None
             if prev is None:                                   # a note saved before previews existed
                 text = _read(k)
-                prev = _preview(text)
+                prev = v["preview"] = _preview(text)           # R524: kept, not re-read on every listing
+                dirty = True
             if q and q not in v.get("title", "").lower():
                 if text is None:
                     text = _read(k)
                 if q not in text.lower():
                     continue
             out.append({"id": k, "title": v.get("title", ""), "preview": prev, "updated": v.get("updated", 0),
-                        "type": _type(v)})
+                        "created": v.get("created", 0), "type": _type(v)})   # R467: `remember` picks the oldest by it
+        if dirty:
+            _write(_dir() / "index.json", json.dumps(idx, ensure_ascii=False))
     order = {k: _pos(v) for k, v in idx.items()}
     return sorted(out, key=lambda n: (order[n["id"]], -n["updated"]))
+
+
+def healthy() -> None:
+    """R529: what /health needs: the index can be read (raises otherwise). Without the listing's previews, sort
+    and search, since /health needs no token and is polled."""
+    with _lock:
+        _index()
 
 
 def valid_id(nid) -> bool:
@@ -157,7 +178,10 @@ def create(title: str = "", text: str = "", source_session: str | None = None,
         _write(_dir() / f"{nid}.txt", text)
         _ordered(idx)
         top = min((v["pos"] for v in idx.values()), default=1)
-        idx[nid] = {"title": _title(title), "preview": _preview(text), "updated": _now(), "pos": top - 1, "type": kind,
+        # R577: `created` is strictly increasing; two notes made in one millisecond tied, and `remember` then picked
+        # the "oldest" Memory note by its random id
+        made = max([_now()] + [v["created"] + 0.001 for v in idx.values() if isinstance(v.get("created"), (int, float))])
+        idx[nid] = {"title": _title(title), "preview": _preview(text), "updated": made, "created": made, "pos": top - 1, "type": kind,
                     **({"source_session": source_session} if source_session else {})}
         _write(_dir() / "index.json", json.dumps(idx, ensure_ascii=False))
     return nid, ""

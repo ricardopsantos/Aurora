@@ -1,0 +1,22 @@
+[package]
+name = "aurora-storage"
+description = "Aurora's on-disk formats: AURORA_HOME, config.yaml, session JSONL, the key store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aurora-core.workspace = true
+base64.workspace = true
+chrono.workspace = true
+fernet.workspace = true
+libc.workspace = true
+pbkdf2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

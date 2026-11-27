@@ -37,9 +37,56 @@ function endThink(t) {
   curThink = null;
 }
 
+// Token problems must never be silent: any 401 from the API shows a banner at the top of the page (not just a note in the log).
+(function () {
+  const _fetch = window.fetch.bind(window);
+  function banner(msg) {
+    let b = document.getElementById('token-banner');
+    if (!b) {
+      // Fixed, not a body child in the flow: the / page's body is a flex ROW, so a prepended block became a
+      // full-height red column beside the sidebar (the whole chat pane on a phone). A one/two-line strip
+      // across the top instead, under the notch (safe-area), with a close button.
+      b = document.createElement('div'); b.id = 'token-banner'; b.setAttribute('role', 'alert');
+      b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;display:flex;align-items:flex-start;gap:8px;'
+        + 'padding:calc(env(safe-area-inset-top,0px) + 8px) 12px 8px;background:#b3261e;color:#fff;'
+        + 'font:600 14px/1.3 system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.35);'
+        + 'max-height:30vh;overflow:auto';
+      const text = document.createElement('span'); text.id = 'token-banner-text'; text.style.flex = '1 1 auto';
+      const close = document.createElement('button'); close.type = 'button'; close.textContent = '×';
+      close.setAttribute('aria-label', 'Dismiss');
+      close.style.cssText = 'flex:none;background:none;border:0;color:#fff;font:600 22px/1 system-ui,sans-serif;padding:0 4px;cursor:pointer';
+      close.onclick = e => { e.stopPropagation(); b.remove(); };
+      b.append(text, close);
+      b.onclick = () => { if (window.openSettings) window.openSettings('token'); else { const t = document.getElementById('token'); if (t) t.focus(); } };
+      document.body.append(b);
+    }
+    b.querySelector('#token-banner-text').textContent = msg + ' Tap to enter it.';
+  }
+  window.fetch = async (...a) => {
+    const r = await _fetch(...a);
+    if (r.status === 401 && String(a[0]).includes('/api/')) {
+      const has = !!localStorage.getItem('aurora_web_token');
+      banner(has ? 'The server REJECTED the saved access token — paste the correct one in Settings and press Save.'
+                 : 'No access token is saved in this browser — paste it in Settings and press Save. Nothing was loaded or sent.');
+    }
+    return r;
+  };
+})();
 const getToken = () => localStorage.getItem('aurora_web_token') || '';
 $('token').value = getToken();
-$('token-save').onclick = () => { localStorage.setItem('aurora_web_token', $('token').value.trim()); location.reload(); };
+// R450 (S11): chats and notes cached for offline reading are dropped when the token changes or is refused
+async function clearOfflineData() {
+  try {
+    if (!window.caches) return;
+    const c = await caches.open('aurora-web-v1');
+    for (const k of await c.keys()) if (new URL(k.url).pathname.startsWith('/api/')) await c.delete(k);
+  } catch (e) {}
+}
+$('token-save').onclick = async () => {
+  const v = $('token').value.trim();
+  if (v !== getToken()) await clearOfflineData();
+  localStorage.setItem('aurora_web_token', v); location.reload();
+};
 const hdr = () => ({ 'Authorization': 'Bearer ' + getToken(), 'Content-Type': 'application/json' });
 async function post(path, body) {
   let r;
@@ -463,7 +510,7 @@ function handle(ev) {
     case 'queue_cancel': if (queued[ev.position - 1] === ev.text) { queued.splice(ev.position - 1, 1); paintQueue(); } else dequeue(ev.text); break;
     case 'output': if (ev.name) turnOutputs.push('~/.aurora/workspace/outputs/' + ev.name); break;   // R418 (F4)
     case 'queue_cleared': queued = []; paintQueue(); note(ev.count + ' queued message' + (ev.count === 1 ? '' : 's') + ' dropped (Stop)'); break;
-    case 'user': dequeue(ev.text); setBusy(true); stick = true; flushCur(); endThink(ev.t); thinkText = ''; turnTools = []; cur = null; clearActs(); lastReplyRaw = ''; lastReplyEl = null; turnOutputs = []; lastUserText = ev.text; lastUser = add('msg user', ev.text + (ev.images ? '  [' + ev.images + ' picture' + (ev.images > 1 ? 's' : '') + ']' : '')); break;
+    case 'user': dequeue(ev.text); setBusy(true, fromOther(ev.client)); stick = true; flushCur(); endThink(ev.t); thinkText = ''; turnTools = []; cur = null; clearActs(); lastReplyRaw = ''; lastReplyEl = null; turnOutputs = []; lastUserText = ev.text; lastUser = add('msg user', ev.text + (ev.images ? '  [' + ev.images + ' picture' + (ev.images > 1 ? 's' : '') + ']' : '')); break;
     case 'retry': clearActs(); if (lastUser && lastUser.parentNode === log) { while (lastUser.nextSibling) lastUser.nextSibling.remove(); lastUser.remove(); } lastUser = null; cur = null;
       if (live_(ev) && (ev.images || ev.notes)) note('sent again with ' + [ev.images && ev.images + ' picture' + (ev.images > 1 ? 's' : ''), ev.notes && ev.notes + ' note/file' + (ev.notes > 1 ? 's' : '')].filter(Boolean).join(' and '));   // R418 (I4)
       break;
@@ -525,15 +572,31 @@ function ctx(c) {
   $('hint').hidden = !lvl;
   $('hint').textContent = pct >= 90 ? 'Context is full: run Clear (it clears itself after the next turn).' : 'Context is getting full: Clear or Compact soon.';
 }
-function setBusy(b) {
-  if (b) { $('status').title = 'Tap to show what Aurora is doing'; if ($('live').hidden) live('working…'); } else { live(''); $('status').textContent = 'idle'; $('status').title = 'Idle: tap to wake a sleeping model'; $('status').classList.remove('busy'); }
+// R458 (#22): one live chat is shared by every device; a turn another device
+// started is named as such instead of a bare "working…"
+const mySent = new Set();
+const fromOther = id => !!id && !mySent.has(id);
+function setBusy(b, other) {
+  if (b && other) { $('status').title = 'Another device or tab sent the message being answered; yours will queue behind it'; live('busy on another device…'); }
+  else if (b) { $('status').title = 'Tap to show what Aurora is doing'; if ($('live').hidden || liveLabel === 'busy on another device…') live('working…'); } else { live(''); $('status').textContent = 'idle'; $('status').title = 'Idle: tap to wake a sleeping model'; $('status').classList.remove('busy'); }
   $('stop').hidden = !b;
   if (window.AURORA_CHAT) { const g = $('go'); g.title = b ? 'Queue (runs after this turn)' : 'Send'; g.setAttribute('aria-label', g.title); g.classList.toggle('queue', b); $('text').placeholder = b ? 'Queue a message…' : $('text').dataset.ph; }
   else $('go').textContent = b ? 'Queue' : 'Send';   // a message sent while a turn runs waits its turn (R373)
   document.querySelectorAll('.cmd').forEach(x => x.disabled = b);
 }
 // Session id: short form, full in the tooltip, click copies it.
+// R461: the address bar names the open chat (`/?chat=<session id>`), so it can be bookmarked or sent to someone
+// who also has access; opening such a link opens that chat
+var LINK_CHAT = (new URLSearchParams(location.search).get('chat') || '').trim();
+if (!/^[A-Za-z0-9_-]{1,64}$/.test(LINK_CHAT)) LINK_CHAT = '';
+function chatInAddress(id) {
+  const q = new URLSearchParams(location.search);
+  if (id) q.set('chat', id); else q.delete('chat');
+  const url = location.pathname + (q.toString() ? '?' + q : '') + location.hash;
+  if (url !== location.pathname + location.search + location.hash) history.replaceState(null, '', url);
+}
 function showSession(id, replaying) {
+  if (!LINK_CHAT) chatInAddress(id);   // R461: not while a ?chat= link is still being opened
   const e = $('sid'); e.hidden = !id; e.textContent = id ? 'session ' + id.slice(0, 6) : ''; e.dataset.full = id || ''; e.title = id + ' (click to copy)';
   if (!replaying) loadSessions();
 }
@@ -779,7 +842,11 @@ function sidebar(open) {
   $('sb-toggle').setAttribute('aria-expanded', String(open));
   localStorage.setItem(SB_KEY, open ? '1' : '0');
 }
+// R451: the remembered state is applied with the slide switched off, so a phone's closed sidebar is closed from the first paint
+// (it used to start open and slide shut on every load, and a click during that slide missed its target)
+document.body.classList.add('sb-init');
 { const v = localStorage.getItem(SB_KEY); sidebar(v === null ? (window.AURORA_SB_OPEN ?? innerWidth > 768) : v === '1'); }
+requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.remove('sb-init')));
 $('sb-toggle').onclick = () => sidebar(document.body.classList.contains('sb-closed'));
 
 // "New chat on open" (on by default): a fresh page starts a fresh conversation; off, it continues the last chat (R388). Skipped while a turn is running.
@@ -802,7 +869,7 @@ async function stream() {
   for (let wait = 1000; ; wait = Math.min(wait * 2, 15000)) {
     try {
       const r = await fetch('/api/stream?after=' + lastId + (bootId ? '&boot=' + encodeURIComponent(bootId) : ''), { headers: hdr() });
-      if (r.status === 401) { if (window.openSettings) { note('this server needs the token — paste it in Settings and press Save', true); window.openSettings('token'); } else { note('this server needs the token — paste it in the sidebar and press Save', true); sidebar(true); fold(document.querySelector('[data-fold=token]'), true); } return; }
+      if (r.status === 401) { clearOfflineData(); if (window.openSettings) { note('this server needs the token — paste it in Settings and press Save', true); window.openSettings('token'); } else { note('this server needs the token — paste it in the sidebar and press Save', true); sidebar(true); fold(document.querySelector('[data-fold=token]'), true); } return; }
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '';
       wait = 1000; netState('ok'); flushOutbox(); log.querySelectorAll('.offline-copy').forEach(e => e.remove());
@@ -823,6 +890,36 @@ async function stream() {
     if (!lastId) showChatCopy();
     await nap(wait);   // R396: cut short when the device comes back online or the page is shown again
   }
+}
+// R460: a page opened as `/?note=<id>` (Notes › Copy link) loads that note into a chat at once, before any message;
+// R462: `/?note=<id>,<id>,…` loads several (at most 5), in that order
+var LINK_NOTE = (new URLSearchParams(location.search).get('note') || '').trim().slice(0, 80);
+function askChoice(title, text, yes, no) { return new Promise(res => {   // like askConfirm, with two answers; Esc = neither
+  const d = $('confirm'), nb = $('cf-no'), was = nb.textContent, done = v => { nb.textContent = was; d.close(); res(v); };
+  $('cf-title').textContent = title; $('cf-text').textContent = text; $('cf-yes').textContent = yes; nb.textContent = no;
+  $('cf-pre').hidden = true;
+  $('cf-yes').onclick = () => done(true); nb.onclick = () => done(false);
+  d.oncancel = () => { nb.textContent = was; res(null); };
+  d.showModal();
+}); }
+async function openLinkNote(empty, busy) {
+  const id = LINK_NOTE; LINK_NOTE = '';
+  const q = new URLSearchParams(location.search); q.delete('note');   // a reload must not load it again
+  history.replaceState(null, '', location.pathname + (q.toString() ? '?' + q : '') + location.hash);
+  const ids = [...new Set(id.split(',').map(x => x.trim()).filter(Boolean))].slice(0, 5);
+  if (!ids.length || !ids.every(x => /^[0-9a-f]{12}$/.test(x))) { note('this link names no note: use Notes › Copy link for a note\'s link', true); return; }
+  if (busy) { note('Aurora is busy: open the note link again when the reply has finished', true); return; }
+  const found = [];
+  for (const x of ids) { try { const r = await fetch('/api/notes/' + x, { headers: hdr() }); if (r.ok) found.push(await r.json()); else note('a note in this link no longer exists', true); } catch (e) {} }
+  if (!found.length) return;
+  let fresh = false;
+  if (!empty) {
+    const what = found.length === 1 ? '\u201c' + (found[0].title || 'Untitled') + '\u201d' : found.length + ' notes';
+    const c = await askChoice('Load ' + what, 'Start a new chat with ' + (found.length === 1 ? 'this note' : 'these notes') + ' as context, or add ' + (found.length === 1 ? 'it' : 'them') + ' to the chat that is open now?', 'New chat', 'Add to this chat');
+    if (c === null) return;
+    fresh = c;
+  }
+  for (let k = 0; k < found.length; k++) if (!(await post('/api/load-note', { id: found[k].id, new_chat: fresh && k === 0 }))) break;
 }
 let ctxFile = '', bootId = '';
 $('load-ctx').onclick = () => { const t = $('text'); t.value = 'load ' + ctxFile; t.focus(); t.dispatchEvent(new Event('input')); };
@@ -850,10 +947,18 @@ async function refreshModel(first) {
       bootId = s.boot || ''; replayUntil = s.last_event || 0;
       // R392 (bug 9): "New chat on open" never wipes a chat another device has open or used in the last 10 minutes
       const inUse = s.streams > 0 || (s.idle_s != null && s.idle_s < 600);
-      if (!s.busy && $('clear-open').checked && !inUse) await post('/api/command', { name: 'clear' });
+      let cleared = false;
+      if (LINK_CHAT) {   // R461: a chat link opens that chat, instead of New chat on open / continuing the last one
+        const want = LINK_CHAT; let at = s.session_id;
+        if (s.session_id !== want && !s.busy) { if (await post('/api/resume', { id: want })) { at = want; stick = true; } else note('could not open the chat in this link', true); }
+        else if (s.session_id !== want) note('Aurora is busy: open the chat link again when the reply has finished', true);
+        LINK_CHAT = ''; chatInAddress(at);
+      }
+      else if (!s.busy && $('clear-open').checked && !inUse) cleared = !!(await post('/api/command', { name: 'clear' }));
       else if (!s.busy && $('clear-open').checked) note('continuing the chat in use on another device (New chat on open skipped)');
       else if (!s.busy) await continueLast();
-      setBusy(s.busy);
+      setBusy(s.busy, s.busy && fromOther(s.busy_client));
+      if (LINK_NOTE) await openLinkNote(cleared || !!s.chat_empty, s.busy);   // R460
     }
   } catch (e) {}
 }
@@ -1202,7 +1307,7 @@ if ($('notes-btn')) (function () {
   if (G('note-type')) G('note-type').onchange = async e => {   // R422: move the open note; the list follows it to its new tab
     const to = e.target.value; if (!cur) return;
     if (!(await flush())) { e.target.value = ntype; return; }   // the typed text is saved before the move
-    try { await api('/api/notes/type', { id: cur, type: to }); say('Moved to ' + NTYPES[to]); await setType(to); list.querySelectorAll('.n').forEach(b => b.toggleAttribute('aria-current', b.dataset.id === cur)); }
+    try { await api('/api/notes/type', { id: cur, type: to }); flash('Moved to ' + NTYPES[to]); await setType(to); list.querySelectorAll('.n').forEach(b => b.toggleAttribute('aria-current', b.dataset.id === cur)); }
     catch (err) { say(err.message, true); e.target.value = ntype; }
   };
   const phone = () => matchMedia('(max-width:768px)').matches;
@@ -1223,6 +1328,9 @@ if ($('notes-btn')) (function () {
   };
   const counts = () => { const w = text.value.trim() ? text.value.trim().split(/\s+/).length : 0; meta.textContent = w + (w === 1 ? ' word' : ' words') + ' · ' + text.value.length + ' characters'; };
   const say = (t, err) => { state.textContent = t; state.style.color = err ? 'var(--bad)' : ''; };
+  // R468: a one-off confirmation (copied, moved) is a toast under the toolbar for 2.5 s, not the footer's save status
+  let flashT = 0;
+  const flash = t => { const el = $('note-toast'); if (!el) return say(t); const h = edit.querySelector('.nhead'); el.style.top = (h ? h.offsetTop + h.offsetHeight + 4 : 56) + 'px'; el.textContent = t; el.hidden = false; clearTimeout(flashT); flashT = setTimeout(() => { el.hidden = true; }, 2500); };
 
   async function load() {
     const q = search.value.trim();   // R422: a search looks in every type, and each hit says which
@@ -1353,6 +1461,17 @@ if ($('notes-btn')) (function () {
       if (!phone() && !n.text && !n.title) title.focus();
     } catch (e) { say(e.message, true); }
   }
+  if (G('note-link')) G('note-link').onclick = async () => {   // R460: a link that opens Aurora with this note loaded
+    if (!cur) return;
+    const url = location.origin + '/?note=' + cur;
+    // R468: a short confirmation (the button's tooltip says what the link does); without clipboard access the
+    // link is copied the old way, and only if that fails too is it offered in a box to copy by hand
+    let ok = false;
+    try { await navigator.clipboard.writeText(url); ok = true; }
+    catch (e) { const ta = document.createElement('textarea'); ta.value = url; ta.style.cssText = 'position:fixed;opacity:0'; dlg.append(ta); ta.select(); try { ok = document.execCommand('copy'); } catch (e2) {} ta.remove(); }
+    if (ok) flash('Link copied');
+    else window.prompt('Copy this link:', url);
+  };
   async function leave() { await dropIfEmpty(false); if (await flush()) { cur = null; show(false); await load(); } }   // R433: Back drops a blank note the tab made
 
   const closeNotes = async () => { await dropIfEmpty(false); if (await flush(true) || await askConfirm('Close without saving?', 'The last change could not be saved.', 'Close')) dlg.close(); };
@@ -1405,7 +1524,7 @@ if ($('notes-btn')) (function () {
   };
   search.oninput = () => { clearTimeout(searchT); searchT = setTimeout(load, 200); };
   $('note-copy').onclick = async () => {
-    try { await navigator.clipboard.writeText(text.value); say('Copied'); } catch (e) { text.select(); document.execCommand('copy'); say('Copied'); }
+    try { await navigator.clipboard.writeText(text.value); flash('Copied'); } catch (e) { text.select(); document.execCommand('copy'); flash('Copied'); }
   };
   if ($('note-send')) $('note-send').onclick = async () => {   // R401: attach this note to the next message
     if (!cur || !(await flush())) return;
@@ -1516,6 +1635,7 @@ function paintOutbox() {
 }
 async function sendNow(item) {   // 'ok' | 'net' (no answer: keep it) | 'busy' (queue full: keep it) | 'refused' (said why)
   let r;
+  mySent.add(item.id);
   try { r = await fetch('/api/send', { method: 'POST', headers: hdr(), body: JSON.stringify({ text: item.text, images: item.images || [], image_paths: item.image_paths || [], note_ids: item.note_ids || [], files: item.files || [], client_id: item.id, temperature: pageTemperature() }) }); }
   catch (e) { netState('offline'); return 'net'; }
   netState('ok');                 // any answer proves the link is up, even while the old stream has not noticed yet

@@ -32,6 +32,17 @@ def whisper(app, monkeypatch):
             return R(json.dumps({"text": f"said in {lang}"}).encode())
         return real(req, timeout=timeout)
     monkeypatch.setattr(web_server.urllib.request, "urlopen", fake)
+    # R533: the server reaches the speech server through build_opener(ProxyHandler({})).open, not urlopen
+    real_build = urllib.request.build_opener
+
+    def build(*handlers):
+        opener = real_build(*handlers)
+        real_open = opener.open
+        opener.open = lambda req, data=None, timeout=None: (
+            fake(req, timeout) if isinstance(req, urllib.request.Request) and req.full_url.startswith("http://stt.invalid")
+            else real_open(req, data, timeout) if timeout is not None else real_open(req, data))
+        return opener
+    monkeypatch.setattr(web_server.urllib.request, "build_opener", build)
     return seen
 
 

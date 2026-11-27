@@ -1,15 +1,110 @@
 # Changelog
 
-Aurora's version is `1.2.<commits since the last published release>`. To see
+Aurora's version is `2.0.<commits since the last published release>`. To see
 which version you're running, use `aurora --man` or
 `python3 -c "import aurora; print(aurora.__version__)"`. Older releases used
-`1.0.<n>` and `1.1.<n>`; the entries below keep the numbers they had. The
+`1.0.<n>` to `1.3.<n>`; the entries below keep the numbers they had. The
 numbered requirements are in `CHANGELOG_TECHNICAL.md` (R1 to R293) and in
 `REQUIREMENTS.md` with `requirements/` (the newer ones).
 
-## 1.3.0 (2026-11-04)
+## 2.0.0 (2026-11-27)
 
-Changes since 1.2.57.
+This is Aurora 2.0: the agent loop now runs in Rust. Bash
+mode became a real shell, the web version gained notes, memory and chat
+links, and the terminal no longer starts on a model you never picked.
+
+### Added
+
+- **Aurora 2.0: a Rust core.** The agent loop (model requests, tools,
+  approvals, the sandbox) runs in `aurora-rs` behind the same terminal and
+  web screens. Your config, keys, sessions and data folder are unchanged, and
+  you can switch back at any time. `install.sh` builds the core when a Rust
+  toolchain is installed ([rustup.rs](https://rustup.rs)); without one, Aurora
+  runs its Python loop, which does the same. To keep the Python loop anyway,
+  set `runtime.core: python` in `config.yaml` (or `AURORA_CORE=python`).
+  After `git pull`, run `./install.sh` again (or
+  `cargo build --release -p aurora-cli`) to rebuild the core. Checked on Linux
+  and macOS. (R478 to R508)
+- **`tools:` for MCP servers.** An `mcp_servers:` entry can list the tools
+  it exposes, so a server with dozens of tools no longer adds thousands of
+  tokens to every request. Unlisted tools cannot be seen or called.
+- **A sanity check of your models at start.** Configured models that can't
+  work on this machine (an Ollama entry where Ollama isn't installed, a
+  server that isn't listening) are named in one line, with why, and the
+  model picker won't switch to them. (R580)
+
+### Changed
+- **Bash mode is a real shell.** Commands typed after `!` (and the
+  model's `run_command`) run in bash instead of `sh`, so `{a,b}`, `[[ ]]`
+  and `source` work. Esc-Esc cancels a running command, output appears
+  while it runs, a failed command shows `[exit N]`, and `cd foo && make`,
+  `cd -`, `export` and activating a virtualenv carry over to the next
+  command. Bash mode keeps its own up-arrow history, colours `ls` and `git`
+  output, and says when a program needs a real terminal instead of failing
+  silently. (R452)
+- **One `/copy` command.** `/copy`, `/copy N`, `/copy turn`, `/copy full`,
+  `/copy all`, `/copy bash` and `/copy last` replace `/copy-last`,
+  `/copy-turn`, `/copy-response` and `/copy-all`, which still work.
+  `/copy abc` now says it doesn't understand instead of copying something
+  else. (R453)
+- **On/off commands agree.** `/multiline on` no longer turns multiline off,
+  `/thinking` and `/markdown` accept `on|off` and are remembered, and a bad
+  argument shows the usage. (R453)
+- **Messages that start with a path** (`/etc/hosts has a bad entry`) are sent
+  to the model, in the web version too, instead of being treated as an
+  unknown command. (R453)
+- **Share links are snapshots.** A shared chat link shows the chat as it was
+  when you shared it, without tool output, and expires after 7 days. Share
+  again to update it. (R454)
+- **The web page is locked down further.** It may only run its own scripts
+  and talk to its own server, and too many wrong tokens lock a client out
+  for 5 minutes. (R454)
+- **The web version starts without a `local` model.** It picks the last
+  model you used there, then `local`, then the first model with a key. (R454)
+- **The example web service unit is a real sandbox.** It shows Aurora only its
+  workspace, its data and its own code, hides the docker socket and makes
+  sudo useless, so a script the model writes cannot reach the rest of the
+  machine. (R459)
+- **The web page names a turn from another device** ("busy on another
+  device…"), and a typed `/command` is answered with where to find it on
+  the page, or that it is terminal-only. (R458)
+- **A note can give Aurora background.** A note's link button copies a link
+  that opens Aurora with that note already loaded (names, email addresses,
+  workplace, preferences), in a new chat or the one that is open. (R460)
+- **A chat has a link.** The address bar shows the open chat (`/?chat=…`);
+  opening that link opens the chat again, on any device with access. (R461)
+- **Aurora can remember.** Say "remember that…" and Aurora adds it to a
+  "Memory" note; load that note with a link and new chats know it. A link can
+  now load several notes at once (`/?note=<id>,<id>`). (R462)
+- **The screen only claims what was checked.** A backend on a VPN address
+  is checked before it is called "ready"; the model picker says `(current)`
+  instead of a ✔ next to "unreachable"; a request that never reached the
+  model leaves no "thought for 0s"; Ollama gets Ollama advice. (R455)
+- **Edits survive whitespace slips.** When the text to replace differs from
+  the file only in indentation or spacing, and matches one place, the edit
+  is applied and the new text is indented to fit. (R457)
+- **A tidier TUI.** `?` shows a short help in three groups; the `/` menu no
+  longer covers the input box; the key hints most worth seeing come first;
+  the draft size reads `draft N tok`; cancelling `/model` says so. (R455)
+- **No model until you pick one.** With no model remembered, the terminal
+  starts with none and says "no model selected — /model to pick one" instead
+  of quietly using the first entry in `config.yaml`. Piped input, `-t` and
+  `--web` keep their defaults. (R578)
+- **Advice that fits your machine.** A backend that isn't listening no longer
+  gets "start Ollama" where Ollama isn't installed; the configured models that
+  answer right now are suggested first. (R579)
+
+### Fixed
+- Edits to an existing file work on macOS again; the space reservation that
+  needs Linux is skipped there.
+- 22 bugs and slow spots found in a review of the Rust core and the web
+  version: streamed replies split into many lines were re-scanned per line, a
+  timed-out request was sent again, tool calls without an index were merged,
+  cancelling a summary kept a half summary, a background job whose child kept
+  running never finished, a bad request body to the web server crashed the
+  handler, and more. (R557 to R577)
+
+## 1.3.0 (2026-11-05)
 
 The biggest change is a web version of Aurora. The terminal also gained
 plan mode, trial runs, spending caps and better ways to work while a turn is
@@ -56,8 +151,6 @@ running.
   runs on; the deploy files are templates. (R346, R393)
 
 ### Fixed
-- Edits to an existing file work on macOS again; the space reservation that
-  needs Linux is skipped there.
 - Many robustness and safety fixes from audits and deep dives, including
   edits that keep a file's inode, command output that keeps both its start
   and its end, and a keyring that never answers no longer freezing Aurora.

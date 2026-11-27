@@ -65,8 +65,8 @@ If this page disagrees with either of them, they're right.
 - **Aurora Lite, the web version (R353 to R440).** `aurora --web` serves the
   same engine as a chat page: chats with folders and downloads, Markdown
   notes, files, voice, a model menu with a YAML editor, and light and dark
-  themes that work on a phone. It needs a bearer token and starts with
-  auto-approve on. Front ends reach the engine only through
+  themes that work on a phone. It needs a bearer token and asks
+  before each write or command until auto-approve is turned on (R474). Front ends reach the engine only through
   `aurora/service.py` (R394).
 
 ## Rules for this project

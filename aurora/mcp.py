@@ -556,6 +556,9 @@ class MCPManager:
 
     def __init__(self, configs: list[dict]):
         self._servers: dict[str, MCPServer] = {}
+        # R449: per-server `tools:` allowlist. A server missing from this
+        # dict exposes everything it advertises (the old behaviour).
+        self._allow: dict[str, set[str]] = {}
         self.errors: list[str] = []
         for c in configs:
             name, command = c.get("name"), c.get("command")
@@ -618,11 +621,36 @@ class MCPManager:
                 self.errors.append(f"{name}: {e.__class__.__name__}: {e}")
                 continue
             self._servers[name] = server
+            self._apply_tools_allowlist(name, server, c.get("tools"))
             # A server that connected fine can still have sent unusable tool
             # entries; surface those per-server rather than losing them.
             self.errors += [f"{name}: {w}" for w in server.warnings]
         if self._servers:
             atexit.register(self.close_all)
+
+    def _apply_tools_allowlist(self, name: str, server: "MCPServer",
+                               wanted) -> None:
+        """R449: `tools: [a, b]` keeps only those tools of this server, so
+        a server that advertises dozens does not put all their schemas in
+        every request. Absent = everything (unchanged). A malformed value
+        exposes NOTHING from that server (an allowlist must fail closed)
+        and warns. A listed name the server does not have only warns."""
+        if wanted is None:
+            return
+        if (not isinstance(wanted, list)
+                or not all(isinstance(t, str) and t for t in wanted)):
+            self._allow[name] = set()
+            self.errors.append(
+                f"{name}: `tools:` must be a list of tool names — exposing "
+                f"no tools from this server until it is fixed")
+            return
+        have = {t["name"] for t in server.tools}
+        missing = [t for t in wanted if t not in have]
+        if missing:
+            self.errors.append(
+                f"{name}: `tools:` lists {', '.join(missing)}, which the "
+                f"server does not provide (it has: {', '.join(sorted(have))})")
+        self._allow[name] = set(wanted)
 
     def _unique_tools(self) -> list:
         """R305: `mcp_{server}_{tool}` is ambiguous (server `a_b` + tool `c`
@@ -631,7 +659,10 @@ class MCPManager:
         call ran another. A colliding name is dropped from BOTH, warned."""
         seen: dict[str, list] = {}
         for name, server in self._servers.items():
+            allow = getattr(self, "_allow", {}).get(name)
             for t in server.tools:
+                if allow is not None and t["name"] not in allow:
+                    continue
                 seen.setdefault(f"mcp_{name}_{t['name']}", []).append((name, server, t))
         out = []
         for full, hits in seen.items():

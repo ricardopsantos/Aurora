@@ -16,6 +16,7 @@ import signal
 import sys
 
 from . import keystore
+from .colors import visible
 from .providers.base import ProviderError
 
 DEFAULT_MAX_STEPS = None     # None = use runtime.max_iterations from config
@@ -59,7 +60,8 @@ class HeadlessFrontend:
         self._tools += 1
         self.calls.append({"name": name, "args": args})
         first = next(iter(args.values()), "") if args else ""
-        self.err.write(f"· {name} {str(first).splitlines()[0][:100] if first else ''}\n")
+        line = str(first).splitlines()[0][:100] if str(first).strip() else ""
+        self.err.write(f"· {name} {visible(line)}\n")       # R546: no escape from the model reaches the terminal
 
     def on_tool_result(self, name: str, output: str) -> None:
         # a denylist hit never reaches approve(), so catch it by its result
@@ -67,7 +69,7 @@ class HeadlessFrontend:
             self.calls[-1]["result"] = output[:2000]
         if output.startswith("[denied by policy"):
             self._fail(f"{name} denied by policy")
-        self.err.write(f"  → {output.strip().splitlines()[0][:100] if output.strip() else '[no output]'}\n")
+        self.err.write(f"  → {visible(output.strip().splitlines()[0][:100]) if output.strip() else '[no output]'}\n")
 
     def on_usage(self, input_tokens: int, output_tokens: int) -> None:
         pass
@@ -128,14 +130,18 @@ def run(engine, task: str, *, yes: bool = False,
         engine.max_iterations = max_steps
     engine.auto_approve = yes
     engine.headless = True
-    old = signal.signal(signal.SIGINT, fe.interrupt)
+    try:
+        old = signal.signal(signal.SIGINT, fe.interrupt)
+    except ValueError:                    # R545: run from a worker thread: no handler of our own
+        old = None
     try:
         engine.send(task, fe)
     except ProviderError as e:
         fe._fail(f"provider error: {e}")
         fe.err.write(f"error: {e}\n")
     finally:
-        signal.signal(signal.SIGINT, old)
+        if old is not None:
+            signal.signal(signal.SIGINT, old)
     if not fe._wrote and not fe._tools and not fe.failed:
         # engine.send reports a dead provider via notify and returns
         fe._fail("the model produced no response")

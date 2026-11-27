@@ -35,6 +35,20 @@ def _secret_key(k: str) -> bool:
     return bool(_SECRET.search(k)) and not _NOT_SECRET.search(k)
 
 
+# R511: secrets inside an ordinary value: a URL's password (`https://user:PASS@host`), a secret-named query value
+# (`?token=X`) and a secret-named `--flag=X` in a command or its arguments.
+_SECRET_WORD = r"(?:api_?key|key|token|secret|password|passwd|pass|pat|sig|signature|auth)"
+_INLINE = (re.compile(r"://[^/\s:@'\"]+:([^@/\s'\"]+)@"),
+           re.compile(r"[?&][\w.-]*" + _SECRET_WORD + r"=([^&#\s'\",\]]+)", re.I),
+           re.compile(r"(?:^|[\s\[,'\"])--?[\w-]*" + _SECRET_WORD + r"=([^\s'\",\]]+)", re.I))
+
+
+def _inline(val: str):
+    """(start, end) of each secret inside `val` (R511), left to right. A «hidden» already there is found too, so
+    `restore` puts the value back at the same place."""
+    return sorted({(m.start(1), m.end(1)) for rx in _INLINE for m in rx.finditer(val)})
+
+
 _FLOW = re.compile(r"""(?P<k>[A-Za-z_][\w-]*)\s*:\s*(?P<v>"[^"]*"|'[^']*'|[^,}\s][^,}]*?)\s*(?=[,}])""")
 
 
@@ -55,6 +69,11 @@ def _walk(text: str):
             continue
         m = re.match(r"^(\s*(?:-\s+)*)([A-Za-z_][\w-]*)\s*:", ln)
         if not m:
+            lm = re.match(r"^\s*-\s+(?P<val>[^#\n]*)", ln)        # R511: a list item that is a plain value
+            if lm:
+                base = lm.start("val")
+                for st, en in _inline(lm.group("val")):
+                    yield i, hit(tuple(k for _, k in stack) + ("-", "inline")), base + st, base + en
             continue
         ind = len(m.group(1))
         while stack and stack[-1][0] >= ind:
@@ -65,13 +84,19 @@ def _walk(text: str):
         if not lm:
             continue
         val = lm.group("val")
+        base = lm.start("val")
+        if _secret_key(lm.group("key")) and val.strip() and not val.lstrip().startswith("{"):
+            yield i, hit(path), base, lm.end("val")
+            continue
+        taken = []
         if val.lstrip().startswith("{"):
-            base = lm.start("val")
             for fm in _FLOW.finditer(val):
                 if _secret_key(fm.group("k")):
+                    taken.append((fm.start("v"), fm.end("v")))
                     yield i, hit(path + (fm.group("k"),)), base + fm.start("v"), base + fm.end("v")
-        elif _secret_key(lm.group("key")) and val.strip():
-            yield i, hit(path), lm.start("val"), lm.end("val")
+        for st, en in _inline(val):                               # R511: secrets inside any other value
+            if not any(st < e and s < en for s, e in taken):
+                yield i, hit(path + ("inline",)), base + st, base + en
 
 
 def _replace(text: str, subs) -> str:

@@ -650,6 +650,7 @@ def test_url_needs_approval_policy(url, gated):
     assert tools.needs_approval("web_fetch") is False   # checkpoint path: never
 
 
+@pytest.mark.python_loop  # mocks Python's fetch; Rust's gate: test_rust_ext_r495 (url_needs_approval)
 def test_private_fetch_is_gated_and_never_prefetched(monkeypatch):
     from aurora import tools
     ran = []

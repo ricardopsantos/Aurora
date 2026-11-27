@@ -424,10 +424,24 @@ def _is_bare_ip(base_url: str) -> bool:
     (hostnames, including .ts.net, keep full verification)."""
     host = (urlparse(base_url).hostname or "").lower()
     try:
-        return ipaddress.ip_address(host).is_private or \
-               ipaddress.ip_address(host).is_loopback
+        ip = ipaddress.ip_address(host)
+        ip = getattr(ip, "ipv4_mapped", None) or ip       # R558: judged as the IPv4 address it maps
+        return ip.is_private or ip.is_loopback
     except ValueError:
         return False
+
+
+def _call_index(tc: dict, pending: dict) -> int:
+    """R560: the slot a tool-call delta belongs to. Without an `index` (some servers send none), a delta with a new
+    `id` is a new call (two calls used to be glued into one), and one without an id continues the last."""
+    i = tc.get("index")
+    if isinstance(i, int) and not isinstance(i, bool):
+        return i
+    if not pending:
+        return 0
+    last = max(pending)
+    tid = tc.get("id")
+    return last + 1 if tid and pending[last]["id"] and pending[last]["id"] != tid else last
 
 
 def _is_lan_host(base_url: str) -> bool:
@@ -435,14 +449,21 @@ def _is_lan_host(base_url: str) -> bool:
     somewhere a connect SHOULD fail fast when it's off. A public API
     (openrouter.ai, …) is not: its TLS handshake can legitimately be slow, so
     it gets a longer connect budget (see `_client`)."""
-    host = (urlparse(base_url).hostname or "").lower()
+    host = (urlparse(base_url).hostname or "").lower().rstrip(".")     # R558: `localhost.` is localhost
     if not host or host == "localhost" or host.endswith((".local", ".ts.net")):
         return True
     try:
-        return ipaddress.ip_address(host).is_private or \
-               ipaddress.ip_address(host).is_loopback
+        ip = ipaddress.ip_address(host)
     except ValueError:
         return False   # a public DNS name → remote
+    if getattr(ip, "ipv4_mapped", None):      # R558: `::ffff:192.168.1.5` is the IPv4 host it maps
+        ip = ip.ipv4_mapped
+    # R455 (#23): the shared/VPN range 100.64.0.0/10 is not `is_private` in Python,
+    # so a bare VPN IP was treated as a public API: never probed, "ready" when down.
+    return ip.is_private or ip.is_loopback or ip in _CGNAT
+
+
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 
 # R91: a cache breakpoint only pays off on a big, byte-identical prefix.
@@ -911,7 +932,7 @@ class OpenAICompatProvider(Provider):
                         result.text += delta["content"]
                         on_text(delta["content"])
                     for tc in delta.get("tool_calls") or []:
-                        i = tc.get("index", 0)
+                        i = _call_index(tc, pending)
                         slot = pending.setdefault(i, {"id": "", "name": "", "args": []})
                         if tc.get("id"):
                             slot["id"] = tc["id"]
@@ -973,7 +994,7 @@ class OpenAICompatProvider(Provider):
                     if self.notify:
                         try:
                             self.notify(
-                                f"· {e.__class__.__name__} — retrying "
+                                f"{e.__class__.__name__} — retrying "
                                 f"(attempt {_attempt + 2}/{_ATTEMPTS})")
                         except Exception:
                             pass

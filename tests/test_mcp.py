@@ -1095,3 +1095,66 @@ def test_pythonpath_injection_would_execute_code_in_a_python_child(tmp_path):
 
 def test_child_env_still_passes_an_ordinary_configured_var():
     assert mcp._child_env({"GITHUB_TOKEN": "abc"})["GITHUB_TOKEN"] == "abc"
+
+
+# ── R449: per-server `tools:` allowlist ────────────────────────────────────
+_MULTI_SERVER = str(Path(__file__).parent / "fixtures" / "multi_tool_mcp_server.py")
+
+
+def _multi(**extra):
+    return mcp.MCPManager([{"name": "multi", "command": sys.executable,
+                            "args": [_MULTI_SERVER], **extra}])
+
+
+def _spec_names(manager):
+    return sorted(s["name"] for s in manager.specs())
+
+
+def test_without_tools_key_every_tool_is_exposed():
+    m = _multi()
+    try:
+        assert _spec_names(m) == ["mcp_multi_echo", "mcp_multi_ping",
+                                  "mcp_multi_shout"]
+        assert m.errors == []
+    finally:
+        m.close_all()
+
+
+def test_tools_allowlist_keeps_only_the_listed_tools_in_specs_and_runners():
+    m = _multi(tools=["echo", "ping"])
+    try:
+        assert _spec_names(m) == ["mcp_multi_echo", "mcp_multi_ping"]
+        assert sorted(m.runners()) == ["mcp_multi_echo", "mcp_multi_ping"]
+        assert "mcp_multi_shout" not in m.runners()   # not callable either
+        assert m.runners()["mcp_multi_ping"](text="x") == "ping: x"
+        assert m.errors == []
+    finally:
+        m.close_all()
+
+
+def test_an_allowlisted_name_the_server_lacks_only_warns():
+    m = _multi(tools=["echo", "nope"])
+    try:
+        assert _spec_names(m) == ["mcp_multi_echo"]
+        assert any("nope" in e and "does not provide" in e for e in m.errors)
+    finally:
+        m.close_all()
+
+
+@pytest.mark.parametrize("bad", ["echo", 5, {"echo": 1}, ["echo", 3], [""]])
+def test_a_malformed_tools_value_fails_closed_and_warns(bad):
+    # an allowlist typo must never expose MORE than intended
+    m = _multi(tools=bad)
+    try:
+        assert m.specs() == [] and m.runners() == {}
+        assert any("`tools:` must be a list" in e for e in m.errors)
+    finally:
+        m.close_all()
+
+
+def test_an_empty_tools_list_exposes_nothing():
+    m = _multi(tools=[])
+    try:
+        assert m.specs() == [] and m.errors == []
+    finally:
+        m.close_all()

@@ -6,6 +6,7 @@ Cmd+Enter newline, ? help, R18), Ctrl+C interrupt (R17), slash commands,
 through its public methods.
 """
 
+import collections
 import getpass
 import re
 import subprocess
@@ -47,7 +48,7 @@ from .colors import (
     visible,
 )
 from .engine import Engine, _assistant_text
-from .paths import aurora_home, write_text_atomic
+from .paths import aurora_home, starts_with_path, write_text_atomic
 
 HELP = f"""\
 {BOLD}plain text{RESET}            talk to the model (paste is safe)
@@ -72,10 +73,8 @@ HELP = f"""\
                       binding: Ctrl+C interrupts, /quit quits at once
 {CYAN}/compact  /clear{RESET}      summarize-and-continue · start fresh
 {CYAN}/reset{RESET}                clear history + system prompt; offers to re-run /bootstrap
-{CYAN}/copy [N]{RESET}             copy Nth-last response to the clipboard (SSH-safe)
-{CYAN}/copy-last{RESET}            copy last turn: prompt, thinking, every reply (tool calls as markers)
-{CYAN}/copy-turn{RESET}            copy last turn with each tool's command and full output (SSH-safe)
-{CYAN}/copy-all{RESET}             copy the whole session — questions, answers, commands, output (SSH-safe)
+{CYAN}/copy [what]{RESET}          copy to the clipboard (SSH-safe): the last reply, or
+                      N (Nth-last reply) · turn · full · all · bash · last
 {CYAN}/redact on|off{RESET}        secret-in-prompt/tool-output detection (default ON, persisted)
 {CYAN}/status{RESET}               is the current model's backend up and ready?
 {CYAN}/cost{RESET}                 per-model token + $ breakdown across EVERY session on this
@@ -110,6 +109,35 @@ HELP = f"""\
                       clicking a matching filename in bash-mode output
                       opens it the same way
 {CYAN}/help  /quit{RESET}          this help · quit immediately (Esc Esc asks first)"""
+
+
+# R455 (#28): the TUI's `?` screen: TUI keys only, grouped, one line each.
+# Details stay in `/<command> help`; the classic REPL keeps HELP above.
+TUI_HELP = f"""\
+{BOLD}Basics{RESET}
+{BOLD}plain text{RESET}            talk to the model (paste is safe)
+{BOLD}/{RESET}                     commands (Tab completes) · {CYAN}/<command> help{RESET} for details
+{BOLD}!{RESET}                     bash mode ($): run shell commands, no model
+{BOLD}?{RESET}                     this help (on an empty prompt)
+
+{BOLD}Keys{RESET}
+{BOLD}Esc{RESET}                   clear input · close a menu · hide this help
+{BOLD}Esc Esc{RESET}               cancel busy work · leave bash mode · quit (asks first)
+{BOLD}Ctrl+J{RESET}                newline (or type {BOLD}\\n{RESET} / {BOLD}\\br{RESET})
+{BOLD}Alt+M{RESET}                 multiline mode: Enter newline, Alt+Enter submits
+
+{BOLD}Commands{RESET}
+{CYAN}/model{RESET}                pick a model · {CYAN}/model add <url>{RESET} · {CYAN}/status{RESET}
+{CYAN}/compact  /clear{RESET}      summarize and continue · start fresh
+{CYAN}/copy [what]{RESET}          last reply · N · turn · full · all · bash · last
+{CYAN}/undo  /rewind  /diff{RESET} undo the last change · restore a checkpoint · show changes
+{CYAN}/resume  /search{RESET}      pick a past session · search all sessions
+{CYAN}/plan  /auto-approve{RESET}  read-only planning · skip approval prompts
+{CYAN}/thinking  /markdown{RESET}  show reasoning live · pretty rendering [on|off]
+{CYAN}/cost  /context{RESET}       spending across sessions · what fills the context
+{CYAN}/skills  /extensions{RESET}  list skills · list extension tools
+{CYAN}/nano <file>{RESET}          edit a text file (click a file name in bash output too)
+{CYAN}/help  /quit{RESET}          every command · quit"""
 
 
 def help_text() -> str:
@@ -180,7 +208,7 @@ class TerminalFrontend:
             sys.stdout.write(f"{DIM}{chunk}{RESET}")
             sys.stdout.flush()
         elif not self._think_marker_shown:
-            sys.stdout.write(dim("(thinking… — /copy-last includes it, "
+            sys.stdout.write(dim("(thinking… — /copy turn includes it, "
                                  "or /thinking to stream it live)"))
             sys.stdout.flush()
             self._think_marker_shown = True
@@ -203,7 +231,9 @@ class TerminalFrontend:
 
     def notify(self, message: str) -> None:
         self._flush_partial_text()                          # R288
-        print(f"\n{YELLOW}· {message}{RESET}")
+        # R455 (#27): a retry line continues the notice above it, no blank line
+        gap = "" if " — retrying (attempt " in message else "\n"
+        print(f"{gap}{YELLOW}· {message}{RESET}")
 
     # prompts (called from the worker thread; main thread is join-waiting)
     def approve(self, tool: str, args: dict, diff: str) -> tuple[str, str]:  # noqa: C901
@@ -700,6 +730,15 @@ def _pick_model(engine: Engine, fe: TerminalFrontend,
         for m in models:
             provider = engine.probe_provider_for(m)
             fn = getattr(provider, "model_health", None) if provider else None
+            if provider is not None and m.get("model") == "local":
+                # re-read what each backend has loaded on every open, so the
+                # "local → <model>" labels are never stale. Its own thread: it
+                # must not wait for (or be lost to) the health probe below.
+                th = threading.Thread(target=engine.refresh_live_name,
+                                      args=(provider, m.get("provider")),
+                                      name="model-live-name", daemon=True)
+                th.start()
+                threads.append(th)
             if not callable(fn):
                 continue
 
@@ -725,9 +764,13 @@ def _pick_model(engine: Engine, fe: TerminalFrontend,
         entries = []       # (label, payload)
         current_index = 0  # which entry is the active model — pre-highlighted
         # alphabetical picker: config models A→Z
-        for m in sorted(engine.list_models(),
-                        key=lambda m: str(m.get("model", "")).lower()):
+        listed = sorted(engine.list_models(), key=lambda m: str(m.get("model", "")).lower())
+        # R442: with two or more providers serving the same model name (typically several
+        # `local` servers) a bare "local" row says nothing, so those rows read provider/model
+        seen_names = collections.Counter(str(m.get("model", "")) for m in listed)
+        for m in listed:
             name = m.get("model", "")
+            where = f"{m.get('provider')}/" if seen_names[str(name)] > 1 else ""
             health_key = (m.get("provider"), name)
             is_openrouter = name != "local" and "openrouter" in str(m.get("provider", ""))
             remote = REMOTE_CONTEXT_LIMITS.get(name, {}) if is_openrouter else {}
@@ -757,11 +800,14 @@ def _pick_model(engine: Engine, fe: TerminalFrontend,
                     # construction before the menu even renders. Serves cache
                     # (or None the first time) and refreshes in the background.
                     provider = engine.probe_provider_for(m)
-                    live = engine._live_model_name_nonblocking(provider)
+                    live = engine._live_model_name_nonblocking(
+                        provider, m.get("provider"))
                 if live:
                     name = f"local {DIM}→ {live}{RESET}"
             is_current = (m.get("provider"), m.get("model")) == cur_key
-            mark = f"  {GREEN}{BOLD}✔{RESET}" if is_current else ""
+            # R455 (#24): "current" in words: a green ✔ next to "⚠ unreachable" read as
+            # two opposite statuses (✔ means "ready" in the header)
+            mark = f"  {BOLD}(current){RESET}" if is_current else ""
             no_key = (f"  {RED}(no key set){RESET}"
                       if not engine.has_key(m.get("provider")) else "")
             # R297: a config entry can name a model that was never actually
@@ -771,11 +817,13 @@ def _pick_model(engine: Engine, fe: TerminalFrontend,
             # (nothing to check for this provider, e.g. a remote paid API)
             # for most entries — only an explicit {"ok": False} warns.
             bad = health.get(health_key)
-            warn = (f"  {RED}⚠ {bad.get('detail') or 'unavailable'}{RESET}"
-                    if bad is not None and not bad.get("ok") else "")
+            why = None if bad is not None and bad.get("ok") else \
+                (getattr(engine, "unusable_models", {}) or {}).get(health_key)   # R580
+            warn = (f"  {RED}⚠ {why or bad.get('detail') or 'unavailable'}{RESET}"
+                    if why or (bad is not None and not bad.get("ok")) else "")
             if is_current:
                 current_index = len(entries)
-            entries.append((f"{name}{mark}  {tag} {info}{no_key}{warn}", m))
+            entries.append((f"{where}{name}{mark}  {tag} {info}{no_key}{warn}", m))
         return entries, current_index
 
     # Bounded total (parallel, not per-model) — stragglers picked up below.
@@ -844,7 +892,10 @@ def _pick_model(engine: Engine, fe: TerminalFrontend,
 
     chosen = select(prompt, options, default_index=current_index)
     if chosen is None:   # TUI: menu dismissed (e.g. a second click on the
-        return            # status bar's model name) — no change
+        # status bar's model name) — no change. R455 (#33): say so, or the
+        # echoed `> /model` sits in the transcript with no result under it.
+        print(dim("· cancelled — model unchanged"))
+        return
     if chosen == "add":
         raw = input(f"{YELLOW}OpenRouter model URL or org/model:{RESET} ").strip()
         if raw:
@@ -852,6 +903,16 @@ def _pick_model(engine: Engine, fe: TerminalFrontend,
         return
     idx = int(chosen) - 1
     _, payload = entries[idx]
+    # R580: a model that cannot work here is not picked — say why and keep the current one
+    pk = (payload.get("provider"), payload.get("model"))
+    bad = health.get(pk)
+    why = ("" if bad is not None and bad.get("ok")        # a live answer beats the startup check
+           else (getattr(engine, "unusable_models", {}) or {}).get(pk)
+           or ((bad.get("detail") or "unavailable") if bad is not None else ""))
+    if why:
+        keep = engine.current.get("model") or "no model"
+        print(f"{YELLOW}· {payload.get('model')} can't be used here: {why} — keeping {keep}{RESET}")
+        return
 
     pkey = payload.get("provider")
     if not engine.has_key(pkey):
@@ -1051,16 +1112,12 @@ def _remove_model_cmd(engine: Engine, arg: str) -> None:
 COMMAND_INFO = {
     "model":     "model picker — OpenRouter $ · local free · add/remove <url>",
     "status":    "is the current model's backend up and ready?",
-    "thinking":  "toggle the live dim reasoning stream",
-    "markdown":  "toggle pretty rendering vs raw text",
+    "thinking":  "live dim reasoning stream [on|off] (persisted)",
+    "markdown":  "pretty rendering vs raw text [on|off] (persisted)",
     "compact":   "summarize-and-continue (frees context)",
     "clear":     "start fresh — history cleared",
     "reset":     "clear history + system prompt; offers /bootstrap",
-    "copy":      "copy Nth-last response to the clipboard",
-    "copy-last": "copy last turn: prompt, thinking, every reply (tool calls as markers)",
-    "copy-turn": "copy last turn: everything — also each tool's command and full output",
-    "copy-response": "copy just the model's final reply from the last turn",
-    "copy-all":  "copy the whole session (questions, answers, commands, output)",
+    "copy":      "copy: last reply · N · turn · full · all · bash · last",
     "redact":    "secret detection on|off · allowlist [clear] (persisted)",
     "cost":      "per-model token + $ breakdown across every session on this machine",
     "context":   "cost tree — this session as turns, tokens, tools and $",
@@ -1085,7 +1142,7 @@ COMMAND_INFO = {
     "skills":    "list installed skills",
     "extensions": "list loaded extension tools + how to add one",
     "bootstrap": "run the saved bootstrap prompt (set/show/clear)",
-    "multiline": "toggle multiline mode: Enter newline, Alt+Enter submit (persisted)",
+    "multiline": "multiline mode [on|off]: Enter newline, Alt+Enter submit (persisted)",
     "nano":      "open a text file (.txt/.md/.json/.yml/.yaml/.xml/.sh, up to 1MB) "
                  "in the built-in editor (TUI only)",
     "help":      "all commands and keys",
@@ -1112,7 +1169,7 @@ COMMANDS = list(COMMAND_INFO)
 # file and qualifies; it writes a fresh transcript, not shared session state.
 SIDE_SAFE_COMMANDS = frozenset({
     "status", "cost", "context", "diff", "skills", "extensions",
-    "allowlist", "denylist", "plan", "auto-approve", "budget", "try", "copy", "copy-last", "copy-turn", "copy-all", "export",
+    "allowlist", "denylist", "plan", "auto-approve", "budget", "try", "copy", "export",
     "help", "sessions",
 })
 
@@ -1125,6 +1182,19 @@ LIVE_TOGGLES = frozenset({"fallback", "multiline", "redact", "cache", "autocompa
 LIVE_DISPLAY_TOGGLES = frozenset({"thinking", "markdown"})
 
 
+# R453 (#12): the five copy commands became one, `/copy <what>`. The old
+# names still work but are no longer listed (help, completion, manual).
+COPY_ALIASES = {"copy-last": "last", "copy-turn": "full",
+                "copy-response": "", "copy-all": "all"}
+COPY_USAGE = "· usage: /copy [N | turn | full | all | bash | last]"
+
+
+def _resolve_copy_alias(cmd: str, arg: str) -> tuple[str, str]:
+    if cmd in COPY_ALIASES:
+        return "copy", (COPY_ALIASES[cmd] + " " + arg).strip()
+    return cmd, arg
+
+
 def side_safe_command(line: str) -> bool:
     """Is this `/…` line safe to run on the side channel (R253)?
 
@@ -1134,6 +1204,7 @@ def side_safe_command(line: str) -> bool:
     `/rewind help` reads the manual without arming the command itself."""
     cmd, _, arg = line[1:].partition(" ")
     cmd, arg = cmd.strip().lower(), arg.strip().lower()
+    cmd, arg = _resolve_copy_alias(cmd, arg)
     if arg in ("help", "man") and cmd in COMMAND_INFO:
         return True
     if cmd in LIVE_DISPLAY_TOGGLES:
@@ -1713,10 +1784,83 @@ def _cost_report(engine: Engine) -> str:
     return "\n".join(out)
 
 
+def _on_off(arg: str, current: bool, bare_flips: bool) -> bool | None:
+    """R453: the one argument rule for every on/off command. `on`/`off` set
+    it; a bare command flips a display toggle (`bare_flips`) and leaves a
+    setting as it is (it just shows it, so checking `/redact` never turns
+    redaction off); anything else is None, for the caller's usage line."""
+    a = arg.strip().lower()
+    if a in ("on", "off"):
+        return a == "on"
+    if not a:
+        return (not current) if bare_flips else current
+    return None
+
+
+def _copy_cmd(engine: Engine, fe: TerminalFrontend, arg: str) -> None:
+    """R453 (#12): `/copy [what]`, the one copy command. Each message says
+    what was actually copied."""
+    what = arg.strip().lower()
+    label = ""
+    if not what:
+        # R256: the final reply of the last turn (skips a trailing tool-call-
+        # only message, never reaches back into an earlier turn)
+        text, label = _outbound(engine.last_turn_final_reply()), "last reply"
+        if not text:
+            print("· no reply in the last turn to copy")
+            return
+    elif what.isdigit():
+        n = int(what)
+        text, label = _outbound(engine.nth_response(n)), (
+            "last response" if n == 1 else f"response {n} back")
+    elif what == "turn":
+        text = _outbound(_raw_last_response_text(engine, fe))
+        label = "last turn (prompt, thinking, replies)"
+    elif what == "full":
+        text = _outbound(_raw_last_response_text(engine, fe, everything=True))
+        label = "whole last turn (thinking, commands and output included)"
+    elif what == "all":
+        text, label = _all_chat_text(engine), "whole chat"
+        if not text.strip():
+            print("· nothing to copy yet")
+            return
+    elif what == "bash":
+        tui = getattr(fe, "_tui", None)
+        text = _outbound(getattr(tui, "_last_bash_output", "") if tui else "")
+        label = "last bash-mode output"
+        if not text:
+            print("· no bash-mode output to copy")
+            return
+    elif what == "last":
+        text, label = _last_copyable_text(engine, fe)
+        label = ("last bash-mode output (it came after the last turn)"
+                 if label == "command output"
+                 else "last turn (prompt, thinking, replies)")
+    else:
+        print(COPY_USAGE)
+        return
+    if not text:
+        print("· no such response")
+        return
+    print(f"· {label} copied via {clipboard.copy(text)}")
+
+
+def _persist_display(engine: Engine, key: str, on: bool) -> None:
+    """R453: `/thinking` and `/markdown` are saved like `/multiline` (they
+    are read back from `runtime:` at start-up). A config that cannot be
+    written keeps the change for this session."""
+    from .config import persist_runtime_value
+    try:
+        persist_runtime_value(engine.cfg, key, on)
+    except (OSError, KeyError, TypeError) as e:
+        print(dim(f"  (not saved: {e})"))
+
+
 def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
     """Returns False to exit the REPL."""
     cmd, _, arg = line[1:].partition(" ")
     cmd, arg = cmd.strip().lower(), arg.strip()
+    cmd, arg = _resolve_copy_alias(cmd, arg)                 # R453
 
     # `/<cmd> help` (alias `man`) — feature request, 2026-07-27: works for
     # EVERY command uniformly, checked once here rather than wired into
@@ -1760,43 +1904,7 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
         n = engine.compact_history(notify=fe.notify)
         print(f"· compacted {n} messages into one" if n else "· nothing to compact")
     elif cmd == "copy":
-        n = int(arg) if arg.isdigit() else 1
-        text = _outbound(engine.nth_response(n))   # R208
-        if not text:
-            print("· no such response")
-        else:
-            print(f"· copied via {clipboard.copy(text)}")
-    elif cmd == "copy-last":
-        text, label = _last_copyable_text(engine, fe)
-        if not text:
-            print("· no such response")
-        else:
-            suffix = " (thinking included)" if label == "raw response" else ""
-            print(f"· {label}{suffix} copied via {clipboard.copy(text)}")
-    elif cmd == "copy-turn":
-        text = _outbound(_raw_last_response_text(engine, fe, everything=True))
-        if not text:
-            print("· no such response")
-        else:
-            print(f"· whole last turn (thinking, commands and output included) "
-                  f"copied via {clipboard.copy(text)}")
-    elif cmd == "copy-response":
-        # R256: the narrow counterpart to /copy-last. Same "last turn" scope,
-        # but only what the model finally said — no prompt, no thinking, no
-        # tool markers. `last_turn_final_reply` skips a trailing tool-call-
-        # only message, which is how a turn stopped at the approval gate ends
-        # and where plain `/copy` hands back an empty string.
-        text = _outbound(engine.last_turn_final_reply())
-        if not text:
-            print("· no reply in the last turn to copy")
-        else:
-            print(f"· final reply copied via {clipboard.copy(text)}")
-    elif cmd == "copy-all":
-        text = _all_chat_text(engine)
-        if not text.strip():
-            print("· nothing to copy yet")
-        else:
-            print(f"· whole chat copied via {clipboard.copy(text)}")
+        _copy_cmd(engine, fe, arg)
     elif cmd == "redact":
         if arg.lower() == "allowlist":
             n = len(engine.secret_allowlist)
@@ -1806,8 +1914,12 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
             engine.clear_secret_allowlist()
             print("· allowlist cleared")
         else:
-            if arg.lower() in ("on", "off"):
-                engine.set_redact_secrets(arg.lower() == "on")
+            on = _on_off(arg, engine.redact_secrets, bare_flips=False)   # R453
+            if on is None:
+                print("· usage: /redact on|off | /redact allowlist [clear]")
+                return True
+            if on != engine.redact_secrets:
+                engine.set_redact_secrets(on)
             print(f"· secret redaction {'ON' if engine.redact_secrets else 'OFF'} "
                  f"(persisted; usage: /redact on|off | /redact allowlist [clear])")
     elif cmd == "cost":
@@ -1824,8 +1936,12 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
         from . import ctxtree
         print(ctxtree.report(engine, arg))
     elif cmd == "cache":
-        if arg.lower() in ("on", "off"):
-            engine.set_prompt_cache(arg.lower() == "on")
+        on = _on_off(arg, engine.prompt_cache, bare_flips=False)    # R453
+        if on is None:
+            print("· usage: /cache [on|off]")
+            return True
+        if on != engine.prompt_cache:
+            engine.set_prompt_cache(on)
         state = "ON" if engine.prompt_cache else "OFF"
         active = "yes" if engine.cache_enabled() else "no (this model)"
         print(f"· prompt caching {state} (persisted) · active on the current "
@@ -1860,8 +1976,12 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
               + dim("  /autocompact on|off · /autocompact <pct> · "
                     "/autocompact keep=<tokens>"))
     elif cmd == "fallback":
-        if arg.lower() in ("on", "off"):
-            engine.set_model_fallback(arg.lower() == "on")
+        on = _on_off(arg, engine.model_fallback, bare_flips=False)  # R453
+        if on is None:
+            print("· usage: /fallback [on|off]")
+            return True
+        if on != engine.model_fallback:
+            engine.set_model_fallback(on)
         state = "ON" if engine.model_fallback else "OFF"
         chain = ", ".join(m.get("model", "?") for m in engine._fallback_models())
         print(f"· model fallback {state} (persisted) — on a hard provider "
@@ -1892,15 +2012,29 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
               "that needs approval runs; /plan off to let it act"
               if engine.plan_mode else "· plan mode OFF")
     elif cmd == "multiline":
-        engine.set_multiline(not engine.multiline)
+        on = _on_off(arg, engine.multiline, bare_flips=True)        # R453
+        if on is None:
+            print("· usage: /multiline [on|off]")
+            return True
+        engine.set_multiline(on)
         print(f"· multiline {'ON' if engine.multiline else 'OFF'} "
               f"(Enter inserts newline, Alt+Enter submits; persisted)")
     elif cmd == "thinking":
-        fe.show_thinking = not fe.show_thinking
-        print(f"· live thinking view {'ON (dim stream)' if fe.show_thinking else 'OFF (marker only)'}")
+        on = _on_off(arg, fe.show_thinking, bare_flips=True)        # R453
+        if on is None:
+            print("· usage: /thinking [on|off]")
+            return True
+        fe.show_thinking = on
+        _persist_display(engine, "show_thinking", on)
+        print(f"· live thinking view {'ON (dim stream)' if fe.show_thinking else 'OFF (marker only)'} (persisted)")
     elif cmd == "markdown":
-        fe.render_md = not fe.render_md
-        print(f"· markdown rendering {'ON' if fe.render_md else 'OFF (raw text)'}")
+        on = _on_off(arg, fe.render_md, bare_flips=True)            # R453
+        if on is None:
+            print("· usage: /markdown [on|off]")
+            return True
+        fe.render_md = on
+        _persist_display(engine, "render_markdown", on)
+        print(f"· markdown rendering {'ON' if fe.render_md else 'OFF (raw text)'} (persisted)")
     elif cmd == "status":
         h = engine.provider_health()
         mark = f"{GREEN}✔{RESET}" if h["ok"] else f"{RED}✘{RESET}"
@@ -2074,6 +2208,11 @@ def _handle_command(engine: Engine, fe: TerminalFrontend, line: str) -> bool:
         base_dir = engine.cfg.get("_base_dir")
         if cmd in skills.discover(base_dir):
             print(skills.run(cmd, arg, base_dir))
+        elif (skills.load_doc(cmd, engine.cfg.get("doc_skill_roots")) is None
+              and starts_with_path(line)):
+            # R453: `/tmp is full` — no skill by that name, and the word is an
+            # existing path: a message, not "[unknown skill: /tmp]"
+            _run_turn(engine, fe, line)
         else:
             _run_doc_skill(engine, fe, cmd, arg)
     return True
@@ -2108,15 +2247,69 @@ TYPED_ONLY_COMMANDS = frozenset({
 })
 
 
+def model_sanity(engine: Engine, timeout: float = 2.0) -> list[tuple[dict, str]]:
+    """R580: the configured models that cannot work on this machine, with why: each local/LAN entry's own health
+    probe (all at once, `timeout` in total). An Ollama entry on a machine without Ollama says so. Hosted entries
+    (no probe) are never listed. Never raises."""
+    import threading
+    from . import diagnose
+    bad: list[tuple[dict, str]] = []
+    lock = threading.Lock()
+
+    def check(m):
+        pcfg = (engine.cfg.get("providers") or {}).get(m.get("provider"), {}) or {}
+        base = pcfg.get("base_url")
+        base = base[0] if isinstance(base, list) and base else base or ""
+        if diagnose.server_installed(pcfg.get("type") == "ollama", str(base)) is False:
+            with lock:                                   # known without a probe
+                bad.append((m, "Ollama is not installed on this machine"))
+            return
+        try:
+            provider = engine.probe_provider_for(m)
+            fn = getattr(provider, "model_health", None) if provider else None
+            h = fn(m.get("model")) if callable(fn) else None
+        except Exception:
+            return
+        if h is None or h.get("ok"):
+            return
+        why = h.get("detail") or "unavailable"
+        with lock:
+            bad.append((m, why))
+    threads = [threading.Thread(target=check, args=(m,), daemon=True) for m in engine.list_models()]
+    for t in threads:
+        t.start()
+    import time
+    end = time.monotonic() + timeout
+    for t in threads:
+        t.join(max(0.0, end - time.monotonic()))
+    with lock:
+        return sorted(bad, key=lambda r: (str(r[0].get("provider")), str(r[0].get("model"))))
+
+
+def _report_model_sanity(engine: Engine) -> None:
+    """R580: one startup line naming the configured models that will not work here."""
+    try:
+        bad = model_sanity(engine)
+    except Exception:
+        return
+    engine.unusable_models = {(m.get("provider"), m.get("model")): why for m, why in bad}
+    if bad:
+        rows = "; ".join(f"{m.get('provider')} · {m.get('model')} ({why})" for m, why in bad)
+        print(f"{YELLOW}· {len(bad)} configured model{'s' if len(bad) > 1 else ''} won't work here: {rows}"
+              f" — they can't be picked; remove them from config.yaml{RESET}")
+
+
 def _offer_model_picker(engine: Engine, fe, health: dict) -> None:
     """R345: the default model failed its startup check — open the model picker
     right away (rows already carry per-model health warnings) so the user can
     switch; Esc / blank keeps going. Never raises: a broken picker must not
     stop the session from starting."""
+    _report_model_sanity(engine)          # R580
     if not health or health.get("ok") or not engine.list_models():
         return
     try:
-        print(dim("· pick another model to start with, or Esc to keep this one"))
+        print(dim("· pick a model to start with, or Esc to start without one" if not engine.current.get("model")
+                  else "· pick another model to start with, or Esc to keep this one"))
         _pick_model(engine, fe)
     except Exception:
         pass
@@ -2262,7 +2455,9 @@ def run(engine: Engine) -> None:
             print(help_text())
             continue
         if line.startswith("!"):  # local bash, no LLM (R10)
-            subprocess.run(line[1:], shell=True)
+            from . import tools as _tools
+            subprocess.run(line[1:], shell=True,                # R452: bash
+                           executable=_tools._shell_executable())
             continue
         # R214: a prompt anywhere UNDER here (a menu, a guidance comment, a
         # paste) reads stdin too, and its EOF used to escape `run()` entirely

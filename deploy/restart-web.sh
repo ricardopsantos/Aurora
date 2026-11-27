@@ -11,7 +11,13 @@ sudo -n systemctl restart "$UNIT"
 for _ in $(seq 1 30); do
   got="$(curl -s -m 2 "http://$HOST:$PORT/health" | "$REPO/.venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)"
   if [ -n "$got" ]; then
-    [ "$got" = "$want" ] && { echo "restart-web: $UNIT up, version $got"; exit 0; }
+    if [ "$got" = "$want" ]; then
+      # R509: say which Rust core the page will use; a debug build or none is worth a line in the log
+      core="$(curl -s -m 2 "http://$HOST:$PORT/health" | "$REPO/.venv/bin/python" -c 'import json,sys; c=json.load(sys.stdin).get("code",{}); print(c.get("core_build","?"))' 2>/dev/null || echo '?')"
+      echo "restart-web: $UNIT up, version $got, Rust core: $core"
+      [ "$core" = release ] || [ "$core" = installed ] || echo "restart-web: warning: no release aurora-rs (run ./install.sh)" >&2
+      exit 0
+    fi
     echo "restart-web: $UNIT answers version $got, expected $want" >&2; exit 1
   fi
   sleep 1

@@ -52,8 +52,12 @@ def create(cwd=".") -> Sandbox:
     root = toplevel(cwd)
     if _git(root, "rev-parse", "--verify", "HEAD", check=False).returncode:
         raise TryError("the repository has no commits yet")
-    path = aurora_home() / "try" / time.strftime("%Y%m%d-%H%M%S")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    base = aurora_home() / "try" / time.strftime("%Y%m%d-%H%M%S")
+    base.parent.mkdir(parents=True, exist_ok=True)
+    path, n = base, 1
+    while path.exists():                  # R536: a second /try in the same second got "already exists"
+        n += 1
+        path = base.with_name(f"{base.name}-{n}")
     _git(root, "worktree", "add", "--detach", str(path), "HEAD")
     try:
         dirty = _git(root, "diff", "HEAD", "--binary").stdout
@@ -63,8 +67,11 @@ def create(cwd=".") -> Sandbox:
         for rel in filter(None, others.stdout.decode().split("\0")):
             dst = path / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-            if (root / rel).is_file():
-                shutil.copy2(root / rel, dst, follow_symlinks=False)
+            src = root / rel
+            if src.is_symlink():          # R537: a link (to a folder too) is copied as the link, never dropped
+                os.symlink(os.readlink(src), dst)
+            elif src.is_file():
+                shutil.copy2(src, dst, follow_symlinks=False)
         _git(path, "add", "-A")
         _git(path, *_ID, "commit", "-q", "--allow-empty", "-m", "try baseline")
     except BaseException:

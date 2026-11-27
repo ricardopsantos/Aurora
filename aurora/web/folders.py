@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 
-from ..service import aurora_home
+from ..service import aurora_home, write_text_atomic
 
 MAX_NAME = 60
 MAX_FOLDERS = 100
@@ -50,15 +50,28 @@ def _load() -> dict:
 
 
 def _save(d: dict) -> None:
-    p = _file()
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(json.dumps(d, ensure_ascii=False))
-    os.replace(tmp, p)
+    write_text_atomic(_file(), json.dumps(d, ensure_ascii=False))      # R513: 0600 from the start, UTF-8, fsynced
+
+
+_cache: tuple = (None, None)      # R517: ((mtime_ns, size, inode), parsed) of web-chats.json
 
 
 def view() -> dict:
+    """R517: the parsed store, re-read only when the file changed (every sidebar refresh, search and share hit
+    used to read and parse it again). A copy, so a caller cannot change the cache."""
+    import copy
+    global _cache
     with _lock:
-        return _load()
+        try:
+            st = _file().stat()
+            sig = (str(_file()), st.st_mtime_ns, st.st_size, st.st_ino)   # a save is a rename: a new inode
+        except OSError:
+            sig = None
+        if sig is not None and _cache[0] == sig:
+            return copy.deepcopy(_cache[1])
+        d = _load()
+        _cache = (sig, d) if sig is not None else (None, None)
+        return copy.deepcopy(d)
 
 
 def hide_chat(sid: str) -> None:

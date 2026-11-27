@@ -260,3 +260,52 @@ Part of the index in [`../REQUIREMENTS.md`](../REQUIREMENTS.md); numbers are sha
     `nokey` ("no API key set") instead of `✘ remote API`.
 
     **Test:** `tests/test_diagnose.py`.
+
+- **R480 — The Rust OpenAI-compatible provider (owner, 2026-11-24).** One provider in `aurora-providers` serves
+  OpenRouter, llama.cpp and Ollama as Python's `openai_compat` does: streamed text, `reasoning_content`, usage (with
+  `stream_options.include_usage`), tool calls put together from fragments by index, and a call whose arguments are not
+  a JSON object rejected as malformed (R268). Three attempts: a 429 waits 1 s then 3 s, or `Retry-After` up to 30 s;
+  a dropped connection is retried, but a stream cut after text arrived keeps that text. LAN servers are probed first
+  (llama.cpp `/props`, Ollama `/`), the answer cached 10 s, a dead URL skipped for 120 s, so a list of `base_url`s
+  fails over. `api_key: none` sends no key; TLS checks are skipped only for a bare private IP; Esc (cancel) ends the
+  stream at once. Tool-call arguments go back to the model byte for byte as Python sends them (`json.dumps` spacing and
+  `\u` escapes), so both send the same history. Tests: `cargo test -p aurora-providers` (a scripted HTTP server).
+
+- **R497 — Provider requests match Python on the wire (owner, 2026-11-26).** `tests/test_rust_providers_r497.py`
+  sends the same headless task to a llama.cpp-style (R2), an Ollama-style (R223) and a remote OpenAI-style provider
+  (R91) on one scripted server. It checks that the Rust and Python request bodies are equal (model, stream options,
+  tools and messages; the system text is excluded because it names the cwd). Headless system prompts are under R91's
+  4 KiB threshold, so there the breakpoint is never sent. The marker itself is covered by the Rust provider unit
+  tests. Live endpoints are review note N2.
+
+- **R502 — Live tests against a real local model, on both cores (review note N2) (owner, 2026-11-26).**
+  `tests/test_live_r502.py` is skipped unless `AURORA_LIVE=1`. It uses only a local server named by `AURORA_LIVE_URL` (llama.cpp or Ollama; a key, if
+  any, in `LLAMA_API_KEY`), never a paid key. On each core a real model streams
+  a reply, makes a real `read_file` call, and the session records the call and an answer that holds what it read. A
+  small model words things differently each run, so the checks are on the shape. The nightly (R503) runs it when its
+  environment file turns it on.
+
+- **R504 — A failed model request reads the same on both cores, and never shows the config-key name (R345, R455, R499) (owner, 2026-11-26).**
+  `agent.provider_error_notices(provider, msg)` holds Python's wording for a failed request: context full, rate
+  limited, unreachable (with the cause and fix list, never the raw error, which names the provider's config key),
+  a diagnosable failure, or the plain error. Python's loop uses it, and `aurora/rustcore.py` renders the Rust core's
+  `provider error: …` notice through it, dropping Rust's own follow-up lines. The Rust provider's transport error now
+  carries its kind and its whole cause chain (`request failed (ConnectError): …: Connection refused`), so it
+  classifies the same. Test: `tests/test_core.py::test_piped_input_actually_runs_a_turn` on both cores (the nightly runs
+  the suite with `AURORA_CORE=rust`).
+
+- **R505 — The provider bridge: Python's provider objects drive the Rust loop, so Python's whole suite tests it (owner, 2026-11-26).**
+  `aurora-rs --core --provider-bridge` asks the front end to run each model request
+  (`{"ev":"provider",…}`); Python runs the provider object it was given in-process (an embedding or a test's fake)
+  and streams chunks back (`provider_chunk`), then answers with the result and its assistant message, or the error
+  (malformed tool calls kept apart). The adapter uses the bridge whenever `Engine._provider_for` was replaced, and
+  checks for a cancel before each request, as Python's loop does. Only a replaced `agent.run_turn` (a Python loop
+  swapped in) still keeps a turn on Python. `AURORA_CORE=python|rust` overrides `runtime.core`. Tests: the whole
+  suite with `AURORA_CORE=rust` (the nightly's second run): every engine test with a fake provider runs on the
+  Rust loop. Each turn also carries the model entry's `tools` flag as Python sees it. D9 in
+  `06-DELIBERATE-DIFFERENCES.md` is the one behaviour kept different.
+
+- **R506 — The Rust core sends the model Python's system prompt (R30, R460, R499) (owner, 2026-11-26).**
+  Each `turn` request carries the system prompt Python composed (environment, skills, the web page's notes, …) and
+  the core uses it for that turn, so the model sees the same prompt on both cores. Found by R505: the web page's
+  linked notes (R460) never reached the model on the Rust core. Test: `tests/test_web_r460.py` with `AURORA_CORE=rust`.

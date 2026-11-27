@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Aurora nightly at 03:30
+
+[Timer]
+OnCalendar=*-*-* 03:30
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

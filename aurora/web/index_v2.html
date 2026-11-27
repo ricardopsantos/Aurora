@@ -74,7 +74,11 @@ code,pre{font-family:var(--font-mono);font-size:var(--fs-mono)}
 
 /* sidebar: the chats */
 #side{width:var(--side);flex:none;background:var(--panel);display:flex;flex-direction:column;height:100dvh;padding:var(--sp-half);padding-top:max(var(--sp-half),env(safe-area-inset-top));padding-bottom:max(var(--sp-half),env(safe-area-inset-bottom));gap:0;border-right:1px solid var(--line)}
-body.sb-closed #side{display:none}
+/* R443: the sidebar slides instead of vanishing: a negative left margin takes it off screen (the page widens as it goes),
+   and it is hidden from keyboard and screen readers once it has arrived */
+#side{margin-left:0;transition:margin-left .22s ease,visibility 0s}
+body.sb-closed #side{margin-left:calc(-1*var(--side) - 1px);visibility:hidden;transition:margin-left .22s ease,visibility 0s .22s}
+body.sb-init #side,body.sb-init.sb-closed #side{transition:none}   /* R451: the first state is applied without sliding */
 .brand{display:flex;align-items:center;gap:var(--sp-half);padding:4px 4px var(--sp-half) 8px;min-height:44px}
 .brand img,.brand .logo{width:24px;height:24px;border-radius:6px;flex:none;background:#1d1e21 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cg fill='none' stroke='%23f1ead0' stroke-width='1.5' stroke-linecap='round'%3E%3Cpath d='M8 12.5C9 7.8 13 6 17 6.2c5.6.3 9 3.7 9 9.2 0 6.5-4.4 10.3-9.7 10.3S7 22.4 7.4 16' stroke-dasharray='3.2 1.8'/%3E%3Cpath d='M13.9 20.2c1.7 1.2 3.5 1.2 5.2 0'/%3E%3Cg transform='rotate(-28 8 8)'%3E%3Cpath d='M8 8C6.6 5.6 3.6 5.4 3.4 7.6c-.2 2 2.8 2.4 4.6.4zM8 8c1.4-2.4 4.4-2.6 4.6-.4.2 2-2.8 2.4-4.6.4z'/%3E%3C/g%3E%3C/g%3E%3Cg stroke='%23f1ead0' stroke-width='1.8' stroke-linecap='round'%3E%3Cpath d='M12.4 13.8v2.4M20.6 13.8v2.4'/%3E%3C/g%3E%3C/svg%3E") center/20px no-repeat}
 .brand b{font-size:var(--fs-title);font-weight:600}
@@ -310,9 +314,10 @@ dialog .bar .btn,.ntop .btn{height:36px}
 
 /* phone: the chats slide over, everything a thumb touches is 44 px */
 @media (max-width:768px){
-  #side{position:fixed;inset:0 auto 0 0;z-index:40;width:min(300px,85vw);border-right:0;box-shadow:0 0 40px rgba(0,0,0,.35);animation:slide .2s ease-out}
-  @keyframes slide{from{transform:translateX(-24px);opacity:0}to{transform:none;opacity:1}}
-  body:not(.sb-closed) #scrim{display:block;position:fixed;inset:0;z-index:35;background:rgba(0,0,0,.45)}
+  #side{position:fixed;inset:0 auto 0 0;z-index:40;width:min(300px,85vw);border-right:0;box-shadow:0 0 40px rgba(0,0,0,.35)}
+  body.sb-closed #side{margin-left:calc(-1*min(300px,85vw) - 40px)}
+  @keyframes scrim-in{from{opacity:0}to{opacity:1}}
+  body:not(.sb-closed) #scrim{display:block;position:fixed;inset:0;z-index:35;background:rgba(0,0,0,.45);animation:scrim-in .22s ease}
   #sb-toggle{display:inline-flex}
   header{padding-inline:4px}
   #chat-title{font-size:16px;padding-left:0}
@@ -339,7 +344,7 @@ dialog .bar .btn,.ntop .btn{height:36px}
   .nav,.chat,.searchbox,.opt,#chats-cap,.btn,#sid,#live-line{min-height:44px}
   #log details summary{min-height:32px}
 }
-@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important}}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
 
 /* R389/R390: dropdown Menu controls, the Commands popup beside Send, the Notes dialog */
 .sel{width:100%;min-height:40px;padding:6px 10px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--panel);color:var(--fg)}
@@ -382,6 +387,11 @@ dialog .bar .btn,.ntop .btn{height:36px}
 #note-edit{display:flex;flex-direction:column;flex:1;min-height:0;padding:0 clamp(16px,4vw,40px) var(--sp-half)}
 #note-edit[hidden],#note-empty[hidden]{display:none}
 .nhead{display:flex;align-items:center;gap:4px;padding:8px 0;min-height:48px}
+/* R468: the toolbar holds only buttons (a narrow editor has no room for text there: a status used to stand one word per
+   line beside them). The save status sits in the footer after the word count; a one-off confirmation is a toast */
+#note-edit{position:relative}#note-state:not(:empty)::before{content:"· "}
+#note-toast{position:absolute;top:56px;right:clamp(16px,4vw,40px);z-index:5;max-width:calc(100% - 32px);background:var(--fg);color:var(--bg);padding:4px 12px;border-radius:999px;font-size:var(--fs-secondary);pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.18)}
+#note-toast[hidden]{display:none}
 #note-title{border:0;outline:0;background:none;font-size:1.6rem;font-weight:700;padding:4px 0;width:100%;color:var(--fg)}
 #note-text{flex:1;min-height:0;width:100%;resize:none;border:0;outline:0;background:none;padding:8px 0;font-size:1rem;line-height:1.65;color:var(--fg)}
 #note-view{flex:1;min-height:0;overflow-y:auto;padding:8px 0;font-size:1rem;line-height:1.65;color:var(--fg);overflow-wrap:anywhere;outline:0}
@@ -420,6 +430,10 @@ mark{background:color-mix(in srgb,var(--link) 30%,transparent);color:inherit;bor
 .offline-copy{opacity:.75}
 #ap-left{display:block;font-size:var(--fs-caption);color:var(--dim);margin-bottom:var(--sp-half)}
 #temp{width:100%}
+/* Design Language v1.25: a select draws its own arrow, 12 px from the border */
+select:not([multiple]):not([size]){appearance:none;-webkit-appearance:none;padding-right:32px;background-repeat:no-repeat;background-size:5px 6px;background-position:right 17px center,right 12px center;background-image:linear-gradient(to top right,transparent 50%,currentColor 50%),linear-gradient(to top left,transparent 50%,currentColor 50%)}
+/* the same arrow where an id rule sets its own padding and background */
+#note-type{padding-right:32px;background-repeat:no-repeat;background-size:5px 6px;background-position:right 17px center,right 12px center;background-image:linear-gradient(to top right,transparent 50%,currentColor 50%),linear-gradient(to top left,transparent 50%,currentColor 50%)}
 </style>
 <script>window.AURORA_CHAT = true; window.AURORA_ENTER_SENDS = true; window.AURORA_LOG_SCROLLS = true;
 window.AURORA_UI_VERSION = '3.1';   // the page's own version (Chat layout); the code version comes from the server
@@ -497,17 +511,19 @@ window.AURORA_SB_OPEN = !matchMedia('(max-width:768px)').matches;
       <div class="nedit">
         <p id="note-empty">Select a note, or start a new one.</p>
         <div id="note-edit" hidden>
-          <div class="nhead"><button class="ib" type="button" id="note-back" title="Back to the notes" aria-label="Back to the notes"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button><span class="sec grow" id="note-state" aria-live="polite"></span>
+          <div class="nhead"><button class="ib" type="button" id="note-back" title="Back to the notes" aria-label="Back to the notes"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button><span class="grow"></span>
             <select id="note-type" aria-label="Move the note to" title="Move the note to another type"><option value="personal">Personal</option><option value="work">Work</option><option value="skills">Skills</option></select>
+            <button class="ib" type="button" id="note-link" title="Copy a link that opens Aurora with this note as context" aria-label="Copy a link that opens Aurora with this note as context"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></svg></button>
             <button class="ib" type="button" id="note-mode" aria-pressed="false" title="Show the formatted note (Ctrl+E)">View</button>
             <button class="ib" type="button" id="note-send" title="Send to chat as context" aria-label="Send to chat as context"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12l16-8-6 16-2-7z"/><path d="M12 13l8-9"/></svg></button>
             <button class="ib" type="button" id="note-copy" title="Copy the text" aria-label="Copy the text"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg></button>
             <button class="ib" type="button" id="note-del" title="Delete the note" aria-label="Delete the note"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/></svg></button>
           </div>
+          <div id="note-toast" role="status" aria-live="polite" hidden></div>
           <input type="text" id="note-title" maxlength="80" aria-label="Note title" placeholder="Untitled" autocomplete="off">
           <textarea id="note-text" aria-label="Note text" placeholder="Start writing…" spellcheck="true"></textarea>
           <div id="note-view" class="md" tabindex="0" aria-label="Note, formatted" hidden></div>
-          <div class="nfoot"><span id="note-meta"></span> <button class="btn" type="button" id="note-src" hidden title="Open the chat this note was saved from">Open its chat</button></div>
+          <div class="nfoot"><span id="note-meta"></span> <span id="note-state" aria-live="polite"></span> <button class="btn" type="button" id="note-src" hidden title="Open the chat this note was saved from">Open its chat</button></div>
         </div>
       </div>
     </div>

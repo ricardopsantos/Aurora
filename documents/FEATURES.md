@@ -220,10 +220,10 @@ desktop or a phone. The README has the
   phone's home screen, and has light and dark themes.
 
 Safety in the web version works differently from the terminal. A session
-starts with auto-approve on, so tool calls run without asking; the denylist
-still blocks what it lists. You can turn it off in Settings, under Chat, where
-there is also a Plan mode switch. With auto-approve off, each call asks yes, no or stop, and no answer within
-10 minutes counts as no. Every API call needs the `AURORA_WEB_TOKEN` bearer
+starts with auto-approve off: each write and command asks yes, no or stop, and
+no answer within 10 minutes counts as no. You can turn auto-approve on in
+Settings, under Chat, where there is also a Plan mode switch; the denylist
+still blocks what it lists, and commands run in the sandbox (R475) either way. Every API call needs the `AURORA_WEB_TOKEN` bearer
 token. Anyone with the token can run commands through Aurora, so keep it out
 of git and chat, keep the default loopback bind, and put a TLS proxy in
 front. See [SECURITY.md](../SECURITY.md).

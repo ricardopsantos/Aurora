@@ -1,0 +1,20 @@
+[package]
+name = "aurora-core"
+description = "Aurora's engine contracts and agent loop; never does terminal I/O"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+fancy-regex.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

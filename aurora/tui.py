@@ -55,7 +55,7 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
-from . import bootstrap, colors, rewind, tools, ui
+from . import bashmode, bootstrap, colors, rewind, tools, ui
 from .colors import BOLD, CYAN, GREEN, RED, RESET, URL_RE, YELLOW, dim
 from .colors import strip_dangerous_escapes as _strip_dangerous_escapes
 from .engine import Engine
@@ -245,6 +245,32 @@ def _clip_frags(frags: list, width: int) -> list:
     return out
 
 
+class _AboveInputFloat(Float):
+    """R455 (#31): the completion menu sits directly above the input box. Placed
+    at the cursor it drew over the input's lower border and the status bar
+    whenever it was short enough to fit below. `bottom` is read on every
+    render, so a multi-line draft moves the menu up with it."""
+
+    def __init__(self, tui, **kw):
+        super().__init__(**kw)
+        self._tui = tui
+
+    @property
+    def bottom(self):
+        t = self._tui
+        try:
+            info = t.input.window.render_info
+            rows = info.window_height if info else 1
+        except Exception:
+            rows = 1
+        top_rule = 1 if (t._question is None and t._menu_options is None) else 0
+        return rows + top_rule + 1 + 3       # input, its two rules, status bar
+
+    @bottom.setter
+    def bottom(self, _value):
+        pass                                  # Float.__init__ assigns it
+
+
 def _completions_menu() -> CompletionsMenu:
     """A CompletionsMenu whose control is crash-guarded (see above)."""
     menu = CompletionsMenu(max_height=10, scroll_offset=1)
@@ -333,6 +359,10 @@ class _ChatControl(FormattedTextControl):
         if ev == MouseEventType.MOUSE_UP:
             if self._tui.sel_finish():
                 return None          # a drag ended in a copy — swallow it
+            # SGR terminals report LEFT on release, legacy (X10/urxvt) ones no button; only a right/middle release is ignored
+            if (mouse_event.button in (MouseButton.LEFT, MouseButton.NONE)
+                    and self._tui.chat_double_click(pos)):
+                return None          # a word was selected + copied — swallow it
             # plain click → per-fragment handlers (thinking toggle)
             return self._dispatch_click(mouse_event)
         return self._dispatch_click(mouse_event)
@@ -603,6 +633,8 @@ class TuiFrontend(ui.TerminalFrontend):
         self._reset_token_counters()
 
     def _reset_token_counters(self) -> None:
+        self._turn_think_rows = []     # R455: this turn's timed rows
+        self._answered = False         # R455: did the model send anything back?
         self._live_in = 0
         self._live_out = 0
         self._stream_len = 0
@@ -622,10 +654,14 @@ class TuiFrontend(ui.TerminalFrontend):
         # the chat, mirroring the toolbar's phase+elapsed — even for models
         # that never stream thinking tokens
         self._tui.set_phase("thinking")
-        self._tui.begin_think(live=self.show_thinking)
+        row = self._tui.begin_think(live=self.show_thinking)
+        if row is not None:
+            self._turn_think_rows.append(row)
 
     def end_turn(self) -> None:
         super().end_turn()
+        if not self._answered and self._turn_think_rows:   # R455 (#26)
+            self._tui.drop_empty_think_rows(self._turn_think_rows)
         self._tui.finish_think()
         tag = self._final_token_tag()
         if tag:
@@ -641,6 +677,7 @@ class TuiFrontend(ui.TerminalFrontend):
 
     def on_think(self, chunk: str) -> None:
         self.think_buffer += chunk            # /copy-last still works
+        self._answered = True
         self._think_len += len(chunk)
         self._tui.think_chunk(chunk, live=self.show_thinking)
 
@@ -648,12 +685,14 @@ class TuiFrontend(ui.TerminalFrontend):
         self._tui.finish_think()              # answer starts → close the block
         self._tui.set_phase("generating")
         self._think_marker_shown = False      # never let the marker logic fire
+        self._answered = True
         self._stream_len += len(chunk)
         super().on_text(chunk)
         if self.render_md:
             self._tui.set_stream_tail(self._mdbuf)            # R297
 
     def on_usage(self, input_tokens: int, output_tokens: int) -> None:
+        self._answered = True
         self._live_in += input_tokens
         self._live_out += output_tokens
         self._tui.invalidate_status()
@@ -675,6 +714,7 @@ class TuiFrontend(ui.TerminalFrontend):
             if len(cmd) > _RUNNING_NOTE_MAX:
                 cmd = cmd[:_RUNNING_NOTE_MAX - 1] + "…"
             self._tui.set_running_note(f"{label}: {cmd}" if cmd else f"{label} a command…")
+        self._answered = True
         super().on_tool_start(name, args)
 
     def on_tool_result(self, name: str, output: str) -> None:
@@ -855,10 +895,10 @@ class Tui:
         # per session, not one per render.
         self._has_checkpoints = False
         self._bash_mode = False      # `!` on an empty prompt → persistent bash
-        self._bash_cwd = os.getcwd()  # tracked separately: each `!` command
-        # runs in its own subprocess, so a plain `cd` inside it never
-        # affects the parent process's cwd — we intercept `cd` ourselves
-        # and pass this along as `cwd=` to every other command
+        # R452: each `!` command runs in a fresh bash; its final directory and
+        # environment are read back into this and handed to the next one
+        # (`bashmode.run`). `_bash_cwd` is a view of `.cwd`.
+        self._bash_state = bashmode.initial_state(os.getcwd())
         self._last_bash_output = ""   # captured stdout+stderr of the last
         self._last_bash_at = 0.0      # `!` command, for "copy last" (R109)
         self._last_llm_at = 0.0       # timestamp of the last LLM turn, so
@@ -911,6 +951,9 @@ class Tui:
         self._status_error: str | None = None
         self._input_click_at = 0.0   # R135a: last left MOUSE_UP in the prompt,
         # for the double-click gesture (monotonic)
+        # last plain left click in the CHAT pane: (monotonic ts, line, col),
+        # for the double-click-a-word gesture (see `chat_double_click`)
+        self._chat_click: tuple | None = None
         self._open_think = False     # a live (undone) think row exists
         # R171/P3: object refs (not indices — `_evict_locked` drops from the
         # FRONT of `_chat`, which would shift any stored index) to every
@@ -920,7 +963,7 @@ class Tui:
         self._open_think_items: list = []
         self._saved_draft = ""       # input text preserved across challenges
         self._help_visible = False
-        self._help_text = ANSI(ui.help_text()).__pt_formatted_text__()
+        self._help_text = ANSI(ui.TUI_HELP).__pt_formatted_text__()   # R455 (#28)
 
         self.fe = TuiFrontend(
             self,
@@ -1200,6 +1243,38 @@ class Tui:
         except Exception:
             pass
 
+    @property
+    def _bash_cwd(self) -> str:
+        return self._bash_state.cwd
+
+    @_bash_cwd.setter
+    def _bash_cwd(self, path: str) -> None:
+        env = dict(self._bash_state.env)
+        env["PWD"] = path
+        self._bash_state = bashmode.ShellState(cwd=path, env=env)
+
+    @property
+    def _bash_mode(self) -> bool:
+        return self.__dict__.get("_bash_mode_on", False)
+
+    @_bash_mode.setter
+    def _bash_mode(self, on: bool) -> None:
+        """R452: prompts and shell commands keep separate up-arrow histories
+        (`input_history`, `bash_history`): one shared history recalled old
+        prompts in bash mode, where Enter ran them as shell commands, and
+        `ls` in prompt mode, where it went to the model. Every way into or
+        out of bash mode sets this, so the swap happens in one place."""
+        on = bool(on)
+        changed = on != self.__dict__.get("_bash_mode_on", False)
+        self.__dict__["_bash_mode_on"] = on
+        histories = self.__dict__.get("_histories")
+        if not changed or not histories or not hasattr(self, "input"):
+            return
+        buf = self.input.buffer
+        buf.history = histories["bash" if on else "prompt"]
+        # reset() re-reads the history on the next repaint; keep any draft
+        buf.reset(Document(buf.text, buf.cursor_position))
+
     def _on_side_thread(self) -> bool:
         """R279: is the caller the side worker (R245/R253)? It marks itself
         via `_prompt_nowait`, the same thread-local R253 uses for the input
@@ -1220,11 +1295,29 @@ class Tui:
             # it must not close the turn's live think row (R254c's rule)
             if not self._on_side_thread():
                 self._close_think_locked()
-            self._chat.append({"kind": "bash_output", "text": text})
+            entry = {"kind": "bash_output", "text": text}
+            self._chat.append(entry)
             self._cache.append(None)
             self._line_counts.append(None)
             self._dirty(len(self._chat) - 1)
             self._evict_locked()              # R152
+        try:
+            self.app.invalidate()
+        except Exception:
+            pass
+        return entry
+
+    def update_bash_output(self, entry: dict, text: str) -> None:
+        """R452: replace the text of a `bash_output` entry while its command
+        is still running (live output). An entry already evicted from the
+        scrollback (R152) is left alone."""
+        text = _strip_dangerous_escapes(text)
+        with self._lock:
+            for i in range(len(self._chat) - 1, -1, -1):
+                if self._chat[i] is entry:
+                    entry["text"] = text
+                    self._dirty(i)
+                    break
         try:
             self.app.invalidate()
         except Exception:
@@ -1239,9 +1332,9 @@ class Tui:
             last = self._chat[-1] if self._chat else None
             if (isinstance(last, dict) and last.get("kind") == "think"
                     and not last["done"]):
-                return                      # this request's row already exists
+                return None                 # this request's row already exists
             if self._open_think:            # R254c: open, just no longer last
-                return                      # (side output landed after it)
+                return None                 # (side output landed after it)
             row = {"kind": "think", "text": "", "open": live,
                   "done": False, "t0": time.monotonic(), "dt": 0}
             self._chat.append(row)
@@ -1252,6 +1345,35 @@ class Tui:
             self._evict_locked()              # R152
             self._open_think = True
         self.app.invalidate()
+        return row
+
+    def drop_empty_think_rows(self, rows) -> None:
+        """R455 (#26): remove these think rows if they never got any text, for a
+        turn whose model never answered ("thought for 0s" above a connection
+        error claims a reply that never started)."""
+        with self._lock:
+            ids = {id(r) for r in rows if isinstance(r, dict) and not r.get("text")}
+            if not ids:
+                return
+            self._close_think_locked()
+            first = None
+            for i in range(len(self._chat) - 1, -1, -1):
+                if id(self._chat[i]) in ids:
+                    del self._chat[i]
+                    del self._cache[i]
+                    del self._line_counts[i]
+                    first = i
+            if first is None:
+                return
+            for j in range(first, len(self._cache)):
+                self._cache[j] = None
+                self._line_counts[j] = None
+            self._dirty_from = first if self._dirty_from is None \
+                else min(self._dirty_from, first)
+        try:
+            self.app.invalidate()
+        except Exception:
+            pass
 
     def _open_think_index_locked(self):
         """(index, row) of the request's still-open think row, or (-1, None).
@@ -1367,7 +1489,11 @@ class Tui:
                 if m.start() > pos:
                     out.append((style, text[pos:m.start()]))
                 name = m.group(0)
-                out.append(("class:link", name, self._nano_filename_click(name)))
+                # R452 (#29): keep the name's own colour (`ls --color`) and
+                # underline it, so "clickable" reads as a link rather than as
+                # a file type; a name with no colour gets the link style
+                link = f"{style} underline" if style.strip() else "class:link"
+                out.append((link, name, self._nano_filename_click(name)))
                 pos = m.end()
             if not matched:
                 out.append(f)
@@ -1526,10 +1652,49 @@ class Tui:
         if sel is None or sel[0] == sel[1]:
             self.app.invalidate()
             return False
-        if self._sel_text(sel).strip():
+        text = self._sel_text(sel)
+        if text.strip():
             self._sel_frozen = sel
+            self._chat_click = None      # a drag is not half a double-click
+            self._auto_copy(text)        # copy by default; /copy can override
         self.app.invalidate()
         return True
+
+    def _auto_copy(self, text: str) -> None:
+        """Copy a just-made chat selection to the clipboard and say so on the
+        status bar. The "copy selected" button / `/copy` menu still work and,
+        being a later copy, override what this put on the clipboard."""
+        from . import clipboard
+        try:
+            how = clipboard.copy(text)
+        except Exception as e:   # a copy failure must never break the mouse path
+            self._sel_notice = (f"copy failed: {e}", time.monotonic())
+            return
+        self._sel_notice = (f"copied {len(text)} chars — {how}", time.monotonic())
+
+    def chat_double_click(self, pos: tuple) -> bool:
+        """Plain left MOUSE_UP in the chat: on the second click within
+        `_DOUBLE_CLICK_S` on the same word, highlight that word and copy it.
+        True = a word was selected (the caller swallows the click so a
+        per-fragment handler, e.g. the thinking toggle, doesn't fire twice)."""
+        now = time.monotonic()
+        y, x = self._unpad(pos)
+        last, self._chat_click = self._chat_click, (now, y, x)
+        if (last is None or now - last[0] >= _DOUBLE_CLICK_S
+                or last[1] != y or abs(last[2] - x) > 2):
+            return False
+        lines = "".join(f[1] for f in self._fragments()).split("\n")
+        if y >= len(lines):
+            return False
+        for m in re.finditer(r"\w+", lines[y]):
+            if m.start() <= x < m.end():
+                self._chat_click = None          # consumed — a 3rd click starts over
+                self.input.buffer.exit_selection()
+                self._sel_frozen = ((y, m.start()), (y, m.end()))
+                self._auto_copy(m.group())
+                self.app.invalidate()
+                return True
+        return False
 
     def _input_sel_text(self) -> str:
         """Text selected in the prompt (drag or double-click), "" if none.
@@ -1991,9 +2156,9 @@ class Tui:
             self.app.invalidate()
             return
         if key == "session":
-            self.append(f"\n{CYAN}{BOLD}> {RESET}/copy-all\n")
+            self.append(f"\n{CYAN}{BOLD}> {RESET}/copy all\n")
             self.scroll_end()
-            self._route_submitted_line("/copy-all")
+            self._route_submitted_line("/copy all")
             return
         if key == "selected":
             if not sel.strip():
@@ -2838,6 +3003,11 @@ class Tui:
             self.input.buffer.reset()
         self.app.invalidate()
 
+    def _cancellable(self) -> bool:
+        """Is there running work Esc-Esc can stop: the main worker (a turn or
+        a `!` command) or a side question/command?"""
+        return self._busy or self._side_kind in ("ask", "bash")
+
     def _resolve_bash_leave_menu(self, key: str) -> None:
         if key == "leave":
             self._bash_mode = False
@@ -2933,7 +3103,7 @@ class Tui:
             # local action, so it wins — same reasoning that puts the menu
             # check first.
             buf.cancel_completion()
-        elif self._bash_mode:
+        elif self._bash_mode and (buf.text or not self._cancellable()):
             if _armed("bash"):
                 self._esc_armed = None
                 self._open_ui_menu("Leave bash mode?", [
@@ -2946,7 +3116,9 @@ class Tui:
                 buf.reset()
             else:
                 _arm("bash")
-        elif self._busy or self._side_kind == "ask":
+        elif self._cancellable():
+            # R452: in bash mode too: a running `!sleep 200` is cancelled by
+            # the same Esc-Esc as a turn (it used to offer "Leave bash mode?")
             if _armed("cancel"):
                 self._esc_armed = None
                 rows = []
@@ -2958,8 +3130,11 @@ class Tui:
                 # R257: `_side_cancel` is polled by `quick_ask` and by
                 # nothing else, so offering this while the channel is running
                 # a `!` command promised a stop that silently did nothing.
+                # R452: a side `!` command now polls it too
                 if self._side_kind == "ask":
                     rows.append(("side", "Cancel the side question"))
+                elif self._side_kind == "bash":
+                    rows.append(("side", "Cancel the side command"))
                 rows.append(("continue", "No, keep going"))
                 # R252: the ONLY exit offered while busy used to be
                 # cancel, so a turn that cancel couldn't reach left no
@@ -2993,6 +3168,11 @@ class Tui:
             wrap_lines=True, style="class:chat")
 
         from prompt_toolkit.history import FileHistory
+        # R452: one history per mode (see the `_bash_mode` setter)
+        self._histories = {
+            "prompt": FileHistory(str(aurora_home() / "input_history")),
+            "bash": FileHistory(str(aurora_home() / "bash_history")),
+        }
         def _prompt():
             # during a blocking ask, the challenge itself is the prompt —
             # the cursor lands right after "…[c]omment: " (no bottom-bar hop).
@@ -3072,7 +3252,7 @@ class Tui:
                 self, ui.SlashCompleter(self.engine.cfg.get("_base_dir"))),
             complete_while_typing=True,
             focus_on_click=True,   # a mouse click moves the input cursor
-            history=FileHistory(str(aurora_home() / "input_history")),
+            history=self._histories["prompt"],
             style="class:input")
         self.input.control.mouse_handler = self._input_mouse_handler(
             self.input.control.mouse_handler)
@@ -3428,8 +3608,10 @@ class Tui:
                 if (not self._bash_mode and not self._secret
                         and self._question is None):
                     text = self.input.buffer.text
-                    if text.strip():
-                        draft_tokens = f"↑{ui.estimate_tokens(text)}"
+                    # R455 (#30): labelled, and not for a /command (`/` alone read "↑0")
+                    n = ui.estimate_tokens(text) if text.strip() else 0
+                    if n and not text.lstrip().startswith("/"):
+                        draft_tokens = f"draft {n} tok"
                 draft_part = f" - {draft_tokens}" if draft_tokens else ""
                 # R352: session-average generation speed, once measured
                 tps_part = f" │ {s.tok_per_s:.0f} t/s" if getattr(s, "tok_per_s", None) else ""
@@ -3584,20 +3766,23 @@ class Tui:
                     toggle_text, toggle_handler = "> prompt", self._leave_bash_mode_click()
                 else:
                     toggle_text, toggle_handler = "! bash", self._enter_bash_mode_click()
+                # R455 (#32): most useful first, so a narrow screen cuts the
+                # least useful hints (the clip works from the right)
                 frags.extend([
                     ("class:status.hint", " "),
+                    ("class:status.hint", "? Help", self._toggle_help_click()),
+                    ("class:status.hint", " · "),
+                    ("class:status.hint", "Esc cancel/clear/exit"),
+                    ("class:status.hint", " · "),
                     ("class:status.hint", "/ commands", self._open_commands()),
                     ("class:status.hint", " · "),
                     ("class:status.hint", toggle_text, toggle_handler),
                     ("class:status.hint", " · "),
-                    ("class:status.hint", "\\n/\\br newline",
-                     self._insert_newline_click()),
-                    ("class:status.hint", " · "),
                     ("class:status.hint", "Ctrl+J newline",
                      self._insert_newline_click()),
                     ("class:status.hint", " · "),
-                    ("class:status.hint", "? Help", self._toggle_help_click()),
-                    ("class:status.hint", " · Esc cancel/clear/exit"),
+                    ("class:status.hint", "\\n/\\br newline",
+                     self._insert_newline_click()),
                 ])
             return _clip_frags(frags, self._cols())
 
@@ -3646,8 +3831,8 @@ class Tui:
             ]),
             # R332: full width, so no transcript text shows through on either
             # side of the menu
-            floats=[Float(left=0, width=lambda: self._cols(), ycursor=True,
-                          content=_completions_menu())])
+            floats=[_AboveInputFloat(self, left=0, width=lambda: self._cols(),
+                                     content=_completions_menu())])
 
         # --debug tints the two non-interactive areas so their bounds are
         # obvious: chat (group 1) and status bar (group 3) both a red tint
@@ -3745,37 +3930,19 @@ class Tui:
             try:
                 if line.startswith("!"):          # local bash, no LLM (R10)
                     cmd = line[1:]
-                    cd_target = self._bash_cd_target(cmd)
+                    # a plain `cd <path>` is resolved here (it accepts an
+                    # unquoted path with spaces); `cd -`, `cd $X` and any
+                    # chained `cd` go to bash, whose final directory is
+                    # carried over (R452)
+                    cd_target = bashmode.plain_cd_target(self._bash_cd_target(cmd))
                     if cd_target is not None:
-                        new_dir = os.path.normpath(os.path.join(
-                            self._bash_cwd, os.path.expanduser(cd_target)))
-                        if os.path.isdir(new_dir):
-                            self._bash_cwd = new_dir
-                            print(dim(f"(cwd: {new_dir})"))
-                        else:
-                            print(f"cd: no such file or directory: "
-                                  f"{cd_target}")
+                        self._bash_state, err = bashmode.cd_into(
+                            self._bash_state, cd_target)
+                        print(err if err else dim(f"(cwd: {self._bash_cwd})"))
                     elif cmd.strip() in ("clear", "cls"):
                         self.clear_screen()
                     else:
-                        # R125c: route through tools._run_command_once (same
-                        # as run_command/wait_until) instead of a bare
-                        # subprocess.run — that gave bash-mode neither a
-                        # timeout nor process-group ownership, so a hanging
-                        # command (`!ssh host`, a REPL waiting on stdin)
-                        # wedged this thread forever since _worker() is the
-                        # sole consumer of the TUI's inbox queue.
-                        from . import tools as _tools
-                        out, code = _tools._run_command_once(cmd, self._bash_cwd)
-                        if code is None:
-                            out = (out + "\n" if out else "") + \
-                                f"[timeout after {_tools.COMMAND_TIMEOUT}s]"
-                        self._last_bash_output = out
-                        self._last_bash_at = time.time()
-                        if out.strip():
-                            self.append_bash_output(out)
-                        else:
-                            print(dim("(no output)"))
+                        self._run_bash(cmd)
                 elif line.startswith("/"):
                     if not ui._handle_command(engine, fe, line):
                         break
@@ -3906,15 +4073,76 @@ class Tui:
                       "— wait for the current command to finish, "
                       "or run it there instead)"))
             return
-        from . import tools as _tools
-        out, code = _tools._run_command_once(cmd, self._bash_cwd)
-        if code is None:
-            out = (out + "\n" if out else "") + \
-                f"[timeout after {_tools.COMMAND_TIMEOUT}s]"
-        if out.strip():
-            self.append_bash_output(out)
+        self._run_bash(cmd, side=True)
+
+    def _run_bash(self, cmd: str, side: bool = False) -> None:
+        """Run one bash-mode command and show its output (R10, R452). Shared
+        by the main worker and the side channel, so both get the same
+        behaviour:
+
+        - R125c: through `tools._run_command_once` (timeout, process group).
+        - cancellable: Esc-Esc sets `fe.cancel_event` (main) or
+          `_side_cancel` (side), polled between reads.
+        - live: output appears as it arrives, in one growing entry.
+        - the exit code is shown when it is not 0.
+        - recorded for "copy last" (R109) on both channels.
+        - the side channel reads the shell state but never writes it.
+
+        The output is shown to the user only; it never enters the model's
+        context."""
+        hint = bashmode.needs_terminal(cmd)
+        if hint:
+            print(dim(hint))
+            return
+        if side:
+            self._side_cancel.clear()
+            cancel = self._side_cancel.is_set
+        else:
+            cancel = self.fe.cancel_event.is_set
+        cap = min(tools.COMMAND_OUTPUT_CAP, 256 * 1024)   # live view only
+        live = {"parts": [], "size": 0, "entry": None, "shown": 0.0,
+                "overflow": False}
+
+        def on_chunk(piece: str) -> None:
+            if live["size"] < cap:
+                live["parts"].append(piece)
+            else:
+                live["overflow"] = True
+            live["size"] += len(piece)
+            now = time.monotonic()
+            if now - live["shown"] < 0.1:     # at most ~10 redraws a second
+                return
+            live["shown"] = now
+            text = "".join(live["parts"])
+            if live["overflow"]:
+                text += dim("\n[… still running, more output …]")
+            if live["entry"] is None:
+                live["entry"] = self.append_bash_output(text)
+            else:
+                self.update_bash_output(live["entry"], text)
+
+        res, state = bashmode.run(cmd, self._bash_state, cancel=cancel,
+                                  on_chunk=on_chunk, carry=not side)
+        if not side:
+            self._bash_state = state
+        # arrival order (stdout and stderr interleaved) when all of it was
+        # kept; past the cap, the runner's head+tail of each stream
+        body = ("".join(live["parts"]) if live["parts"] and not live["overflow"]
+                else res.out).rstrip("\n")
+        plain = bashmode.format_result(bashmode.Result(body, res.code, res.cancelled))
+        self._last_bash_output = bashmode.plain_text(plain)
+        self._last_bash_at = time.time()
+        status = plain[len(body):].strip() if plain != body else ""
+        shown = (body + "\n" if body.strip() else "") + (dim(status) if status else "")
+        extra = bashmode.failure_hint(cmd, res.code, res.out)
+        if live["entry"] is not None:
+            self.update_bash_output(live["entry"], shown or dim("(no output)"))
+        elif shown.strip():
+            self.append_bash_output(shown)
         else:
             print(dim("(no output)"))
+        if extra:
+            print(dim(extra))
 
     def _side_run_command(self, line: str) -> None:
         """R253: a read-only `/command`, run concurrently with the turn.

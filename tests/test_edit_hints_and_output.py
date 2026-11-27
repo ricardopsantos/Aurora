@@ -11,12 +11,15 @@ def _edit(tmp_path, content, old):
     return out
 
 
+# R457: a UNIQUE whitespace-only match now applies; the hints are for when
+# it is ambiguous, so these files hold the near-match twice
 def test_hint_whitespace(tmp_path):
-    assert "leading/trailing whitespace" in _edit(tmp_path, b"a = 1\n", "  a = 1\n\n")
+    assert "leading/trailing whitespace" in _edit(tmp_path, b"a = 1\nb\n a = 1\n", "  a = 1\n\n")
 
 
 def test_hint_indentation(tmp_path):
-    assert "tabs vs spaces" in _edit(tmp_path, b"if x:\n\treturn 1\n", "if x:\n    return 1")
+    assert "tabs vs spaces" in _edit(tmp_path, b"if x:\n\treturn 1\nif x:\n  return 1\n",
+                                     "if x:\n    return 1")
 
 
 def test_hint_first_line(tmp_path):

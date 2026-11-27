@@ -19,6 +19,7 @@ def _open(browser, app, w, h, mobile):
 
 
 def _side(page, mobile, btn):
+    page.wait_for_function("document.getAnimations().length === 0")   # R451: let the sidebar finish sliding before asking if it is visible
     if mobile and not page.is_visible(btn):
         page.click("#sb-toggle")
     page.click(btn)
@@ -33,7 +34,7 @@ def test_r418_notes_and_files_fill_the_chat_area(browser, app, w, h, mobile):
     assert not page.is_visible("#log") and not page.is_visible("#send")
     assert page.evaluate("getComputedStyle(document.getElementById('notes')).position") == "static"
     assert page.evaluate("document.querySelector('.main').contains(document.getElementById('notes'))")
-    assert "Back to chat" in page.locator("#new-chat").inner_text()
+    assert "Back to chat" in page.locator("#new-chat").text_content()
     assert page.locator("#chat-title").inner_text() == "Notes"
     page.click("#note-new"); page.wait_for_selector("#note-edit:not([hidden])")
     page.fill("#note-title", "Kept"); page.fill("#note-text", "typed just before leaving")
@@ -45,7 +46,7 @@ def test_r418_notes_and_files_fill_the_chat_area(browser, app, w, h, mobile):
     _side(page, mobile, "#new-chat")                                     # Back to chat: saves first
     page.wait_for_selector("#log", state="visible")
     assert not page.is_visible("#notes")
-    assert "New Chat" in page.locator("#new-chat").inner_text()
+    assert "New Chat" in page.locator("#new-chat").text_content()
     notes = call(app, "/api/notes")[1]["notes"]
     assert any(n["title"] == "Kept" for n in notes)
     nid = next(n["id"] for n in notes if n["title"] == "Kept")
@@ -53,7 +54,7 @@ def test_r418_notes_and_files_fill_the_chat_area(browser, app, w, h, mobile):
 
     _side(page, mobile, "#files-btn")
     page.wait_for_selector("#files.panel[open]")
-    assert not page.is_visible("#log") and "Back to chat" in page.locator("#new-chat").inner_text()
+    assert not page.is_visible("#log") and "Back to chat" in page.locator("#new-chat").text_content()
     assert page.evaluate(OVERFLOW) <= 0
     if shots:
         page.screenshot(path=f"{shots}/r418-files-{w}.png")

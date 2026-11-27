@@ -32,7 +32,7 @@ from pathlib import Path
 import yaml
 
 from . import rewind
-from .paths import aurora_home, write_text_atomic
+from .paths import aurora_home, file_lock, write_text_atomic
 
 
 @functools.lru_cache(maxsize=512)
@@ -141,6 +141,9 @@ DANGEROUS_COMMANDS = frozenset({
     "csh", "tcsh", "pwsh", "tclsh", "wish", "expect", "julia", "swift", "irb",
     "luajit", "groovy", "scala", "kotlin", "dotnet",
     "sort", "nc", "ncat", "socat", "telnet", "ftp",
+    # R450 (S7): wrappers that run the rest of the line (`flock x reboot`, `setsid x`) and `gh`, whose two-token rule
+    # `gh pr` covered `gh pr merge` and `gh api -X DELETE`
+    "flock", "setsid", "stdbuf", "ionice", "chrt", "taskset", "unshare", "script", "gh",
 })
 
 # R277: `git` itself is safe to generalize (`git status`, `git log …`) —
@@ -150,6 +153,12 @@ DANGEROUS_COMMANDS = frozenset({
 _GIT_EXEC_OPTIONS = ("-c", "--config-env", "--exec-path")
 _GIT_RETARGET_OPTIONS = ("-C", "--git-dir", "--work-tree", "--namespace")
 _GIT_CONFIG_SUBCOMMANDS = ("config", "alias")
+# R450 (S7): git flags that run a program or write a file named by their value, on subcommands that are otherwise
+# routine (`git grep -O<cmd>`, `git log --output=~/.bashrc`, `git fetch --upload-pack=<cmd>`, `rebase --exec`,
+# `difftool --extcmd`). Their presence makes the command exact-only; "always allow" never covers it.
+_GIT_UNSAFE_FLAGS = ("--output", "--upload-pack", "--receive-pack", "--exec", "--extcmd", "--ext-diff", "--textconv",
+                     "--open-files-in-pager")
+_GIT_UNSAFE_WORDS = ("foreach", "-x")
 
 # families whose real binary name carries a suffix: mkfs.ext4, newfs_hfs
 _DANGEROUS_PREFIXES = ("mkfs.", "newfs_")
@@ -271,6 +280,12 @@ def _is_dangerous(toks: tuple) -> bool:
         rest = toks[i + 1:]
         if rest and (rest[0] in _GIT_RETARGET_OPTIONS
                      or any(t in _GIT_CONFIG_SUBCOMMANDS for t in rest[:2])):
+            return True
+        # R450 (S7): see _GIT_UNSAFE_FLAGS; `bisect run` and `submodule foreach` take a command as arguments
+        if any(t in _GIT_UNSAFE_WORDS or t.startswith("-O")
+               or any(t == f or t.startswith(f + "=") for f in _GIT_UNSAFE_FLAGS) for t in rest):
+            return True
+        if rest and rest[0] == "bisect" and "run" in rest:
             return True
     return False
 
@@ -494,7 +509,9 @@ def _matches(tool: str, args: dict, data: dict, strict: bool = False) -> bool:
                 return True
             if exact_only:
                 continue
-            if len(rule) >= 2 and sig_toks[:len(rule)] == rule:
+            # R450 (S7): only a two-token rule is a prefix rule. A longer one is a whole command stored
+            # as approved (`zip -r a.zip src`); with anything appended (`-TT '<cmd>'`) it is a different command.
+            if len(rule) == 2 and sig_toks[:2] == rule:
                 return True
             # A single-token rule prefix-matches regardless of args — but for
             # the ALLOWlist only when the command is known-safe (see
@@ -743,22 +760,24 @@ def add_rule(tool: str, args: dict) -> str:
     KeyError'd for any tool name outside the fixed `_TOOLS` tuple — an
     extension's tool (e.g. `mcp_github_create_issue`) crashed the turn
     instead of persisting the rule. `setdefault` handles any tool name."""
-    data = load()
     rule = _rule_for(tool, args)
-    if rule and rule not in data.setdefault(tool, []):
-        data[tool].append(rule)
-        save(data)
+    with file_lock(_path()):          # R531: two Auroras answering "always" at once both keep their rule
+        data = load()
+        if rule and rule not in data.setdefault(tool, []):
+            data[tool].append(rule)
+            save(data)
     return rule
 
 
 def add_deny_rule(tool: str, args: dict) -> str:
     """Persist an 'always DENY' answer (R120) — same rule shape as
     add_rule, opposite file and meaning."""
-    data = load_deny()
     rule = _rule_for(tool, args)
-    if rule and rule not in data.setdefault(tool, []):
-        data[tool].append(rule)
-        save_deny(data)
+    with file_lock(_deny_path()):     # R531
+        data = load_deny()
+        if rule and rule not in data.setdefault(tool, []):
+            data[tool].append(rule)
+            save_deny(data)
     return rule
 
 
@@ -830,14 +849,18 @@ def _diff_preview(tool: str, args: dict) -> str:
         count = -1 if args.get("replace_all") else 1
         # R324: the preview must not show a change the tool will refuse.
         n = text.count(old)
+        after = None
         if n == 0:
-            return "[edit will fail: `old` not found — nothing changes]"
+            from .patch import whitespace_edit                  # R457: as the tool will
+            after = whitespace_edit(text, old, new)
+            if after is None:
+                return "[edit will fail: `old` not found — nothing changes]"
         if n > 1 and count == 1:
             return (f"[edit will fail: `old` occurs {n} times and replace_all "
                     "is not set — nothing changes]")
         d = difflib.unified_diff(
             text.split("\n"),
-            text.replace(old, new, count).split("\n"),
+            (after if after is not None else text.replace(old, new, count)).split("\n"),
             "before", "after", lineterm="")
     elif tool == "apply_patch":
         path = Path(args["path"]).expanduser()

@@ -611,3 +611,276 @@ Part of the index in [`../REQUIREMENTS.md`](../REQUIREMENTS.md); numbers are sha
   `agent.REPEAT_ROUNDS_STOP` (3) rounds in a row, the turn ends with the notice "stopped: the model keeps repeating the
   same call". The repeat nudge compares raw outputs, so it fires on every repeat, not every other one.
 - Covered by `tests/test_core.py::test_agent_loop_stops_a_model_that_ignores_the_repeat_nudge`.
+
+- **R447 — The web denylist also covers Docker, other machines and the secrets, and sees through quoting** (card `20261112-185835`, round 3 #13, 2026-11-13). `WEB_DENY_DEFAULT` gains `docker`/`docker.sock`, `ssh|scp|sftp|rsync|nsenter`, `su`, a bare `env`/`printenv`/`set`/`export -p`, `/etc/environment`, `/proc/*/environ`, `.ssh`, `os.system`/`subprocess`/`pty.spawn`, `base64 -d | sh` and `eval`. A command is matched both as written and with quotes and backslashes removed, so `su""do` or `s\\udo` no longer step round a pattern. A regex list is still not a sandbox: the real limits are R448 and the systemd unit. Test: `tests/test_deep_dive_2026_11_13.py`.
+- **R448 — Commands the agent runs do not inherit secrets** (card `20261112-185835`, round 3 #1, 2026-11-13). `run_command` (foreground and background) starts the shell with the environment minus every variable whose name looks like a secret (`TOKEN`, `SECRET`, `PASSWORD`, `API_KEY`, `PRIVATE`, `CREDENTIAL`, `*_KEY`, `*_PASS`). Aurora's own process keeps them (it needs them for the model); `env` in a tool call shows none. Test: `tests/test_deep_dive_2026_11_13.py`.
+- **R449 — An MCP server entry can limit which of its tools Aurora exposes (`tools:`)** (2026-11-14). `mcp_servers:` entries accept `tools: [name, ...]`. Only the listed tools of that server get a spec and a runner, so the model neither sees nor can call the others, and their schemas stop costing tokens on every request (one real memory server advertises 36 tools, about 6.5k tokens). No `tools:` key = every tool, as before. A malformed value (not a list of non-empty strings) exposes **no** tools from that server and warns, because an allowlist must fail closed. A listed name the server does not provide only warns. Test: `tests/test_mcp.py` (R449 section), fixture `tests/fixtures/multi_tool_mcp_server.py`.
+- **R450 — Fixes from the review card: web guard, linear HTML, safer "always allow" (card `20261114-203412-aurora-issues`, 2026-11-14).** One entry, items named as on the card. Test: `tests/test_review_r450.py`.
+  - **S6, B2 (linear HTML).** `html_to_text` (web_fetch) and `.html` attachments strip comments, tags and blocks in ONE forward pass (`aurora/htmltext.py`); a `<` with no later `>` is plain text, an unclosed comment or `<script` swallows the rest. The regexes it replaces took 33 s on 128 kB of `<!-- `. Each tag is searched forward only, so many `<script>` pairs cost no more.
+  - **S1, S8, S2 (web path guard, `aurora/guard.py`).** In web mode only (switched on by `WebSession`; the terminal is unchanged) every file tool passes `guard.check` inside `run_tool`. Reads and writes are refused for secret places: `.ssh`, `.gnupg`, `.aws` folders, `/etc/environment`, `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, `/proc/<pid>/environ`, `.netrc`, `.git-credentials`, `.pgpass`, `keys.enc`, `*.token`, `*.pem`, `*.key`. Writes are also refused anywhere in `AURORA_HOME` except `workspace/` (allowlist, denylist, `web-denylist.txt`, `state.yaml`, extensions, bootstrap, sessions). Paths are resolved first, so `..` and symlinks do not step round it. `grep -r` over a parent skips those folders and files. A `web-denylist.txt` with no patterns means the defaults, not "deny nothing". The refusal text starts `[blocked on the web page`.
+  - **S2 (redactor).** The "Env credential" pattern also sees NUL-separated text (`/proc/<pid>/environ`). **B5:** names ending in `PASS` (`MYAPP_DBPASS=`) are redacted.
+  - **S3.** A `web_fetch` that `url_needs_approval` flags (R283) is put to the page even with auto-approve on.
+  - **B1, S4 (web denylist).** The command patterns are matched against what is run: every string, nested ones included, of `run_command`, `wait_until` and `mcp_*` calls. A file tool is matched on its `path` only, so a README that says `docker` or code with `import subprocess` can be written. More patterns: `os.popen/exec*/spawn*`, `perl|ruby|php|lua -e`, `node -e`, `awk system(`, `base64/xxd -d` inside `$(...)` or backticks, and the policy files (`web-denylist`, `allowlist.yaml`, `denylist.yaml`, `state.yaml`, `.aurora/extensions|bootstrap`). A path glob in a command is expanded and the real names are matched too (`cat ~/.s?h/id_ed25519`, `/usr/bin/doc?er`). `deploy/aurora-web.service.example` carries the sandbox lines (`NoNewPrivileges`, `ProtectSystem`, `PrivateTmp`).
+  - **S7 ("always allow" cannot widen).** A git command with `--output`, `--upload-pack`, `--receive-pack`, `--exec`, `--extcmd`, `--ext-diff`, `--textconv`, `--open-files-in-pager`, `-O…`, `-x`, `submodule foreach` or `bisect run` is "dangerous": exact-only, never covered by a stored `git grep` / `git log` / ... rule. `flock`, `setsid`, `stdbuf`, `ionice`, `chrt`, `taskset`, `unshare`, `script` and `gh` join the dangerous set. Only a TWO-token rule is a prefix rule; a longer stored rule (a whole command such as `zip -r a.zip src`) matches that command exactly, not with arguments appended.
+  - **B3.** The Files listing skips a file that vanishes while it is listed instead of failing with a 500. **P1:** an office attachment may unpack to at most `MAX_ZIP_TOTAL` (100 MB) across all its parts, besides the 30 MB per part.
+  - **S5.** The web handler has a 60 s socket timeout (longer than the 15 s stream heartbeat), and `/health` answers its outbound model probe from a 10 s cache.
+  - **S9.** Commands do not inherit `SSH_AUTH_SOCK`, `DATABASE_URL`, `*_DSN` or `*_PAT` either (R448's list grew).
+  - **S10.** `AURORA_HOME` loses group/other access on first use (mode only ever reduced), and the web notes, folders and vision files are written 0600.
+  - **S11.** The page deletes its offline copies of chats and notes (service-worker cache entries under `/api/`) when the token is changed or the server answers 401.
+  - **P3.** Each shadow repo records its folder (`checkpoints/<hash>/aurora-cwd`). Once a day per process, after a checkpoint, repos whose folder is gone or that nothing has touched for 90 days are removed (`rewind.sweep_stale`); a repo from before this has no mark and goes by age alone. Only 16-hex-digit directories with a `HEAD` are ever touched.
+  - **Not done:** **B4** (six mobile UI tests fail on unchanged code) is a separate diagnosis; see the card.
+- **R457 — `edit_file` applies a unique whitespace-only match (part 5 E of card `20261123-183314-aurora-bash-mode-weaknesses-deep-dive`, 2026-11-23).** When `old` is not in the file as written but matches exactly one run of whole lines once indentation and runs of spaces/tabs are ignored (`patch.whitespace_edit`), the edit is applied and `new` is re-indented the way the match is (its lines' leading `old` indentation becomes the file's); the result says so (`matched once with different indentation/spacing; new was re-indented`). Two or more such matches, part of a line, or any other difference is still the R309 error with its hint. The approval preview shows the same change. Measured first on the main machine's 131 sessions (2026-11-23): ~153 edit results, 8 "not found", none of them whitespace-only, so this is cheap insurance for small local models rather than a measured fix. Tests: `tests/test_r457_whitespace_edit.py`, `tests/test_edit_hints_and_output.py`.
+- **R459 — The example web unit is a real sandbox (part 5 A of card `20261123-183314-aurora-bash-mode-weaknesses-deep-dive`, 2026-11-23).** The web denylist (R447, R450) is regexes, and a model can write a script and run it (`write_file x.sh` then `run_command "bash x.sh"`). `deploy/aurora-web.service.example` now makes the OS the boundary: `ProtectHome=tmpfs` with `BindPaths` for the workspace and `~/.aurora`, `BindReadOnlyPaths` for Aurora's own code except `config.yaml` and `aurora/providers/remote_context_limits.json` (which the page writes), `ProtectSystem=strict`, `InaccessiblePaths=/run/docker.sock`, `NoNewPrivileges`, `RestrictSUIDSGID`, `PrivateTmp` and the kernel protections. Checked with `systemd-run --user` and the same options: `~/.ssh` and other folders in the home are absent, the docker socket answers nothing, `sudo` fails, the code is read-only, the workspace, data dir and the two files are writable, and `aurora --web` starts and serves `/` and `/api/state`. A site applies it with a drop-in for its own unit; network access is not limited.
+
+- **R466 — Deleting a chat on the web page revokes its share links (audit, 2026-11-24).** A chat deleted on the page
+  (`/api/chat/delete`, or `/api/folder/delete` hiding the folder's chats) is only hidden, so its read-only
+  `/shared/<token>` link (R418/R454) stayed live for up to 7 days, and the Share button that revokes it is on the chat's
+  row, which was gone. Now: deleting revokes every link to those chats (`shares.delete_session`), and `/shared/` answers
+  404 for a hidden chat, so a link kept by an older server is not served either. Expired links are dropped whenever a
+  link is made, so they no longer count towards the 500-link limit. Tests: `tests/test_web_r466.py`.
+
+- **R469 — The web denylist's glob check is bounded, and a glob it cannot finish is asked (audit, 2026-11-24).** R450
+  matches a command's path globs as expanded (`cat ~/.s?h/id_ed25519`) with `glob.iglob`, on the turn thread before any
+  approval, with no limit: `ls /*/*/*/*/*/*/zz` walked the filesystem for 15 s on the i3 (1 s for four levels, 2.9 s for
+  five), up to 200 such words a command, and Stop could not cut it. `_bounded_glob` matches like iglob (hidden names only
+  for a part that starts with `.`) but stops after 0.5 s per command (`GLOB_BUDGET_S`) or at 5,000 paths in one level
+  (`GLOB_MAX_FRONTIER`). A command whose globs were not fully expanded is never auto-approved: the page asks, with a
+  note saying why, so a deep glob cannot be used to step round the check. Tests: `tests/test_audit_r464.py`
+  (`test_r469_*`), `tests/test_review_r450.py`.
+
+- **R473 — The web denylist reads a command's paths from the directory it really runs in (audit, 2026-11-24).** The
+  patterns matched the words as typed, so `cd /etc && cat environment`, `cat /etc/./environment`,
+  `cat /etc//environment`, `cd /proc/self && cat environ`, or `cat environment` with the tool's own `cwd: /etc`, all
+  read what `/etc/environment` blocks. `_resolved_paths` now follows `cd`/`pushd` (and the `cwd` argument) through the
+  command, splits at `&&`, `||`, `;`, `|`, `&`, newlines, `(`, `$(` and backticks, drops redirections, and adds every
+  word as a normalised absolute path to what the patterns see. A `cd $VAR` leaves the directory unknown. The denylist
+  is still best effort (a script can build a path at run time): R474 (asking first) and R475 (the sandbox) are the
+  boundary. Tests: `tests/test_audit_r470.py` (`test_r473_*`).
+
+- **R474 — The web page asks before every write and command until auto-approve is turned on (owner, 2026-11-24, after an outside review).**
+  `aurora --web` started with auto-approve on (R357/R392): anyone holding the token, or a prompt injection in a page
+  the model fetched, could run commands with no one asked, and only the denylist (best effort, R473) stood in the way.
+  The default is now off; the page's own switch (Settings › Chat) still turns it on and survives a restart, but only
+  a stored `web_auto_approve: true` does, and an unreadable state file means off. Docs (README, FEATURES, CHANGELOG,
+  REQUIREMENTS_OVERVIEW) say so. Tests: `tests/test_audit_r470.py` (`test_r474_*`), `tests/test_web.py`.
+
+- **R475 — The model's shell commands run in a sandbox (owner, 2026-11-24, after an outside review: "stronger
+  sandboxing and command execution isolation").** A command the model ran had everything the user has: ssh keys,
+  `/etc/environment`, Aurora's keys, the Docker socket (root on the host), `systemd --user` and tmux (a way to start a
+  process that outlives any check), and `~/.bashrc` or `.git/hooks` to plant something that runs later. Only the
+  denylist (patterns, best effort) stood in front of that on the web. `aurora/sandbox.py` now runs each command the
+  model starts (`run_command`, `wait_until`, background jobs) in a box: bubblewrap on Linux (own PID/IPC/UTS
+  namespaces, new session, dies with Aurora), `sandbox-exec` on macOS. The machine is read-only except the workspace,
+  `AURORA_HOME/workspace` (uploads, outputs), `~/.cache` and a private `/tmp` that lasts between commands. Hidden:
+  `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.docker`, `~/.kube`, `~/.netrc`, `~/.git-credentials`, gh/gcloud config,
+  `/etc/environment`, `AURORA_HOME` (but `skills/` read-only and `workspace/`), the Docker/containerd/podman sockets the
+  user can reach, `/run/user/<uid>`, the host's `/tmp`; `.git/hooks` and `.git/config` stay read-only; agent and bus
+  variables are dropped. The writable set comes from Aurora's working directory, never from the command's own `cwd`
+  argument (the model picks that). Mount order makes hiding win over a writable parent. The box is tried for real once
+  per process (a workspace write works, a home write and a hidden read fail); if that fails, the web page asks before
+  every command even with auto-approve on, and the server log says why. `runtime: sandbox: web` (default) boxes the web
+  page; `all` the terminal too; `off` none; `sandbox_network`, `sandbox_writable`, `sandbox_hide` tune it. Bash mode
+  and `/skill` runs (typed by the user) are never boxed. The macOS profile is checked by the same trial run but was
+  not run on a Mac when written. Tests: `tests/test_sandbox_r475.py` (36 attacks and uses, run in the real box).
+
+- **R476 — Adversarial integration tests for the web server and the shell boundary (owner, 2026-11-24, after an
+  outside review: "more extensive integration and adversarial tests").** `tests/test_adversarial_r476.py` runs a real
+  server: 34 POST routes each get 40 hostile bodies (not JSON, not an object, every known key set to null, huge
+  numbers, NUL bytes, path tricks, nested lists, 20 kB strings) and must answer below 500 with JSON, never a dropped
+  connection; every POST and GET route refuses a missing, empty or near-miss token with 401; URL path tricks
+  (`..%2F`, `%2e%2e`, absolute names) find nothing. Then the model itself attacks through real `run_command` calls
+  with auto-approve on and the sandbox on (planted keys only, never a real secret): reading `~/.ssh` through a
+  variable, appending to `~/.bashrc`, writing a git hook from base64; it must leak and change nothing, and the test
+  fails when the sandbox is off. With `tests/test_sandbox_r475.py` (36 attacks inside the box) and the R473 bypass
+  list. Tests: `tests/test_adversarial_r476.py`.
+
+- **R477 — Python extensions behind a process boundary: the `aurora-ext/1` extension host (owner, 2026-11-24, after
+  an outside review: "keep Python extensions as a compatibility layer").** Extensions were only ever loaded into
+  Aurora's own process, with the whole engine in reach, so a non-Python Aurora (the Rust core planned for 2.0) could
+  not use them, and a bad one could take the engine down. `python -m aurora.exthost` loads the same `SPEC` /
+  `RUNNERS` / `register(engine)` files and serves their tools over newline-delimited JSON-RPC 2.0 on stdio
+  (`initialize`, `tools/list`, `tools/call`, `shutdown`); the protocol is written down in
+  `documents/EXTENSIONS_PROTOCOL.md`. Same loading rules as in process (name order, first name wins, bad files are
+  warnings); a raising tool answers `is_error: true` and the host keeps running; extension prints go to stderr (fd 1
+  is pointed at stderr, the protocol keeps its own copy). `register()` gets `cfg` and `runtime` only. `Client` is a
+  Python client. The in-process loader is unchanged. Tests: `tests/test_exthost_r477.py` (a subprocess host; the same
+  tools as the in-process loader; the bundled lint extension loads behind the boundary).
+
+- **R481 — The Rust core's first tools: files and commands (owner, 2026-11-24).** `aurora-tools` has `read_file`
+  (whole, `offset`/`limit`, `tail`, the 200 000-byte cap), `list_dir`, `write_file` and `edit_file` (an existing
+  file keeps its mode; a CRLF file stays CRLF, R269; `old` must be unique unless `replace_all`), and `run_command`
+  (bash, its own process group, secret variables left out, R448; the head and the tail of long output, R310; a
+  timeout or Esc kills the whole group). Names, arguments and result strings are Python's, so a model sees the same
+  tool either way. Reads need no approval and run in parallel; writes and commands always ask. Not yet: grep,
+  find_files, apply_patch, web tools, background jobs (R245) and the R475 sandbox. The Rust approval policy has no
+  allow rules yet: every gated call asks, and while `denylist.yaml` holds a rule, auto-approve asks or refuses instead
+  (an unreadable denylist refuses every gated call, as in Python). Tests: `cargo test -p aurora-tools`,
+  `cargo test -p aurora-storage approvals`.
+
+- **R483 — The Rust core applies the allow and deny rules exactly as Python does (owner, 2026-11-25).**
+  `aurora-storage` ports `aurora/approve.py`'s matcher: command rules match by token prefix on normalised tokens
+  (quotes removed, `~` expanded); a chained, redirected or substituted command (R141) and a dangerous one (R149, R190,
+  R242, R277, R298, R319, R450) match only exactly; only a two-token rule is a prefix rule; a single-token rule
+  covers any arguments only for the read-only commands, but on the denylist it covers every argument (R149b); path
+  rules are normalised (R195) and, for the allowlist, must also match after symlinks are followed (R209); web_fetch
+  rules match per origin (R283); `cwd` outside the working directory (R303) and `wait_until`'s `then` (R299) always ask.
+  Deny wins, an unreadable denylist refuses everything. "Always allow" and "always deny" write the rule Python would
+  (`allowlist.yaml`, `denylist.yaml`, atomically), "allow for this session" keeps it in memory (R334), and the prompt
+  shows how far "always" reaches before it is chosen (R335). `--ask` offers all of them. The denylist no longer turns
+  `--yes` into asking (R481 did that while the matcher was missing). Not ported yet: `audit`/`prune` of old rules
+  (R336) and the web denylist's `cd` tracking (R473). Tests: `cargo test -p aurora-storage`;
+  `tests/test_rust_policy_r483.py` feeds about 3 500 generated rule, command, path and URL cases to `approve.py` and to
+  `aurora-rs --policy-oracle` and requires identical answers.
+
+- **R484 — The Rust core finds and redacts secrets as Python does (R58) (owner, 2026-11-25).** `aurora-core::secrets`
+  ports `aurora/secrets.py`: the known key and token shapes (GUIDs, AWS, GitHub, Slack, Stripe, OpenAI-style,
+  OpenRouter, Bearer, private key blocks, credential assignments in `.env` style with R328's code-value exemption), then
+  the entropy fallback with its hash, date and word-name exemptions, the claim bitmap (R90e, R170b), the allowlist by
+  SHA-256 and `<secret>` redaction that never leaves the tail of a nested match (R221). The loop asks the front end
+  (`Frontend::secret_challenge`: keep, redact, always, stop; fails closed to stop) at the same five points as Python:
+  the prompt before it is logged or sent, the model's reply, the content of `write_file` / `edit_file` / `apply_patch`
+  (a redact changes the call that runs), tool output of every tool (a keep is remembered for the session, R329), and a
+  command's own text, which only gets a notice (R131). A stop closes the turn with a valid history and never logs the
+  secret: the skipped write's arguments are scrubbed first (Python logs stale empty arguments there). `aurora-rs -t`
+  treats a likely secret as Python's headless mode does, ending the run with exit 1; `--ask` offers the choice.
+  `runtime.redact_secrets` switches it off and `runtime.secret_allowlist` is read. Not ported yet: saving a new
+  "always" value to the config, and `format_matches` for terminal display. Tests: `cargo test -p aurora-core`;
+  `tests/test_rust_secrets_r484.py` compares both scanners over hand-written cases, seeded random tokens and about 400
+  repository files; `tests/test_rust_compat_r482.py` stops the same scripted run in both Aurora's at a secret in the
+  prompt, in written content and in tool output.
+
+- **R485 — The Rust core boxes the model's commands as Python does (R475) (owner, 2026-11-25).** `aurora-tools::sandbox`
+  ports the Linux half of `aurora/sandbox.py`: the machine read-only under bubblewrap with the workspace, Aurora's
+  `workspace/`, `~/.cache`, `runtime.sandbox_writable` and a private kept `/tmp` writable; `~/.ssh` and the other secret
+  places, `runtime.sandbox_hide`, the container sockets, the user runtime dir and Aurora's own home (apart from `skills/`
+  read-only and `workspace/`) hidden; `.git/hooks` and `.git/config` read-only; own PID/IPC/UTS namespaces and a new
+  session; agent and bus variables dropped; `runtime.sandbox_network: false` removes the network. The mount order is
+  the one Python documents (a later mount covers an earlier one). A real trial run checks the box before first use; when
+  it fails `aurora-rs` says so on stderr and runs unboxed, as Python's terminal does. `runtime.sandbox: all` turns it on
+  (default `web` keeps the terminal unboxed, as in Python). A command's `cwd` argument never makes a folder writable.
+  Not ported: macOS `sandbox-exec`, boxing `wait_until`, background jobs and skills (those tools do not exist in Rust
+  yet). Tests: `cargo test -p aurora-tools sandbox` (real bubblewrap, skipped where it cannot run) and
+  `tests/test_rust_compat_r482.py::test_sandbox_all_boxes_commands_the_same_way_as_python`.
+
+- **R486 — The Rust core runs background jobs as Python does (R245, R246, R293) (owner, 2026-11-25).**
+  `run_command(background=true)` starts the command detached in its own process group (inside the R485 box when
+  there is one) and answers `[background job bgN started]` at once; `check_command` lists the jobs or shows one's
+  status and the end of its output (`tail`, at least 200 characters); `cancel_command` (asks approval) kills the whole
+  group. At most 4 jobs run at once and the 8 newest finished ones are kept; each stream is capped at 5 MB. The
+  registry is process-wide, and `aurora-rs` kills every running job when it exits, so none outlives the run. The tool
+  descriptions and result strings are Python's. Tests: `cargo test -p aurora-tools jobs` and
+  `tests/test_rust_compat_r482.py::test_background_jobs_report_alike_and_never_outlive_the_run` (both Auroras, same
+  script, no process left behind).
+
+- **R489 — The Rust core has `grep` and `find_files` as Python does (R90b, R95b, R96m, R127, R292) (owner, 2026-11-26).**
+  `grep` runs `grep -rnIE` with Python's prune list, stops reading at 200 000 bytes, drains stderr alongside so a flood
+  of errors never stalls it, times out after 30 s, and reports exit codes of 2 or more as `[grep error: …]`, never as
+  "no matches". `find_files` walks with the same prune list, matches the file name or the relative path, stops at 500
+  results, and returns partial results on a 30 s timeout or a cancel. The tool descriptions and result strings are
+  Python's. The web page's extra secret-place excludes come with the web front end (phase 6). Tests:
+  `cargo test -p aurora-tools search`; `tests/test_rust_tools_r489.py` (14 calls on one tree, Python as the oracle).
+
+- **R490 — The Rust core has `apply_patch`, and `edit_file` explains and forgives misses as Python does (R97, R220, R236, R269, R281, R309, R457) (owner, 2026-11-26).**
+  `aurora-tools::patch` ports `aurora/patch.py`: hunks are found by content, as whole lines, in order, all or none; a
+  removed `---` line is content, not a file header; a blank-line-only removal still applies; a uniformly CRLF file
+  keeps its line endings. A miss says why (different whitespace, spacing, only inside a longer line, a later line
+  differs). `edit_file` now takes a unique whitespace-insensitive match and re-indents `new` (R457). The approval
+  preview shows the change the patch will really make, or why it will fail. Tests: `cargo test -p aurora-tools`;
+  `tests/test_rust_tools_r489.py::test_patch_and_edit_match_python` (17 calls, LF and CRLF, results and bytes equal).
+
+- **R491 — The Rust core has `wait_until` as Python does (R100, R125, R272) (owner, 2026-11-26).**
+  One approval for the whole call. `command` reruns every `interval` seconds (at least 0.5, default 2) until it exits
+  0 or `timeout` passes (1 to 300, default 60); each attempt gets only what is left of the timeout, the wait between
+  attempts can be cancelled, `then` runs once right after the first success, and commands run inside the R485 box
+  when there is one. The result strings are Python's, including the `[tool error: …]` for a bad number. Tests:
+  `tests/test_rust_tools_r489.py::test_wait_until_matches_python` (9 cases, Python as the oracle).
+
+- **R495 — The Rust core runs Python's extensions through the aurora-ext/1 host (R119, R157, R227, R283, R477) (owner, 2026-11-26).**
+  At startup `aurora-rs` starts `python -m aurora.exthost` (`AURORA_PYTHON`, default `python3`). It loads Python's
+  bundled extensions (web, MCP, lint, price refresh) and `AURORA_HOME/extensions/`, then adds their tools after the
+  built-in ones. The model therefore gets exactly Python's tool list, and `runtime.web_search: false` hides the web
+  tools in both. Calls go over the protocol. A raised error reads `[tool error: <name>: Type: msg]` as in process.
+  Every `mcp_*` call asks for approval. `web_fetch` asks for a non-public or data-carrying URL: R283's check is
+  ported to Rust (`aurora-tools::url`) and makes no DNS query. Load failures and MCP startup errors are printed as
+  `· warning` lines, as in Python. A host that cannot start costs only the extension tools. Cancelling a running
+  extension call stops the host, because v1 has no cancel method. The host's `register(engine)` view gains `web`,
+  `models` and `extension_warnings`, which the bundled extensions read.
+  Tests: `cargo test -p aurora-tools url`; `tests/test_rust_ext_r495.py` (same tool specs and results as Python, an
+  extension that fails to load is reported, web tools hidden when turned off); `tests/test_rust_compat_r482.py`
+  (now compares the full tool list).
+
+- **R496 — Every ported requirement names its differential test (review note N4) (owner, 2026-11-26).**
+  `03-FEATURE-PARITY.md` gains a Compat test column. It lists the `tests/test_rust_*.py` files that name the
+  requirement, or that name the port its status note cites. `build_parity.py --check` fails when a PORTED or PARTIAL
+  row has none. `tests/test_rust_details_r496.py` fills the gaps the check found. It covers non-object tool arguments
+  (R268), the head and tail of long command output (R310), secret variables kept from commands (R448) and the
+  private AURORA_HOME (R450), each checked against Python. The remaining gaps are providers (R2, R91, R223), which
+  need live endpoints (N2).
+
+- **R499 — Python's front ends can run each turn's loop on the Rust core (`runtime.core: rust`) (owner, 2026-11-26).**
+  `aurora-rs --core` speaks `aurora-core/1` (`documents/CORE_PROTOCOL.md`) and `aurora/rustcore.py` drives it from
+  `Engine.send`. Python keeps everything around the turn: secret check of the prompt, budgets, compaction before the
+  prompt, session records, costs and the front end. Rust runs the loop: model requests, tools, the approval gate and
+  rules, checkpoints, mid-turn compaction and extensions. The TUI, classic REPL and headless runs need no change. The
+  default stays `python`. A turn that the Rust core cannot run yet goes to the Python loop with a `· this turn runs on
+  the Python core (why)` notice: the web page (path guard R450 and command box R475 are Python-only; rule 4), plan
+  mode, pictures, a missing `aurora-rs`. `AURORA_RS` names the binary. The `tool_result` event carries the call's
+  arguments. A call skipped without being considered now logs `args: {}` in Rust too, as Python's `_skip` does. A
+  missing `AURORA_HOME/extensions` folder is no longer passed to the extension host. Tests:
+  `tests/test_rust_core_r499.py` (Python headless with `--yes`, a denial, a command plus a read, and y / deny with a
+  note / steer / stop answered by a front end: same records, same requests, same files on both cores; the fallback
+  notice; web mode stays on Python); `cargo test -p aurora-cli` (answer mapping).
+
+- **R500 — The web page runs on the Rust core too: path guard and command box in Rust (R450, R475, R499) (owner, 2026-11-26).**
+  `aurora-tools::guard` ports `aurora/guard.py`. On the web page, file tools refuse secret locations (reads and
+  writes) and Aurora's own files outside `workspace/` (writes), on paths resolved through symlinks and `..`. `grep`
+  gets the same extra excludes. `aurora-rs --core --web` turns the guard on, and it boxes commands unless
+  `runtime.sandbox: off`, as Python's `service.web_sandbox` does for `aurora --web`. `aurora/rustcore.py` passes
+  `--web` whenever the guard is on, so the web page no longer stays on the Python loop. Its own rules (web denylist,
+  auto-approve, the R469 and R475 "asking" cases) stay in `WebFrontend.approve`, which answers the core's approval
+  requests. Tests: `tests/test_rust_web_r500.py` (Rust's guard against `guard.check` on 170 tool/path cases plus the
+  grep excludes; a web turn on each core refuses a prompt-injected `~/.ssh` read the same way; a web turn on each core
+  boxes a command the same way: the workspace is writable, the home folder is not, a secret is unreadable).
+
+- **R501 — The macOS command box (sandbox-exec) in the Rust core (R475, review note N1) (owner, 2026-11-26).**
+  `aurora-tools::sandbox` picks the box the machine has, as Python's `platform_tool` does: bubblewrap on Linux,
+  `sandbox-exec` on macOS. `macos_profile` writes the same SBPL profile as `aurora/sandbox.py`: writes allowed only
+  to the workspace, Aurora's `workspace/`, `~/.cache`, extra folders, the box's tmp and the per-user temp dir; hidden
+  places and AURORA_HOME unreadable, with `skills/` readable and `workspace/` writable again; `.git/hooks` and
+  `.git/config` read-only; container sockets shut; the network off when asked. On macOS a boxed command keeps
+  `TMPDIR`, starts in the caller's working directory, and the trial run names the tool. Tests:
+  `tests/test_rust_macos_r501.py` (the profile text equals Python's for the same policy, network on and off; on a Mac
+  it also really runs); `cargo test -p aurora-tools sandbox` (the box tests now also run on macOS). The real runs on
+  macOS are in `documents/migration/HANDOFF-MACOS.md`.
+
+- **R507 — Python's loop tests run on the Rust loop too, and what they found is fixed (R505) (owner, 2026-11-26).**
+  With `AURORA_CORE=rust`, `tests/conftest.py` sends every direct `agent.run_turn(...)` call through the Rust core:
+  the caller's history list, system prompt, cap and provider object (bridged), with scanning on when the caller gives
+  a `secret_challenge` (as a bare call switches it on). Plan-mode calls, and the engine's own fallback, keep Python's
+  loop. A test about one of Python's own hooks (the checkpoint and fold callbacks, Python's clock, a faked Python
+  tool, a Python provider's bulk hook) or a known difference (D8 explain, steering) is marked `python_loop` and names
+  the Rust test that covers the same behaviour. What the run found, now on both cores:
+  - the repeat nudge (R27) and the stop after three repeating rounds (R350) were missing from the Rust loop;
+  - auto-continue answered "never ask again", so the R314 backstops (50 rounds, an hour) did not apply;
+  - the spend limit (R340) was never checked mid-turn: the core now asks the front end (`budget`) after each reply
+    with tool calls and stops or warns as Python does;
+  - the allow and deny lists were read once per core, not at each turn's start (R170a, R196): the core re-reads
+    them every turn and says so when one is unreadable;
+  - the secret allowlist and the session's "keep" answers (R329), and the "allow for this session" rules (R334),
+    lived in one core process: the front end's sets go with each turn and come back with `done`;
+  - generation speed (R352) and the last reply's size for the context gauge (R84) were not reported;
+  - a bridged reply's assistant message was the provider's, from before the loop redacted it (R58): it is rebuilt
+    from the redacted result;
+  - `on_usage` and `on_approval` were assumed present, and a failing approval logger could end the turn (R133c).
+  Tests: the suite with `AURORA_CORE=rust` (the nightly's second run); `agent::tests::the_repeat_nudge_needs_the_same_call_and_the_same_result`,
+  `agent::tests::a_model_that_keeps_repeating_is_stopped`; `tests/test_rust_bridge_r505.py`.
+- **R511 — The config editor hides secrets inside values too (review F5) (owner, 2026-11-27).**
+  Besides secret-named keys (R427), the page never sees a URL's password (`https://user:«hidden»@host`), a
+  secret-named query value (`?api_key=«hidden»`) or a secret-named `--flag=«hidden»` in a command or a list item.
+  Saving puts each one back at the same place. Tests: `tests/test_review_r509_r512.py`.
+- **R512 — web_fetch checks the target's address before it sends the request; proxies are handled (review F6) (owner, 2026-11-27).**
+  The R301 rebinding guard read the peer address after the GET had gone out, so a private service still received it.
+  Each hop is now resolved first, and a name that resolves to a private or local address is refused before anything is
+  sent (unless the URL itself was approved as private). The peer check stays as a second line. When an environment
+  proxy carries the request, the peer is the proxy, so that check is skipped instead of blocking every page; the
+  pre-request check still applies. Tests: `tests/test_review_r509_r512.py`.

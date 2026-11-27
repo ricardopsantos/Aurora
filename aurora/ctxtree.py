@@ -13,7 +13,7 @@ through `ui._handle_command`.
 import math
 
 from . import session as sessions
-from .colors import BOLD, CYAN, DIM, GREEN, MAGENTA, RED, RESET, YELLOW, dim
+from .colors import BOLD, CYAN, DIM, GREEN, MAGENTA, RED, RESET, YELLOW, dim, visible
 from .tokens import fmt_token_count
 
 # how many turns render by default — a long session is unbounded (nothing is
@@ -78,7 +78,7 @@ def _collect(session_id: str) -> tuple[list, bool]:
     for r in sessions.Session(session_id).iter_records(events=wanted):
         ev = r.get("event")
         if ev == "user":
-            text = " ".join((r.get("text") or "").split())
+            text = visible(" ".join((r.get("text") or "").split()))   # R553: pasted escapes cannot style the tree
             if len(text) > _LABEL_CHARS:
                 text = text[:_LABEL_CHARS - 1] + "…"
             turn = _Turn(text, r.get("model") or "?")

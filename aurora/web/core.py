@@ -22,6 +22,7 @@ AUTO_CLEAR_RATIO = 0.9      # a turn that ends with the context this full starts
 MAX_SENT_IDS = 500                       # R396: remembered outbox ids (a resend window, not a log)
 PRICE_REFRESH_GAP_S = 20                 # R397: a second manual refresh within this is refused (the catalog is ~1 MB)
 MAX_QUEUE = 20              # messages waiting behind a running turn; more are refused
+MAX_QUEUE_IMAGE_BYTES = 48_000_000   # R510: pictures (data URLs) held by waiting messages together; more are refused
 MAX_HISTORY = 200           # messages of a resumed session drawn on the page
 MAX_DIFF = 200_000          # diff text sent to the page, chars
 COMMANDS = ("clear", "compact", "context")   # the only commands the page can run; anything else is refused
@@ -29,6 +30,26 @@ MAX_EVENT_BYTES = 32_000_000   # R392 (P7): the replay buffer is capped by size 
 COALESCE_S = 0.05              # R392 (P1): text/think chunks are sent at most every 50 ms ...
 COALESCE_BYTES = 1024          # ... or once 1 KB has gathered
 MAX_STREAMS = 20               # R392 (P12): open /api/stream connections; more get 429
+# R458 (#13): what a typed /command gets instead of a bare refusal: where its web
+# equivalent is, or that it exists only in the terminal
+WEB_EQUIVALENT = {"clear": "the Clear item in the ⋯ menu", "compact": "the Compact item in the ⋯ menu",
+                  "context": "the Context item in the ⋯ menu", "diff": "the Diff item in the ⋯ menu",
+                  "undo": "the Undo item in the ⋯ menu", "model": "the model menu above the message box",
+                  "plan": "Plan mode in Settings", "new": "New Chat in the sidebar",
+                  "resume": "the chat list in the sidebar", "search": "the search box in the sidebar",
+                  "export": "the download button on the chat in the sidebar"}
+
+
+def typed_command_refusal(text: str) -> str:
+    name = text[1:].split(None, 1)[0].lower() if text[1:].strip() else ""
+    where = WEB_EQUIVALENT.get(name)
+    if where:
+        return f"typed commands are not run on the web: for /{name} use {where}"
+    return (f"/{name or '…'} works only in the terminal (aurora). On the web: Clear, Compact, Context, "
+            "Diff and Undo are in the ⋯ menu, the model menu sits above the message box, "
+            "Plan mode is in Settings")
+
+
 def _vision_memory(new: dict | None = None) -> dict:
     """R412: per model, the last "can it see pictures" answer given while it was awake (AURORA_HOME/web-vision.json)."""
     import json as _json
@@ -37,6 +58,7 @@ def _vision_memory(new: dict | None = None) -> dict:
     if new is not None:
         try:
             f.write_text(_json.dumps(new), encoding="utf-8")
+            os.chmod(f, 0o600)            # R450 (S10)
         except OSError:
             pass
         return new
@@ -51,7 +73,16 @@ VISION_CACHE_S = 600.0         # R392 (bug 17): a probed "can this model see pic
 # R392: the web's own denylist. It wins even with auto-approve on; the terminal's approvals are untouched.
 WEB_DENY_DEFAULT = (r"\brm\s+-[a-z]*r[a-z]*f|\brm\s+-[a-z]*f[a-z]*r", r"\bsudo\b", r"\bgit\s+push\b", r"\bmkfs",
                     r"\bdd\s+if=", r"\b(shutdown|reboot|poweroff)\b", r"\b(curl|wget)\b[^|]*\|\s*(ba|z)?sh\b",
-                    r"\bchmod\s+-R\s+777\b", r":\(\)\s*\{")
+                    r"\bchmod\s+-R\s+777\b", r":\(\)\s*\{",
+                    # R447: what matters most on a host with Docker and ssh keys: the socket, other machines, the secrets
+                    r"\bdocker(-compose)?\b", r"docker\.sock", r"\b(ssh|scp|sftp|rsync|nsenter)\b", r"\bsu\b",
+                    r"\b(env|printenv|export\s+-p|set)\s*($|[|;&>])", r"/etc/environment", r"/proc/[^\s]*/environ", r"\.ssh\b",
+                    r"\bos\.system\b|\bsubprocess\b|\bpty\.spawn\b", r"\b(base64|xxd)\b[^|]*-d[^|]*\|\s*(ba|z)?sh\b",
+                    r"\beval\b",
+                    # R450 (S4): more ways to run a program, and the policy/code files (S1/S8) a command could rewrite
+                    r"\bos\.(popen|exec[a-z]*|spawn[a-z]*)\b|\bpexpect\b", r"\b(perl|ruby|php|lua)\b\s+-[a-z]*e\b",
+                    r"\bnode\b\s+-e\b|\bawk\b[^|;]*\bsystem\s*\(", r"[$`(][^)`]*\b(base64|xxd)\b[^)`]*-d",
+                    r"web-denylist|\ballowlist\.yaml|\bdenylist\.yaml|\bstate\.yaml|\.aurora/(extensions|bootstrap)")
 
 
 def web_denylist() -> list[str]:
@@ -60,19 +91,171 @@ def web_denylist() -> list[str]:
         lines = (service.aurora_home() / "web-denylist.txt").read_text(encoding="utf-8").splitlines()
     except OSError:
         return list(WEB_DENY_DEFAULT)
-    return [x.strip() for x in lines if x.strip() and not x.lstrip().startswith("#")]
+    pats = [x.strip() for x in lines if x.strip() and not x.lstrip().startswith("#")]
+    return pats or list(WEB_DENY_DEFAULT)      # R450 (S1): an empty file never means "deny nothing"
+
+
+_COMMAND_TOOLS = ("run_command", "wait_until")
+_PATH_KEYS = ("path", "file", "filename")
+
+
+def _strings(v, depth: int = 0):
+    """R450 (S4): every string inside nested lists/dicts (MCP tool arguments were not scanned at all)."""
+    if isinstance(v, (str, int, float)):
+        yield str(v)
+    elif depth < 6 and isinstance(v, dict):
+        for x in v.values():
+            yield from _strings(x, depth + 1)
+    elif depth < 6 and isinstance(v, (list, tuple)):
+        for x in v:
+            yield from _strings(x, depth + 1)
+
+
+GLOB_BUDGET_S = 0.5           # R469: time the denylist may spend expanding one command's path globs
+GLOB_MAX_FRONTIER = 5000      # ... and how many paths one glob level may hold
+
+
+def _bounded_glob(pattern: str, deadline: float, limit: int = 20) -> tuple[list[str], bool]:
+    """R469: glob.iglob's matches (hidden names only for a part that starts with '.'), at most `limit`, giving up at
+    `deadline` or when one level holds more than GLOB_MAX_FRONTIER paths. Returns (matches, complete). iglob itself
+    walked `/*/*/*/*/*/*/x` for 15 s on this machine, longer for each level, before the approval was even shown."""
+    import fnmatch
+    import glob
+    pattern = os.path.expanduser(pattern)
+    bases = ["/"] if pattern.startswith("/") else [""]
+    for part in [p for p in pattern.split("/") if p]:
+        nxt = []
+        for b in bases:
+            if time.monotonic() > deadline:
+                return [], False
+            if not glob.has_magic(part):
+                p = os.path.join(b, part)
+                if os.path.lexists(p):
+                    nxt.append(p)
+                continue
+            try:
+                with os.scandir(b or ".") as it:
+                    names = [e.name for e in it]
+            except OSError:
+                continue
+            nxt.extend(os.path.join(b, n) for n in names
+                       if fnmatch.fnmatch(n, part) and (part.startswith(".") or not n.startswith(".")))
+            if len(nxt) > GLOB_MAX_FRONTIER:
+                return [], False
+        bases = nxt
+        if not bases:
+            break
+    return bases[:limit], True
+
+
+def _glob_expanded(text: str, budget_s: float | None = None) -> tuple[str, bool]:
+    """R450 (S4): `cat ~/.s?h/id_ed25519` or `/usr/bin/doc?er` — what a path glob in the command really names.
+    R469: bounded (GLOB_BUDGET_S for the whole command); returns (paths, complete)."""
+    import itertools
+    import shlex
+    try:
+        toks = shlex.split(text)
+    except ValueError:
+        toks = text.split()
+    deadline = time.monotonic() + (GLOB_BUDGET_S if budget_s is None else budget_s)
+    out, complete = [], True
+    for t in itertools.islice((t for t in toks if "/" in t and any(c in t for c in "*?[")), 200):
+        got, done = _bounded_glob(t, deadline)
+        out.extend(got)
+        if not done:
+            complete = False
+            break
+    return "\n".join(out), complete
+
+
+_SEGMENT = re.compile(r"&&|\|\||[;&|\n()]|\$\(|`")
+_REDIRECT = re.compile(r"^\d*[<>]+&?")
+
+
+def _resolved_paths(command: str, start: str) -> str:
+    """R473: every word of `command` as a path from the directory it would really be read in: `cd /etc && cat
+    environment` names /etc/environment, and so does `cat environment` run with cwd /etc, or `cat /etc/./environment`.
+    The denylist matched only the words as typed. `cd`/`pushd` move the directory for the rest of the command;
+    `cd` with no argument (or `~`) goes home; a word that is a $VARIABLE leaves the directory unknown."""
+    import shlex
+    home = os.path.expanduser("~")
+    cur: str | None = os.path.normpath(start) if start and os.path.isabs(start) else None
+    out: list[str] = []
+    for seg in _SEGMENT.split(command)[:400]:
+        try:
+            words = shlex.split(seg)
+        except ValueError:
+            words = seg.split()
+        words = [_REDIRECT.sub("", w) for w in words]
+        words = [w for w in words if w]
+        if not words:
+            continue
+        if words[0] in ("cd", "pushd"):
+            arg = next((w for w in words[1:] if not w.startswith("-")), "~")
+            if "$" in arg or "`" in arg:
+                cur = None
+            elif arg.startswith("~"):
+                cur = os.path.normpath(os.path.expanduser(arg))
+            elif os.path.isabs(arg):
+                cur = os.path.normpath(arg)
+            elif cur is not None:
+                cur = os.path.normpath(os.path.join(cur, arg))
+            continue
+        for w in words[1:]:
+            w = w.split("=", 1)[1] if w.startswith("-") and "=" in w else w
+            if not w or w.startswith("-") or "$" in w:
+                continue
+            if w.startswith("~"):
+                w = os.path.expanduser(w)
+            if os.path.isabs(w):
+                out.append(os.path.normpath(w).replace("//", "/"))
+            elif cur is not None:
+                out.append(os.path.normpath(os.path.join(cur, w)))
+            elif w.startswith(".."):
+                out.append(os.path.normpath(os.path.join(home, w)))   # unknown start: still catch ../../etc/x
+    return "\n".join(out[:2000])
 
 
 def web_denied(tool: str, args: dict, patterns: list[str] | None = None) -> str:
-    """The first web-denylist pattern any string argument of the call matches, or ""."""
-    text = "\n".join(str(v) for v in (args or {}).values() if isinstance(v, (str, int, float)))
+    """The first web-denylist pattern the call matches, or "" (see web_check)."""
+    return web_check(tool, args, patterns)[0]
+
+
+def web_check(tool: str, args: dict, patterns: list[str] | None = None) -> tuple[str, bool]:
+    """(the first web-denylist pattern the call matches or "", checked). R469: `checked` is False when a path glob
+    in the command was too broad to expand in time: the call is then put to the page, never auto-approved.
+
+    R450 (B1): the command patterns are matched against what is RUN: every string inside the arguments of a command
+    tool (`run_command`, `wait_until`) or an MCP tool, nested ones included. A file tool is matched only on its path,
+    so writing a README that says `docker`, or code with `import subprocess`, is no longer refused."""
+    args = args or {}
+    if tool in _COMMAND_TOOLS or tool.startswith("mcp_"):
+        text = "\n".join(_strings(args))
+    else:
+        text = "\n".join(str(args[k]) for k in _PATH_KEYS if isinstance(args.get(k), str))
+    if not text:
+        return "", True
+    # R447: also match with quotes and backslashes removed, so su""do / s\\udo / 'rm' -rf cannot step round a pattern
+    plain = re.sub(r"[\"'\\]", "", text)
+    variants, checked = [text, plain], True
+    if tool in _COMMAND_TOOLS:
+        ex, checked = _glob_expanded(plain)
+        if ex:
+            variants.append(ex)
+        # R473: the words as paths from where the command really runs (its `cwd` argument, then each `cd`)
+        cwd = args.get("cwd") if isinstance(args.get("cwd"), str) else ""
+        start = os.path.join(os.getcwd(), os.path.expanduser(cwd)) if cwd else os.getcwd()
+        cmd = args.get("command") if isinstance(args.get("command"), str) else ""
+        rp = _resolved_paths(re.sub(r"[\"'\\]", "", cmd), start) if cmd else ""
+        if rp:
+            variants.append(rp)
     for pat in (web_denylist() if patterns is None else patterns):
         try:
-            if re.search(pat, text, re.I):
-                return pat
+            if any(re.search(pat, v, re.I) for v in variants):
+                return pat, checked
         except re.error:
             continue
-    return ""
+    return "", checked
 
 
 def _ev_size(ev: dict) -> int:
@@ -108,6 +291,7 @@ def _split_notes(text: str) -> tuple[str, str, str]:
 class WebSession:
     def __init__(self, engine, approve_timeout: float | None = None, auto_approve: bool | None = None):
         self.engine = engine
+        service.set_web_guard(True)                       # R450: file tools refuse secrets and Aurora's own policy files
         if approve_timeout is None:
             try:
                 approve_timeout = float(os.environ.get("AURORA_WEB_APPROVE_TIMEOUT", "") or APPROVE_TIMEOUT_S)
@@ -126,18 +310,24 @@ class WebSession:
         self._next_id = 1
         self._last_reset = 0                   # id of the newest reset: a fresh page replays from there, not from event 1
         self.busy = False
+        self.busy_client = None                # R458: client_id of the message the running turn answers
+        self._link_notes: list[dict] = []      # R460: notes a page link loaded into this chat ({id, title, text})
+        from . import memory
+        memory.install()                       # R462: the `remember` tool (writes the Memory note)
         self._price_refreshing = False         # R397: one manual refresh at a time
         self._price_refreshed = 0.0
         self._sent_ids: dict[str, None] = {}        # R396: outbox ids already accepted, oldest first
-        self._queue: list[tuple] = []          # R373: (text, images, shown, temperature) sent while a turn runs, oldest first
+        self._queue: list[tuple] = []          # R373: (text, images, shown, temperature, client_id) sent while a turn runs, oldest first
         self._stop = False
         self._approval: dict | None = None     # {"id", "answer"}
         self._approval_seq = 0
         if auto_approve is None:                # R392 (bug 15): the page's switch survives a restart (state.yaml)
+            # R474: until the switch is turned on, every write and command asks the page first (it used to start on:
+            # anyone holding the token, or a prompt injection in a fetched page, ran commands with no one asked)
             try:
-                auto_approve = bool(service.load_state().get("web_auto_approve", True))
+                auto_approve = service.load_state().get("web_auto_approve", False) is True
             except Exception:
-                auto_approve = True
+                auto_approve = False
         self.auto = auto_approve                # R357/R392: the web's own auto-approve; the web denylist wins over it
         engine.auto_approve = False             # the engine always asks the page, which applies the web policy
         engine.headless = True                  # keep max_iterations binding, no steering
@@ -156,11 +346,15 @@ class WebSession:
                 self._last_reset = ev["id"]
             if type_ in ("user", "text", "done", "tool_start"):
                 self.last_activity = ev["t"]
-            drop = max(0, len(self.events) - MAX_EVENTS)
-            gone = sum(self._sizes[:drop])
-            while drop < len(self.events) - 1 and self._bytes - gone > MAX_EVENT_BYTES:
-                gone += self._sizes[drop]
-                drop += 1
+            # R573: trimmed in batches (to 7/8 of a cap) once a cap is passed; at the cap it used to shift the whole
+            # 20,000-event list (and sum a slice of sizes) for every streamed chunk
+            drop = 0
+            if len(self.events) > MAX_EVENTS or self._bytes > MAX_EVENT_BYTES:
+                drop = max(0, len(self.events) - MAX_EVENTS * 7 // 8)
+                gone = sum(self._sizes[:drop])
+                while drop < len(self.events) - 1 and self._bytes - gone > MAX_EVENT_BYTES * 7 // 8:
+                    gone += self._sizes[drop]
+                    drop += 1
             if drop:
                 self._bytes -= gone
                 del self.events[:drop]
@@ -207,12 +401,12 @@ class WebSession:
             ctx = {}
         with self.cond:
             pend = self._approval["id"] if self._approval else None
-        return {"busy": self.busy, "model": model, "provider": self.engine.current.get("provider", ""), "context": ctx, "loaded": bool(ctx.get("live_model")), "auto_approve": bool(self.auto), "context_file": _context_file(),
+        return {"busy": self.busy, "busy_client": self.busy_client or "", "model": model, "provider": self.engine.current.get("provider", ""), "context": ctx, "loaded": bool(ctx.get("live_model")), "auto_approve": bool(self.auto), "sandbox": service.sandbox_status(), "context_file": _context_file(),
                 "pending_approval": pend, "last_event": self._next_id - 1, "boot": self.boot,
                 "plan_mode": bool(getattr(self.engine, "plan_mode", False)), "streams": self.streams,
                 "stt": bool(os.environ.get("AURORA_WEB_STT_URL")),
                 "idle_s": round(time.time() - self.last_activity, 1) if self.last_activity else None,
-                "session_id": self.engine.session.id, "version": _code_version(), "queued": len(self._queue), "vision": self.vision()}
+                "session_id": self.engine.session.id, "chat_empty": not self.engine.messages, "version": _code_version(), "queued": len(self._queue), "vision": self.vision()}
 
     def search(self, query: str, limit: int = 30) -> list[dict]:
         """R377: sessions whose log contains `query` (case-insensitive), newest first, one snippet each."""
@@ -253,6 +447,8 @@ class WebSession:
         if sid == self.engine.session.id:
             return False, "that chat is open: start a new one first"
         folders.hide_chat(sid)
+        from . import shares
+        shares.delete_session([sid])           # R466: a deleted chat's share link would stay live, with no way to revoke it
         return True, ""
 
     def rename_chat(self, sid: str, name: str) -> tuple[bool, str]:
@@ -269,6 +465,9 @@ class WebSession:
 
     def delete_folder(self, fid: str) -> tuple[bool, str]:
         gone, why = folders.delete(fid, {self.engine.session.id})
+        if gone:
+            from . import shares
+            shares.delete_session(gone)         # R466: the folder's chats are hidden: their links go too
         return (gone is not None), why
 
     def session_markdown(self, sid: str) -> str | None:
@@ -276,7 +475,7 @@ class WebSession:
         (so a crafted id can never reach the filesystem). Capped; the cut is said, not silent."""
         if not service.session_exists(sid):
             return None
-        md = service.export_markdown(sid)
+        md = service.export_markdown(sid, MAX_TRANSCRIPT)     # R465: stops reading past the cap
         if sid == self.engine.session.id and self.busy:   # R415 (B7): the live chat, read while a turn appends to it
             md += "\n\n[… this chat is in progress: the reply being written is not shown yet]"
         return md if len(md) <= MAX_TRANSCRIPT else md[:MAX_TRANSCRIPT] + f"\n\n[… transcript cut at {MAX_TRANSCRIPT} characters]"
@@ -322,6 +521,56 @@ class WebSession:
         if rule not in (self.engine.system or ""):
             self.engine.system = (self.engine.system or "") + rule
 
+    def _context_rule(self) -> None:
+        """R460: the notes a page link (`/?note=<id>`, see `load_note`) loaded into this chat go into the system
+        prompt, in one <context-notes> block. Re-applied before every turn because a reset (auto-clear) or a resume
+        starts from the bare system prompt. Runs on the turn thread or holding the claim: the one writer."""
+        system = self.engine.system or ""
+        if CTX_START in system and CTX_END in system:
+            a = system.index(CTX_START)
+            system = system[:a] + system[system.index(CTX_END, a) + len(CTX_END):]
+        if self._link_notes:
+            system += (f"{CTX_START}The user loaded these notes as background for this chat. Use them when they help; "
+                       "do not repeat them back unless asked.\n\n" + "\n\n".join(_ctx_part(n) for n in self._link_notes)
+                       + CTX_END)
+        self.engine.system = system
+
+    def _restore_context_notes(self) -> None:
+        """R460: a resumed chat gets back the notes a link loaded into it (from its log)."""
+        got: dict[str, dict] = {}
+        for r in self.engine.session.iter_records(events={"context_note"}):
+            if isinstance(r.get("id"), str) and isinstance(r.get("text"), str):
+                got.pop(r["id"], None)
+                got[r["id"]] = {"id": r["id"], "title": str(r.get("title", "")), "text": r["text"]}
+        self._link_notes = list(got.values())
+        self._context_rule()
+
+    def load_note(self, nid: str, new_chat: bool) -> tuple[bool, str]:
+        """R460: a page opened as `/?note=<id>` loads that note into a chat at once, before any message:
+        into a new chat, or added to the current one. Kept in the session log, so a resumed chat has it again."""
+        from . import notes
+        n = notes.get(nid) if notes.valid_id(nid) else None
+        if n is None:
+            return False, "no such note"
+        if new_chat:
+            ok, why = self.new_chat()
+            if not ok:
+                return False, why
+        if not self._claim():
+            return False, "a turn is running \u2014 stop it first"
+        try:
+            snap = {"id": n["id"], "title": n["title"], "text": n["text"][:NOTE_CTX_MAX]}
+            self._link_notes = [x for x in self._link_notes if x["id"] != snap["id"]] + [snap]
+            self._context_rule()
+            try:
+                self.engine.session.log("context_note", **snap)
+            except Exception:
+                pass
+        finally:
+            self._release()
+        self.emit("notify", text=f"note \u201c{n['title'] or 'Untitled'}\u201d loaded as context: Aurora has it from your next message")
+        return True, ""
+
     def send(self, text: str, images: list | None = None, client_id: str | None = None,
              notes: list | None = None, temperature: float | None = None) -> tuple[bool, str]:
         """R396: `client_id` (the page's outbox id) makes a resend after a dropped connection a no-op:
@@ -347,8 +596,8 @@ class WebSession:
             text = "(see the attached " + ("file" if files else "note") + ("s)" if len(notes) > 1 else ")")
         if not text:
             return False, "empty message"
-        if text.startswith("/"):
-            return False, "commands are disabled in the web version"
+        if text.startswith("/") and not service.starts_with_path(text):     # R453: `/etc/hosts …` is a message
+            return False, typed_command_refusal(text)
         self._outputs_rule()
         shown = text
         if notes:
@@ -363,7 +612,10 @@ class WebSession:
             if self.busy:
                 if len(self._queue) >= MAX_QUEUE:
                     return False, f"the queue is full ({MAX_QUEUE} messages): wait or stop"
-                self._queue.append((text, images, shown, temperature))
+                held = sum(len(u) for q in self._queue for u in q[1])
+                if images and held + sum(len(u) for u in images) > MAX_QUEUE_IMAGE_BYTES:
+                    return False, "the queue is full (pictures waiting take too much room): wait for the reply, then send"
+                self._queue.append((text, images, shown, temperature, client_id))
                 pos = len(self._queue)
             else:
                 pos = 0
@@ -377,12 +629,14 @@ class WebSession:
         if pos:
             self.emit("queued", text=shown, position=pos, images=len(images))
             return True, ""
-        self.emit("user", text=shown, images=len(images))
+        self.busy_client = client_id     # R458 (#22): which page started the running turn
+        self.emit("user", text=shown, images=len(images), client=client_id or "")
         threading.Thread(target=self._turn, args=(text, images, temperature), daemon=True).start()
         return True, ""
 
     def _start_queued(self, nxt: tuple) -> None:
-        self.emit("user", text=nxt[2], images=len(nxt[1]))
+        self.busy_client = nxt[4] if len(nxt) > 4 else None
+        self.emit("user", text=nxt[2], images=len(nxt[1]), client=self.busy_client or "")
         threading.Thread(target=self._turn, args=(nxt[0], nxt[1], nxt[3]), daemon=True).start()
 
     def cancel_queued(self, position, text) -> tuple[bool, str]:
@@ -440,6 +694,7 @@ class WebSession:
         # R418 (F5): the page's temperature, for this turn only; never written to the model entry or state.yaml
         self.engine.turn_overrides = {"temperature": temperature} if temperature is not None else {}
         try:
+            self._context_rule()
             self.engine.send(text, fe, images=images)
         except ProviderError as e:
             fe.notify(f"provider error: {e}")
@@ -536,7 +791,7 @@ class WebSession:
                 "daily_budget": float(getattr(self.engine, "daily_budget", 0) or 0)}
 
     def set_budget(self, which: str, usd) -> tuple[bool, str]:
-        if isinstance(usd, bool) or not isinstance(usd, (int, float)) or usd < 0 or usd > 10_000:
+        if isinstance(usd, bool) or not isinstance(usd, (int, float)) or not 0 <= usd <= 10_000:   # R518: NaN fails too
             return False, "budget must be a number of dollars, 0 = no limit"
         if which == "session":
             self.engine.set_session_budget(float(usd))
@@ -574,8 +829,8 @@ class WebSession:
             text = text.strip()
             if not text:
                 return False, "empty message"
-            if text.startswith("/"):
-                return False, "commands are disabled in the web version"
+            if text.startswith("/") and not service.starts_with_path(text):
+                return False, typed_command_refusal(text)
         if not self._claim():
             return False, "a turn is running — stop it first"
         msgs = self.engine.messages
@@ -911,6 +1166,7 @@ class WebSession:
         try:
             had_turns = next(iter(self.engine.session.iter_records(events={"user"})), None) is not None
             self.engine.reset()
+            self._link_notes = []              # R460: a link's notes belong to the chat they were loaded into
             if had_turns:                      # R377: a chat with turns stays in the list; the next one gets its own session
                 self.engine.session = service.new_session()
         finally:
@@ -962,6 +1218,7 @@ class WebSession:
             self.busy = True
         try:
             n = self.engine.resume_from(sid)
+            self._restore_context_notes()          # R460
         except Exception as e:
             n, err = -1, f"{type(e).__name__}: {e}"
         finally:
@@ -1042,6 +1299,17 @@ def _code_version() -> str:
     return service.version()
 
 
+CTX_START = "\n\n<context-notes>\n"   # R460: the block _context_rule adds to the system prompt
+CTX_END = "\n</context-notes>"
+NOTE_CTX_MAX = 20_000                  # characters sent of each context note; the rest is cut, it is billed every turn
+
+
+def _ctx_part(n: dict) -> str:
+    text = n["text"][:NOTE_CTX_MAX].replace("</context-notes>", "").replace("</note>", "")
+    title = re.sub(r'["<>\r\n]', "", n.get("title") or "")[:200] or "Untitled"    # R519: a title cannot close the tag
+    return f'<note title="{title}">\n{text}\n</note>'
+
+
 def _context_file() -> str:
     """R358: the workspace's bootstrap file (the server runs with the workspace as cwd), or "" when it has none."""
     path = os.path.join(os.getcwd(), "context.md")
@@ -1070,8 +1338,24 @@ def _outputs_snapshot() -> dict | None:
         return None
 
 
+def _clip(v, budget: list):
+    """R519: strings anywhere in the value cut to what is left of the budget; lists and dicts walked, so an
+    `edits: [...]` list or a nested patch no longer goes to the page (and the replay buffer) at full size."""
+    if isinstance(v, str):
+        # a short string (a path, a name) is never cut; a long one gets at most MAX_OUTPUT of what is left
+        keep = len(v) if len(v) <= 500 else max(0, min(len(v), MAX_OUTPUT, budget[0]))
+        budget[0] -= keep
+        return v[:keep] + ("…" if keep < len(v) else "")
+    if isinstance(v, list):
+        return [_clip(x, budget) for x in v[:200]]
+    if isinstance(v, dict):
+        return {str(k)[:200]: _clip(x, budget) for k, x in list(v.items())[:200]}
+    return v
+
+
 def _clip_args(args: dict) -> dict:
-    return {k: (v if not isinstance(v, str) else v[:MAX_OUTPUT]) for k, v in (args or {}).items()}
+    budget = [4 * MAX_OUTPUT]
+    return {k: _clip(v, budget) for k, v in (args or {}).items()}
 
 
 class WebFrontend:
@@ -1160,12 +1444,18 @@ class WebFrontend:
         """R392 web approval policy: the web denylist refuses without asking (even with auto-approve on);
         auto-approve answers yes; otherwise the page is asked. Reads are never gated, so 'off' = reads only."""
         self.flush()
-        pat = web_denied(tool, args)
+        pat, checked = web_check(tool, args)
         if pat:
             self.s.emit("notify", text=f"denied by the web denylist ({pat}): {tool}")
             return ("n", "blocked by the web denylist: this command is never run from the web page")
-        if self.s.auto:
-            return "y"
+        sb = service.sandbox_status()
+        unboxed = tool in _COMMAND_TOOLS and sb["wanted"] and not sb["active"]
+        if not checked:          # R469: a glob too broad to expand in time is not auto-approved
+            self.s.emit("notify", text=f"{tool}: a path pattern in it was too broad to check against the web denylist: asking")
+        elif unboxed and self.s.auto:   # R475: no sandbox on this machine: a command is never run without asking
+            self.s.emit("notify", text=f"{tool}: no command sandbox here ({sb['problem']}): asking")
+        elif self.s.auto and not (tool == "web_fetch" and service.url_needs_approval(str(args.get("url", "")))):
+            return "y"          # R450 (S3): a fetch that could carry data out (R283) is always put to the page
         return self.s.ask(tool, args, diff)
 
     def ask_continue(self, iterations: int):

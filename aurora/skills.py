@@ -249,7 +249,8 @@ def run(name: str, args: str, config_base: str | None = None) -> str:
     # standardized on. Route through the same helper `run_command` uses.
     try:
         out, code = tools._run_command_once(shlex.join(cmd), None,
-                                            timeout=_SKILL_TIMEOUT)
+                                            timeout=_SKILL_TIMEOUT,
+                                            sandbox=False)   # R475: the user typed /name: not boxed, like bash mode
     except OSError as e:
         # an executable skill with a bad/missing interpreter (Exec format
         # error, ENOENT shebang) must come back as text, not kill the turn

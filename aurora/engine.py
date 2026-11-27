@@ -118,6 +118,7 @@ class ContextStats:
 class Engine:
     def __init__(self, config_path: str, session_id: str | None = None):
         self.cfg = load_config(config_path)
+        self.config_path = config_path            # R499: the Rust core opens the same file
         self.session = Session(session_id)
         # R150e: coerce a YAML null. A bare `models:` line parses as None, and
         # `load_config`'s `cfg.setdefault("models", [])` does NOT replace it —
@@ -142,6 +143,12 @@ class Engine:
         self.timeout = float(self.runtime.get("timeout", 300))
         tools.set_command_timeout(self.timeout)  # run_command honours it too (R90g)
         tools.set_parallel_tools(self.runtime.get("parallel_tools", True))  # R94
+        # R475: `sandbox: all` boxes the terminal's commands too (the web turns its own on in web/server.py)
+        from . import sandbox as _sandbox
+        from .paths import aurora_home as _ah
+        self.sandbox_problem = ""
+        if _sandbox.mode_from(self.runtime) == "all":
+            self.sandbox_problem = tools.enable_sandbox(_sandbox.policy_from(self.runtime, str(_ah())))
         # R119: extensions (bundled — e.g. MCP — + user's ~/.aurora/extensions/).
         # Loaded once per Engine lifetime: an MCP extension's register() may
         # spawn child server processes, which must not happen on every turn.
@@ -273,7 +280,12 @@ class Engine:
         # starting model: last one used on this machine, else the first
         # configured model that already has a usable key (never nags for a
         # key on a model nobody selected — see _default_model)
-        self.current = self._restore_last_model() or self._default_model()
+        restored = self._restore_last_model()
+        # R578: whether the starting model is one the user picked on this machine (state.yaml), or only the
+        # config's default. The terminal starts with no model rather than a default it never chose.
+        self.model_restored = restored is not None
+        self.unusable_models: dict = {}       # R580: (provider, model) -> why, from the startup check
+        self.current = restored or self._default_model()
 
     def _default_model(self) -> dict:
         """First-ever boot (no state.yaml yet): prefer a model whose key is
@@ -571,6 +583,22 @@ class Engine:
         return [m for m in self.models if self._has_key(m.get("provider"))]
 
     # ── the turn ────────────────────────────────────────────────────────
+    def _loop(self, provider, model, cb, tools_enabled, fe):
+        """R499: the turn's loop, on the Rust core when `runtime.core: rust` asks for it and it can."""
+        from . import rustcore
+        if rustcore.wanted(self):
+            why = rustcore.unsupported(self)
+            if why is None:
+                try:
+                    return rustcore.run_turn(self, provider, model, cb, tools_enabled)
+                except (OSError, RuntimeError) as e:
+                    why = f"{e.__class__.__name__}: {e}"
+            if rustcore.explicit(self):     # R508: by default, a turn the Rust core cannot take runs on Python quietly
+                fe.notify(f"· this turn runs on the Python core ({why})")
+            loop = getattr(agent.run_turn, "python_loop", agent.run_turn)    # the real one, if a test routed it (R507)
+            return loop(provider, model, self.messages, self.system, cb, self.max_iterations, tools_enabled)
+        return agent.run_turn(provider, model, self.messages, self.system, cb, self.max_iterations, tools_enabled)
+
     def _run_turn_with_fallback(self, provider, model, cb, tools_enabled, fe):
         """R162: run the turn; on a hard provider failure and `model_fallback`
         is on, retry the SAME messages against the next configured model with
@@ -607,9 +635,7 @@ class Engine:
                 model = self.current.get("model", "")
             last = (i == len(candidates) - 1)
             try:
-                turn = agent.run_turn(provider, model, self.messages,
-                                      self.system, cb, self.max_iterations,
-                                      tools_enabled)
+                turn = self._loop(provider, model, cb, tools_enabled, fe)
             except ProviderError as e:
                 last_error = e
                 if last:
@@ -1117,9 +1143,11 @@ class Engine:
     def _ledger(self) -> dict:
         import json
         try:
-            return json.loads(self._ledger_path().read_text(encoding="utf-8"))
+            d = json.loads(self._ledger_path().read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
+        # R530: anything but {day: number} reads as empty, never an AttributeError in the budget check
+        return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, (int, float))} if isinstance(d, dict) else {}
 
     def spent_today(self) -> float:
         import datetime
@@ -1130,15 +1158,19 @@ class Engine:
         import json
         if delta <= 0:
             return
-        led = self._ledger()
-        day = datetime.date.today().isoformat()
-        led = {k: v for k, v in led.items() if k >= (
-            datetime.date.today() - datetime.timedelta(days=60)).isoformat()}
-        led[day] = round(float(led.get(day, 0.0)) + delta, 6)
-        try:
-            write_text_atomic(self._ledger_path(), json.dumps(led))
-        except OSError:
-            pass
+        # R530: the terminal and the web page add to the same ledger; read, add and write under one file lock, so
+        # neither loses the other's spending (the daily cap counted less than was spent)
+        from .paths import file_lock
+        with file_lock(self._ledger_path()):
+            led = self._ledger()
+            day = datetime.date.today().isoformat()
+            led = {k: v for k, v in led.items() if k >= (
+                datetime.date.today() - datetime.timedelta(days=60)).isoformat()}
+            led[day] = round(float(led.get(day, 0.0)) + delta, 6)
+            try:
+                write_text_atomic(self._ledger_path(), json.dumps(led))
+            except OSError:
+                pass
 
     def set_daily_budget(self, usd: float) -> None:
         self.daily_budget = max(0.0, usd)
@@ -1206,7 +1238,8 @@ class Engine:
         if not stats.limit or stats.pct < self.auto_compact_threshold_pct:
             return
         folded = self.compact_history(
-            keep_recent_tokens=self.compact_keep_recent_tokens, notify=fe.notify)
+            keep_recent_tokens=self.compact_keep_recent_tokens, notify=fe.notify,
+            cancel=getattr(fe, "cancelled", None))
         if folded:
             fe.notify(f"auto-compact: context was at {stats.pct:.0f}% mid-task "
                      f"— folded {folded} older message(s) and continued")
@@ -1225,7 +1258,8 @@ class Engine:
         if not stats.limit or stats.pct < self.auto_compact_threshold_pct:
             return
         folded = self.compact_history(
-            keep_recent_tokens=self.compact_keep_recent_tokens, notify=fe.notify)
+            keep_recent_tokens=self.compact_keep_recent_tokens, notify=fe.notify,
+            cancel=getattr(fe, "cancelled", None))
         if folded:
             fe.notify(f"auto-compact: folded {folded} older message(s) — "
                      f"context was at {stats.pct:.0f}%")
@@ -1396,7 +1430,23 @@ class Engine:
         if live:
             self._limit_cache[key] = (live, _time.time())
 
-    def _live_model_name_nonblocking(self, provider) -> str | None:
+    def refresh_live_name(self, provider, pkey=None) -> str | None:
+        """Blocking re-read of what `provider` has loaded, written to the
+        per-provider name cache. The `/model` picker calls this (bounded, off
+        the UI thread) each time it opens, so its labels are never up to 120s
+        stale. `pkey` defaults to the current provider's key."""
+        import time as _time
+        if not hasattr(provider, "live_model_name"):
+            return None
+        key = pkey if pkey is not None else self._provider_key
+        try:
+            name = provider.live_model_name()
+        except Exception:
+            name = None
+        self._live_name_cache[key] = (name, _time.time())
+        return name
+
+    def _live_model_name_nonblocking(self, provider, pkey=None) -> str | None:
         """R170j: same nonblocking-cache shape as `_context_limit_nonblocking`
         above, for `live_model_name()` — the `/model` picker used to call it
         directly and synchronously to label the "local" entry, which is a
@@ -1412,7 +1462,10 @@ class Engine:
         import time as _time
         if not hasattr(provider, "live_model_name"):
             return None
-        key = self._provider_key
+        # keyed by the provider actually probed (the picker passes each row's
+        # own), NOT always the current one — else every local row showed the
+        # current provider's loaded model
+        key = pkey if pkey is not None else self._provider_key
         cached = self._live_name_cache.get(key)
         if cached and _time.time() - cached[1] < 120:
             return cached[0]
@@ -1449,7 +1502,7 @@ class Engine:
         self.system = _base_system()
         self.session.log("reset")
 
-    def compact_history(self, keep_recent_tokens: int = 0, notify=None) -> int:
+    def compact_history(self, keep_recent_tokens: int = 0, notify=None, cancel=None) -> int:
         """/compact (R14) and auto-compact (R118): summarize OLDER history
         with the CURRENT model and carry only the summary — a flatten barely
         shrinks anything, so it is the fallback, not the mechanism.
@@ -1527,10 +1580,13 @@ class Engine:
             # empty `result.text` from a thinking model meant the summary
             # silently fell back to a clipped flatten — the fold happened,
             # just without the summary it exists to produce.
+            # R562: `cancel` (the turn's Esc) stops the summary request, and a stopped fold folds nothing
             summary = side_completion(provider, self.current.get("model", ""),
-                                      ask)
+                                      ask, cancel=cancel)
         except Exception:
             pass  # model unreachable → clipped flatten below
+        if cancel is not None and cancel():
+            return 0
         if summary:
             body = "[Summary of the earlier conversation:]\n\n" + summary
         else:
@@ -1641,7 +1697,8 @@ class Engine:
             # that contradicts itself. `make_provider` also returns None when a
             # model names a `provider:` the config doesn't define.
             if not self.current.get("model"):
-                return {"ok": False, "detail": "no model configured"}
+                return {"ok": False, "detail": ("no model selected — /model to pick one" if self.models
+                                                else "no model configured")}
             missing = self.current.get("provider")
             return {"ok": False,
                     "detail": f"provider {missing!r} not in config.yaml"
@@ -1746,7 +1803,58 @@ class Engine:
             key_env=pcfg.get("api_key_env", "") or "",
             detail=health.get("detail", ""),
             is_ollama=pcfg.get("type") == "ollama",
-            local=cur.get("model") == "local" or pcfg.get("type") == "ollama")
+            local=cur.get("model") == "local" or pcfg.get("type") == "ollama",
+            installed=diagnose.server_installed(pcfg.get("type") == "ollama", url),     # R579
+            alternatives=self.answering_models(exclude=cur))
+
+    def answering_models(self, exclude: dict | None = None, timeout: float = 1.0) -> list[str]:
+        """R579: configured models (as `provider · model`) whose server takes a TCP connection now, local ones
+        first; a hosted one counts only when its key is stored. One connect per distinct host, all at once, at
+        most `timeout` seconds in total; never raises. A TCP connect only: an HTTP request would wake a model the
+        idle manager put to sleep."""
+        import socket
+        import threading
+        from urllib.parse import urlparse
+        from .providers.openai_compat import _is_lan_host
+        rows = []
+        for m in self.models:
+            if exclude and m.get("provider") == exclude.get("provider") and m.get("model") == exclude.get("model"):
+                continue
+            pcfg = (self.cfg.get("providers") or {}).get(m.get("provider"), {}) or {}
+            bases = pcfg.get("base_url")
+            bases = bases if isinstance(bases, list) else [bases] if bases else []
+            if not bases or not self._has_key(m.get("provider")):
+                continue
+            rows.append((m, [str(b) for b in bases]))
+        hosts = {}
+        for _m, bases in rows:
+            for b in bases:
+                u = urlparse(b)
+                if u.hostname:
+                    hosts[(u.hostname, u.port or (443 if u.scheme == "https" else 80))] = None
+        up: dict = {}
+
+        def probe(hp):
+            try:
+                with socket.create_connection(hp, timeout=timeout):
+                    up[hp] = True
+            except Exception:
+                up[hp] = False
+        threads = [threading.Thread(target=probe, args=(hp,), daemon=True) for hp in list(hosts)[:16]]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout)
+        out = []
+        for m, bases in rows:
+            hit = False
+            for b in bases:
+                u = urlparse(b)
+                if u.hostname and up.get((u.hostname, u.port or (443 if u.scheme == "https" else 80))):
+                    hit = True
+            if hit:
+                out.append((0 if any(_is_lan_host(b) for b in bases) else 1, f"{m.get('provider')} · {m.get('model')}"))
+        return [name for _k, name in sorted(out, key=lambda r: r[0])]
 
     def set_redact_secrets(self, on: bool) -> None:
         self.redact_secrets = on

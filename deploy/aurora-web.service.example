@@ -9,10 +9,30 @@ User=YOUR_USER
 EnvironmentFile=/etc/aurora-web.env
 WorkingDirectory=/home/YOUR_USER/YOUR_WORKSPACE
 ExecStart=/home/YOUR_USER/Aurora/.venv/bin/python -m aurora --web --bind 127.0.0.1 --port 9592 --workspace /home/YOUR_USER/YOUR_WORKSPACE
+# Aurora 2.0 (R508): each chat runs its turns in the Rust core, this checkout's target/release/aurora-rs
+# (inside the read-only bind below; build it with ./install.sh). Add Environment=AURORA_CORE=python to keep the Python loop.
 Restart=on-failure
 # a missing AURORA_WEB_TOKEN exits 1 on purpose: do not spin
 RestartPreventExitStatus=1
 RestartSec=5
+# R450 (S4) / R459: the web denylist is a list of regexes, not a sandbox: a model can write a script and run it.
+# These lines are the real limit. The agent sees only its workspace, Aurora's data dir and Aurora's own code
+# (read-only, except the two files the page edits); the rest of your home (~/.ssh, other projects' .env files)
+# is an empty tmpfs. NoNewPrivileges makes sudo and setuid programs useless; the docker socket is hidden, so
+# membership of the docker group gives nothing. Tested with `systemd-run --user` and the same -p options.
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/YOUR_USER/YOUR_WORKSPACE /home/YOUR_USER/.aurora
+BindReadOnlyPaths=/home/YOUR_USER/Aurora
+BindPaths=/home/YOUR_USER/Aurora/config.yaml /home/YOUR_USER/Aurora/aurora/providers/remote_context_limits.json
+ReadWritePaths=/home/YOUR_USER/YOUR_WORKSPACE /home/YOUR_USER/.aurora
+InaccessiblePaths=/run/docker.sock
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
 
 [Install]
 WantedBy=multi-user.target

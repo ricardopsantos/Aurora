@@ -63,6 +63,9 @@ _URL = re.compile(r"(?<![\"'=>])\b(https?://[^\s<]+[^\s<.,;:!?)\]'\"])")
 
 
 def _inline(t: str) -> str:
+    # R472: NUL marks the stashed pieces below, so one in the text itself becomes U+FFFD (as an HTML parser would show
+    # it). Text holding "\x007\x00" used to raise IndexError, and the export or the share link failed with it.
+    t = t.replace("\x00", "\ufffd")
     keep = []
 
     def stash(h):
@@ -202,18 +205,37 @@ def _steps(steps: list) -> str:
             f"<ol>{items}</ol></details>")
 
 
-def render(sid: str, level: str = "brief", title: str = "") -> str:
-    """The HTML document for session `sid` (the caller has checked that it exists)."""
+EXPORT_MAX = 20_000_000      # R528: characters of session text one export carries; the rest is left out, said at the end
+EXPORT_STEP_MAX = 200_000    # R528: characters of one tool output or thinking block in a full export
+
+
+def _step_cut(text: str) -> str:
+    if len(text) <= EXPORT_STEP_MAX:
+        return text
+    return text[:EXPORT_STEP_MAX] + f"\n[… {len(text) - EXPORT_STEP_MAX} more characters left out of this export]"
+
+
+def render(sid: str, level: str = "brief", title: str = "", upto: int | None = None, footer: str = "") -> str:
+    """The HTML document for session `sid` (the caller has checked that it exists). `upto`: only the first that
+    many session records (R454: a share link's snapshot)."""
     full = level == "full"
     turns, first, start, end, models = [], "", "", "", []
     cur = None
+    size, trimmed = 0, False
 
     def new_turn(prompt="", ts=""):
         t = {"prompt": prompt, "ts": ts, "body": [], "steps": []}
         turns.append(t)
         return t
-    for r in service.session_records(sid):
+    for i, r in enumerate(service.session_records(sid)):
+        if upto is not None and i >= upto:
+            break
+        if size > EXPORT_MAX:                 # R528: a huge session no longer builds a page of hundreds of MB
+            trimmed = True
+            break
         ev = r.get("event")
+        if ev in ("user", "assistant") or (full and ev in ("thinking", "tool")):
+            size += len(str(r.get("text") or "")) + min(len(str(r.get("output") or "")), EXPORT_STEP_MAX)
         ts = _when(r.get("ts"))
         start = start or ts
         end = ts or end
@@ -233,11 +255,12 @@ def render(sid: str, level: str = "brief", title: str = "") -> str:
             cur = cur or new_turn()
             more = int(r.get("chars") or 0) - len(r.get("text") or "")
             cut = f"\n[… {more} more characters not kept in the session log]" if more > 0 else ""
-            cur["steps"].append(("thinking", "Thinking", str(r.get("text") or "") + cut))
+            cur["steps"].append(("thinking", "Thinking", _step_cut(str(r.get("text") or "")) + cut))
         elif full and ev == "tool":
             cur = cur or new_turn()
-            out = str(r.get("output", ""))
-            lost = int(r.get("chars") or len(out)) - len(out)
+            whole = str(r.get("output", ""))
+            out = _step_cut(whole)
+            lost = int(r.get("chars") or len(whole)) - len(whole)
             if lost > 0:
                 out += f"\n[… {lost} more characters not kept in the session log]"
             head, args = _call(r.get("name"), r.get("args"))
@@ -265,5 +288,7 @@ def render(sid: str, level: str = "brief", title: str = "") -> str:
             f"<title>{_e(name)} · Aurora</title><style>{_CSS}</style></head><body><main>"
             f"<header><h1>{_e(name)}</h1><ul class=meta>" + "".join(f"<li>{_e(x)}</li>" for x in meta if x) + "</ul></header>"
             + "".join(parts)
-            + f"<footer>Aurora chat {_e(sid)} · exported as one file; it runs no script and loads nothing.</footer>"
+            + (f"<p class=meta>[… the rest of this chat is left out: an export carries at most {EXPORT_MAX // 1_000_000} million "
+               "characters]</p>" if trimmed else "")
+            + f"<footer>{_e(footer) if footer else 'Aurora chat ' + _e(sid) + ' · exported as one file; it runs no script and loads nothing.'}</footer>"
             "</main></body></html>")

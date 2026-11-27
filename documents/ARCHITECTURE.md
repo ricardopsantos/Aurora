@@ -104,6 +104,17 @@ into them.
 
 ## 2. The agent loop (`agent.py`)
 
+> **Aurora 2.0 (R499, R508):** by default each turn's loop runs in the Rust
+> core, `aurora-rs --core` (crates `aurora-core`, `aurora-providers`,
+> `aurora-tools`, `aurora-storage`, `aurora-cli`), driven from `Engine.send`
+> by `aurora/rustcore.py` over the `aurora-core/1` line protocol
+> (`documents/CORE_PROTOCOL.md`). The front ends, the session files, budgets
+> and costs stay in Python. `agent.py`, described below, is the Python loop:
+> it runs with `runtime.core: python` or `AURORA_CORE=python`, when
+> `aurora-rs` is not built, and for what the core cannot do yet (plan mode,
+> pictures in the prompt). Both loops must behave the same; a deliberate
+> difference goes in `documents/migration/06-DELIBERATE-DIFFERENCES.md`.
+
 `run_turn(provider, model, messages, system, cb: AgentCallbacks, ...)` is the
 loop between the model and the tools. It's driven entirely by callbacks
 (`AgentCallbacks`), so it knows nothing about the UI and can be tested
@@ -695,5 +706,6 @@ arm must never fire on an unrelated later Esc.
 
 - Requirements: `CHANGELOG_TECHNICAL.md` for R1 to R293, and
   `REQUIREMENTS.md` with `requirements/` for the newer ones.
+- The Rust core: `documents/CORE_PROTOCOL.md` and `documents/migration/`.
 - What users see: `README.md` and `documents/FEATURES.md`; the Esc rule is in
   `documents/COMMANDS.md`.

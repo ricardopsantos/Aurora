@@ -149,8 +149,122 @@ Part of the index in [`../REQUIREMENTS.md`](../REQUIREMENTS.md); numbers are sha
     **Test:** `tests/test_no_personal_references.py`; `tests/test_web_r392.py::test_r393_*`. The project is MIT-licensed (`LICENSE`, `pyproject.toml`; owner, 2026-11-02). `aurora --version` prints the version (asked for by SECURITY.md); `install.sh` was run in a clean container (2026-11-02) and installs and serves.
 
 
-101. **R441 — Editing an existing file works where the OS has no `posix_fallocate` (macOS).** `_rewrite_in_place` reserves
+101. **R446 — Editing an existing file works where the OS has no `posix_fallocate` (macOS).** `_rewrite_in_place` reserves
     space up front only when `os.posix_fallocate` exists; without it the write still goes through the same inode, with the
     old bytes restored on failure. Before this, every edit of an existing file raised `AttributeError` on macOS.
 
     **Test:** `tests/test_paths.py::test_rewrite_in_place_works_without_posix_fallocate`.
+
+102. **R465 — The web chat viewer stops reading a session at its cap (audit, 2026-11-24).** `GET /api/sessions/<id>`
+    shows at most 300,000 characters, but it built the Markdown of the whole log first (`export_markdown`) and cut it
+    afterwards: a 36 MB session peaked at 129 MB of memory per request. `export_markdown(sid, max_chars)` stops once the
+    text passes `max_chars` (one record over at most); the web passes `MAX_TRANSCRIPT`, so the same request peaks at
+    about 2 MB. The text shown and the "transcript cut" line are unchanged. The terminal's `/export` still writes it all.
+
+    **Test:** `tests/test_audit_r464.py` (`test_r465_*`).
+
+- **R478 — Aurora 2.0 starts: a Rust workspace beside the Python app, with written contracts and a migration
+  baseline (owner, 2026-11-24, card "Create Aurora 2.0").** The repo root has a Cargo workspace (`Cargo.toml`,
+  `crates/*`) that the Python app neither needs nor touches: `pip install` and every Python test behave as before.
+  `aurora-core` holds the contracts the rest is built on, with no I/O of its own: `Provider` (one streamed model turn,
+  cancellable), `Frontend` (an event stream of serialisable `AgentEvent`s plus `approve` / `ask_continue`, so a
+  terminal, a web page or a remote client are the same to the engine), `Tool` / `ToolBox`, `ApprovalPolicy` (the R133c
+  decision words), `SessionLog`, the `aurora-ext/1` wire types (R477) and the agent loop. The loop keeps Python's
+  rules: every tool call gets exactly one result (denied, skipped and stopped calls included), reads run in parallel,
+  a malformed call is retried once and then the tools are dropped, a provider error is a notice and never a crash, and
+  the iteration cap asks before going on. `documents/migration/` holds the baseline (what Python is, measured), the
+  plan, the target architecture, the data formats both must share, the test strategy, and `03-FEATURE-PARITY.md`, a
+  table of every requirement R1–Rmax with its Rust status, built by `build_parity.py` from `parity-status.yaml`.
+  Tests: `cargo test -p aurora-core`; `tests/test_migration_parity_r478.py` (the table is current and lists every
+  number from R1 to the highest).
+
+- **R509 — The web server says when it runs older code than the disk has (review F1) (owner, 2026-11-27).**
+  A pull or an edit without a restart left the live page on day-old code, and because some modules are imported on
+  first use, a process could mix old and new files. `/health` now has `code`: `stale` (up to 20 source files changed
+  since the process started) with `stale_count`, `started`, and `core` / `core_build` (`release`, `debug`,
+  `installed` or `none`: the `aurora-rs` a turn would start). `deploy/restart-web.sh` prints the core build and warns
+  when it is not a release build. Tests: `tests/test_review_r509_r512.py`.
+- **R510 — Bounded connections and memory on the web server (review F2-F4) (owner, 2026-11-27).**
+  At most `MAX_CONNECTIONS` (64) connections are served at once; one more gets an immediate `503` with `Retry-After`
+  and no thread. The socket timeout is 20 s (above the 15 s stream heartbeat), so an idle keep-alive connection frees
+  its slot soon. At most `BIG_BODIES` (2) bodies over 1 MB are read at once. Audio and video uploads are copied to the
+  input folder in 1 MB chunks and never held whole (a short upload leaves no file). Voice input refuses a recording
+  whose 16 kHz WAV would pass `WAV_MAX` (40 MB, about 20 minutes), and ffmpeg itself stops there. `/api/files/file`
+  streams the file in chunks and honours one `Range` (206, 416). Messages waiting in the queue may hold at most
+  48 MB of pictures together. Tests: `tests/test_review_r509_r512.py`.
+- **R513–R535 — 25 bugs and performance issues found after the review (owner, 2026-11-27).**
+  Tests: `tests/test_review_r513_r535.py` (one test per item).
+  - R513: the notes, folders and shares stores are written through `write_text_atomic` (0600 from the first byte, fsync).
+  - R514: a damaged share store is moved aside (`.corrupt-<time>`) and named on `/health`, not overwritten.
+  - R515: a shared page is rendered once per snapshot (16 kept).
+  - R516: static files, the script hash and the CSP are cached until the file changes.
+  - R517: the folders view is parsed again only when its file changes; callers get a copy.
+  - R518: JSON bodies refuse NaN and Infinity; a NaN budget no longer switches the cap off.
+  - R519: nested approval arguments are clipped (short strings kept whole); a note title cannot close its tag.
+  - R520: a picture over `MAX_PIXELS` (50 M) is refused before it is decoded.
+  - R521: thumbnails are cached per file version (256) and JPEGs are drafted down.
+  - R522: a text preview reads only what it shows; a document over the limit is refused before it is read.
+  - R523: spreadsheet and slide extraction stop once the text limit is passed.
+  - R524: a note preview, once made, is kept in the index.
+  - R525: the Rust `read_file` checks the final newline with a seek, not a second whole read.
+  - R526: a rebuilt `aurora-rs` is picked up at the next turn.
+  - R527: wrong tokens from a loopback proxy also count per peer (10× the limit), so rotating `X-Forwarded-For` no longer gives unlimited guesses.
+  - R528: an export is capped at 20 MB and one step at 200 kB, with a note saying what was left out.
+  - R529: `/health` checks the notes index without building the listing.
+  - R530: `spend.json` and `state.yaml` are changed under a file lock; a malformed ledger reads as empty.
+  - R531: "always allow/deny" rules are added under a file lock shared by the Python and Rust loops.
+  - R532: the Rust client never sends a local or LAN model through an environment proxy.
+  - R533: voice input reaches the speech server directly, never through an environment proxy.
+  - R534: a streamed event is serialised once for every open page.
+  - R535: `/health` has `HEALTH_SPARE` (4) connection slots of its own, so a monitor sees the truth when the server is full.
+- **R536–R556 — 21 more bugs, with tests for modules that had few (owner, 2026-11-27).**
+  Tests: `tests/test_review_r536_r555.py` (also covers htmltext, diagnose, tokens, mdrender, modelcfg, trybox,
+  gitcommit, headless, bashmode, exthost and the key store beyond the fixes).
+  - R536: two `/try` sandboxes made in the same second get two folders.
+  - R537: an untracked symlink (to a folder too) is copied into the sandbox as the link.
+  - R538: a `<` that does not open a tag (`a < b`) stays text.
+  - R539: `<scripts>` or `<stylesheet>` is not taken for `<script>`/`<style>`.
+  - R540: 401/403/404/429 are matched as whole numbers (a port 4013 is not an auth failure).
+  - R541: the `/commit` read helpers return '' when git is missing or times out.
+  - R542: `**` inside a code span stays literal in the terminal.
+  - R543: the single-byte C1 OSC/DCS/SOS/PM/APC introducers are stripped like their ESC forms.
+  - R544: token counts of a million and more read `1.2M`, never `1000k`.
+  - R545: a headless run started off the main thread works (no SIGINT handler of its own).
+  - R546: headless progress lines show escapes as text.
+  - R547: the extension-host client writes the host's stderr to a file; a full pipe hung it.
+  - R548: "copy" in bash mode also drops OSC hyperlinks.
+  - R549: `cd` into a folder without search permission is refused.
+  - R550: a quoted or escaped `cd` target is left to bash.
+  - R551: a missing `keys.salt` next to an existing key store is an error, never a new salt.
+  - R552: the key-store key is derived once per passphrase and salt.
+  - R553: `/context` turn labels show escapes as text.
+  - R554: a share expiry of infinity or 1e300 days is capped (it raised OverflowError).
+  - R555: a hand-edited `upto`/`expires` in a share makes a dead link, not a 500.
+  - R556: invalid YAML in `config.yaml` is a model-edit error, not a crash.
+- **R557–R581 — 25 bugs and slow paths in the Rust core and the web page's server (owner, 2026-11-27).**
+  Tests: `tests/test_review_r557_r576.py` and the crates' own tests (`cargo test --workspace`).
+  - R557: the SSE line splitter scans only the new bytes and drains once per chunk (it rescanned and shifted per line).
+  - R558: an IPv4-mapped IPv6 address (`::ffff:192.168.1.5`) and a trailing-dot name (`localhost.`) count as LAN.
+  - R559: the Rust client never re-sends a request after a read timeout (Python never did).
+  - R560: tool-call deltas without an `index` are told apart by their `id` (two calls were glued into one).
+  - R561: `text::tail(s, 0)` is "" (it panicked).
+  - R562: a fold's summary request honours the turn's cancel; a cancelled fold folds nothing, an interrupted one is not kept as the summary.
+  - R563: the tokens/s clock starts at the first streamed thought, not the first text.
+  - R564: the rate-limit hint needs 429 as a whole number in the Rust loop too (R540).
+  - R565: `web_fetch` treats `localhost.` / `nas.local.` like the names without the dot (no approval skipped).
+  - R566: a squeezed command output keeps exactly `limit` characters (an odd limit lost one; limit 1 kept all of it).
+  - R567: a background job is done when its shell exits; a child still holding the pipes is kept draining and can still be cancelled.
+  - R568: bridged provider chunks that arrive with the answer keep their kind (a late thought showed as reply text).
+  - R569: a cancelled bridged request or question leaves no waiting slot.
+  - R570: a session append looks for newer parts from the last one seen, not from the first part every time.
+  - R571: counting a session's folds prefilters lines on `"event": "compact"` instead of parsing the whole log.
+  - R572: app.js's `?v=` hash is tied to the bytes it was taken of (an `id()` key could serve a stale hash).
+  - R573: the web replay buffer trims in batches to 7/8 of its caps (it shifted 20,000 events per chunk at the cap).
+  - R574: a hand-edited notes index (non-number `updated`, non-text `title`, bool `pos`) never breaks the list or a save.
+  - R575: Python's background-job drain follows R567 (the same never-done bug).
+  - R576: a POST body that is not a JSON object is a 400; it used to run the action with every default.
+  - R578: the terminal starts with no model when none was picked on this machine ("no model selected — /model to pick one"), never on the config's first entry; `-t` and `--web` keep their defaults.
+  - R579: a dead backend's advice fits the machine: no "start Ollama" where Ollama is not installed, and the configured models that answer now come first.
+  - R580: at start, the configured models that cannot work on this machine are named in one line (with why), and the picker refuses them instead of switching to a dead model.
+  - R581: the personal-string audit (R346) scans the Rust sources too; a Rust test named a real private host.
+  - R577: note `created` times are strictly increasing (a same-millisecond tie let a random id pick the Memory note).

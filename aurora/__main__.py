@@ -323,6 +323,13 @@ def main() -> None:
         serve(engine, web_opts["--bind"], port, web_opts["--workspace"])
         return
 
+    # R578: the terminal never starts on a model nobody picked here. With no remembered model it starts with
+    # none ("no model selected — /model to pick one"), instead of the config's first entry, which may be a
+    # server this machine does not run (it then failed every message after three connection retries).
+    if not engine.model_restored and not engine.messages and len(engine.models) > 1 \
+            and sys.stdin.isatty() and sys.stdout.isatty():   # one model: nothing to pick
+        engine.current = {}       # a pipe or CI keeps the default, like -t
+
     # full-screen TUI (pinned prompt, scrollable chat) on a real terminal;
     # --classic or a non-tty (pipes, CI) falls back to the inline REPL
     if classic or not sys.stdout.isatty():

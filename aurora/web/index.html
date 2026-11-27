@@ -112,7 +112,10 @@ dialog .btns .btn{min-width:0}
 .layout{display:flex;flex:1 1 auto;align-items:stretch}
 .layout main{min-width:0}
 aside{flex:none;width:240px;position:sticky;top:var(--hh,45px);height:calc(100dvh - var(--hh,45px));overflow-y:auto;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column}
-body.sb-closed aside{display:none}
+/* R443: the sidebar slides away (a negative left margin; the page widens as it goes) and is hidden from keyboard and screen readers once gone */
+aside{margin-left:0;transition:margin-left .22s ease,visibility 0s}
+body.sb-closed aside{margin-left:-241px;visibility:hidden;transition:margin-left .22s ease,visibility 0s .22s}
+@media (prefers-reduced-motion:reduce){aside,body.sb-closed aside{transition:none}}
 aside section{border-bottom:1px solid var(--line);display:flex;flex-direction:column}
 aside h2.cap{margin:0;padding:var(--sp-half) var(--sp);display:flex;align-items:center;gap:var(--sp-half);cursor:pointer;user-select:none;min-height:32px}
 aside h2.cap::before{content:"";flex:none;border:5px solid transparent;border-top:6px solid currentColor;border-bottom:0;transition:transform .12s}

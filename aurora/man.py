@@ -13,8 +13,7 @@ from .colors import BOLD, CYAN, DIM, GREEN, RESET, YELLOW
 # Display order for the manual's COMMANDS section. `/cmd help` doesn't need
 # this (it looks up one key directly) — this only controls the full page.
 COMMAND_ORDER = [
-    "model", "compact", "clear", "reset", "copy", "copy-last", "copy-response",
-    "copy-turn", "copy-all",
+    "model", "compact", "clear", "reset", "copy",
     "redact", "status", "cost", "context", "cache", "autocompact",
     "fallback", "auto-approve", "plan", "budget", "try", "thinking", "markdown", "multiline", "allowlist",
     "denylist", "rewind", "undo", "diff", "commit", "resume", "search",
@@ -72,49 +71,24 @@ def _entries(B, C, D, G, Y, R):
     instead if you just want the conversation gone but the current system
     prompt kept.""",
 
-"copy": f"""{C}/copy{R} [{G}N{R}]  Copy the Nth-last assistant response to the
-    clipboard (default: the last one). Uses OSC52, so it works over SSH
-    with no local clipboard access needed on the remote end. Copies the
-    final answer only — no thinking, no tool output; see {C}/copy-last{R}
-    for the whole turn including reasoning, or {C}/copy-response{R} for the
-    last turn's final reply with the empty-message edge handled.""",
-
-"copy-last": f"""Copy the LAST turn IN FULL — the prompt that started it,
-    all of the reasoning/thinking, and EVERY reply the model made, in order,
-    with a one-line marker per tool call — to the clipboard (OSC52,
-    SSH-safe). R256: a turn that used tools is a chain (narrate, call,
-    narrate, call, answer), and this used to copy only its final message,
-    which on a long turn is usually a short wrap-up — the substantive reply
-    was dropped. Tool OUTPUT is still left out; one result can be 60KB —
-    {C}/copy-turn{R} is the copy that includes it.
-    This is the one place either the prompt or the thinking is ever
-    copyable; {C}/copy{R} and {C}/copy-all{R} both leave thinking out. Want
-    just the answer? {C}/copy-response{R}. Also reachable as
-    "copy last turn: prompt + replies" in the status bar's {C}copy{R} picker.""",
-
-"copy-turn": f"""Copy the LAST turn with EVERYTHING — what {C}/copy-last{R}
-    takes (prompt, thinking, every reply) plus, for each tool call, the
-    command that ran (or the call's arguments) and its output IN FULL, no
-    cap (OSC52, SSH-safe). Reach for it when the output is the point; a
-    result can be 60KB. Also reachable as "copy last turn: everything" in
-    the status bar's {C}copy{R} picker.""",
-
-"copy-response": f"""Copy just the model's FINAL reply from the last turn —
-    no prompt, no thinking, no tool markers (OSC52, SSH-safe). The narrow
-    counterpart to {C}/copy-last{R}, which takes the whole turn. Unlike
-    {C}/copy{R} it skips a trailing tool-call-only message, so a turn stopped
-    at the approval gate still copies the last thing the model actually
-    said instead of an empty string, and it never reaches back into the
-    previous turn to find one. Also reachable as "copy last turn: answer only" in
-    the status bar's {C}copy{R} picker.""",
-
-"copy-all": f"""Copy the WHOLE session — every question and answer, plus each
-    tool's command and output — to the clipboard (OSC52, SSH-safe). Thinking
-    is never included. Output comes from the session log, which stores the
-    first 4000 chars of each result; a longer one ends in a note saying how
-    much was not stored (use {C}/copy-turn{R} for the last turn in full).
-    Also reachable as "copy whole session" in the status bar's
-    {C}copy{R} picker.""",
+"copy": f"""{C}/copy{R} [{G}what{R}]  Copy to the clipboard. Uses OSC52, so it works
+    over SSH with no clipboard on the remote end. Thinking is only ever
+    included by {G}turn{R}, {G}full{R} and {G}last{R}.
+      {C}/copy{R}         the model's final reply in the last turn (a turn
+                    stopped at the approval gate still copies the last
+                    thing it said; never reaches into an earlier turn)
+      {C}/copy{R} {G}N{R}       the Nth-last response (1 = the last one)
+      {C}/copy turn{R}    the last turn: its prompt, the thinking and every
+                    reply, with a one-line marker per tool call
+      {C}/copy full{R}    the same plus each tool's command and full output
+                    (a result can be 60KB)
+      {C}/copy all{R}     the whole session: questions, answers, commands and
+                    output (the first 4000 chars of each result, as stored)
+      {C}/copy bash{R}    the last bash-mode command's output, without colours
+      {C}/copy last{R}    whichever is newer: the last turn or the last
+                    bash-mode output (it says which)
+    The old names still work: /copy-response, /copy-last, /copy-turn and
+    /copy-all. Also reachable from the status bar's {C}copy{R} picker.""",
 
 "redact": f"""Secret detection in prompts and tool output — API keys, bearer
     tokens, GUIDs, {D}.env{R}-style assignments, plus a high-entropy
@@ -506,14 +480,17 @@ def man_page() -> str:
                   Enter.
     (Quit: {B}Esc{R} {B}Esc{R} on an empty prompt asks; {C}/quit{R} quits at once;
      classic REPL has no Esc binding — Ctrl+C interrupts, {C}/quit{R} quits.)
-    {B}mouse drag{R}    Select chat text — stays highlighted on release and adds
-                  a "copy selected" button to the status bar's top line; tap
-                  it to copy (local: pbcopy/wl-copy/xclip; over SSH: OSC52).
-                  The terminal's own selection is captured by the TUI; use
-                  this instead. {C}/copy{R} grabs the whole last response in
-                  one go. Dragging in the prompt line works the same way —
-                  same button — and a {B}double-click{R} there selects the
-                  whole draft.
+    {B}mouse drag{R}    Select chat text — it is copied to the clipboard when you
+                  release (local: pbcopy/wl-copy/xclip; over SSH: OSC52), the
+                  status bar says what was copied, and the text stays
+                  highlighted with a "copy selected" button to copy it again.
+                  {B}Double-click{R} a word in the chat to select and copy
+                  just that word. The terminal's own selection is captured
+                  by the TUI; use this instead. {C}/copy{R} grabs the whole
+                  last response in one go and replaces what the selection
+                  copied. Dragging in the prompt line works the same way —
+                  same button, but nothing is copied until you tap it — and
+                  a {B}double-click{R} there selects the whole draft.
 
 {B}FILES{R}
     {C}AURORA_HOME{R} {D}(default ~/.aurora; set at install, marker ~/.aurora-path){R}

@@ -36,6 +36,38 @@ def _ensure_dir(path: "Path", what: str) -> "Path":
     return path
 
 
+class file_lock:
+    """R530: an exclusive lock on `<path>.lock` for a read-change-write of `path` shared by several processes
+    (the terminal and the web page) and threads. Without fcntl (Windows) it is a lock within this process only."""
+    import threading as _threading
+    _local = _threading.RLock()          # reentrant: a lock taken inside another never deadlocks this thread
+
+    def __init__(self, path: "Path | str"):
+        self.path = Path(str(path) + ".lock")
+        self.fh = None
+
+    def __enter__(self):
+        file_lock._local.acquire()
+        try:
+            import fcntl
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.fh = open(self.path, "a")
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            if self.fh is not None:
+                self.fh.close()
+            self.fh = None
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self.fh is not None:
+                self.fh.close()            # closing releases the flock
+        finally:
+            file_lock._local.release()
+        return False
+
+
 def _fsync_dir(directory: "Path") -> None:
     """R171/I6: fsyncing a temp file makes ITS contents durable, but the
     rename that makes it visible under the final name is a separate metadata
@@ -247,8 +279,34 @@ def aurora_home() -> Path:
         home = Path(_MARKER.read_text(encoding="utf-8").strip()).expanduser()
     else:
         home = Path.home() / ".aurora"
-    return _ensure_dir(home, "AURORA_HOME")
+    _ensure_dir(home, "AURORA_HOME")
+    # R450 (S10): the home folder's own mode is what keeps other local users out of sessions, notes and keys
+    try:
+        mode = home.stat().st_mode & 0o7777
+        if mode & 0o077:
+            home.chmod(mode & ~0o077)       # only ever removes group/other access, never grants the owner any
+    except OSError:
+        pass
+    return home
 
 
 def sessions_dir() -> Path:
     return _ensure_dir(aurora_home() / "sessions", "the sessions directory")
+
+
+def starts_with_path(line: str, cwd: str | None = None) -> bool:
+    """R453: is a line that starts with `/` a message about a path rather
+    than a command? True when its first word contains another `/`
+    (`/etc/hosts has a bad entry`) or names something that exists
+    (`/tmp is full`). Command and skill names never contain `/`."""
+    if not line.startswith("/"):
+        return False
+    first = line.split(None, 1)[0] if line.strip() else ""
+    if len(first) < 2:
+        return False
+    if "/" in first[1:]:
+        return True
+    try:
+        return Path(first).exists()
+    except OSError:
+        return False

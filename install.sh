@@ -23,6 +23,17 @@ PY="$(command -v python3)"
 
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
+# R508: the agent loop runs in Rust (aurora-rs) when it is built; without Rust, Aurora runs its Python loop
+if command -v cargo >/dev/null 2>&1; then
+    echo "→ building the Rust core (cargo build --release; a few minutes the first time)"
+    if cargo build --release --quiet -p aurora-cli; then
+        echo "→ Rust core: $(pwd)/target/release/aurora-rs"
+    else
+        echo "→ the Rust core did not build: Aurora will run its Python loop"
+    fi
+else
+    echo "→ no Rust toolchain (https://rustup.rs): Aurora will run its Python loop"
+fi
 ln -sf "$(pwd)/.venv/bin/aurora" "$BIN_DIR/aurora"
 echo "→ symlinked $BIN_DIR/aurora"
 case ":$PATH:" in

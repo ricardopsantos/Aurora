@@ -20,6 +20,7 @@ def _open(browser, app, w, h, mobile):
 
 
 def _side(page, sel):
+    page.wait_for_function("document.getAnimations().length === 0")   # R451: let the sidebar finish sliding before asking if it is visible
     if not page.is_visible(sel):
         page.click("#sb-toggle")
     page.click(sel)

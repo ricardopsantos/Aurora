@@ -446,10 +446,17 @@ def format_tool_call(name: str, args) -> str:
     return f"→ {name}\n```\n{body}\n```"
 
 
-def export_markdown(session_id: str) -> str:
+def export_markdown(session_id: str, max_chars: int | None = None) -> str:
+    """The whole session as Markdown. R465: with `max_chars`, reading stops once the text is longer than that, so
+    a caller that shows only the head (the web viewer, 300,000 characters) no longer builds the transcript of a
+    huge log in memory just to cut it (a 36 MB log peaked at 129 MB). The result may run past `max_chars` by up to
+    one record: the caller cuts it and says so."""
     s = Session(session_id)
     lines = [f"# Aurora session {session_id}\n"]
+    size = len(lines[0])
     for r in s.iter_records():
+        if max_chars is not None and size > max_chars:
+            break
         ev = r.get("event")
         if ev == "user":
             lines.append(f"## User\n\n{r.get('text', '')}\n")
@@ -463,4 +470,7 @@ def export_markdown(session_id: str) -> str:
                 out += f"\n[… {lost} more chars not stored in the session log]"
             call = format_tool_call(r.get("name"), r.get("args"))
             lines.append(f"{call}\n\n```\n{out}\n```\n")
+        else:
+            continue
+        size += len(lines[-1]) + 1
     return "\n".join(lines)

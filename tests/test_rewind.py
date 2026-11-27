@@ -240,6 +240,7 @@ def test_undo_after_an_out_of_tree_mutation_reports_nothing_to_undo(proj, tmp_pa
     assert outside.read_text() == "out of tree"   # the out-of-tree file never touched either way
 
 
+@pytest.mark.python_loop  # Python's checkpoint hook; Rust checkpoints itself (test_rust_rewind_r494)
 def test_agent_checkpoints_before_mutations_only(proj):
     """run_turn snapshots before an approved write_file, never before reads."""
     from aurora.providers.base import ToolCall, TurnResult
@@ -260,6 +261,7 @@ def test_agent_checkpoints_before_mutations_only(proj):
     assert snaps == ["write_file"]
 
 
+@pytest.mark.python_loop  # Python's checkpoint hook; Rust checkpoints itself (test_rust_rewind_r494)
 def test_agent_passes_call_arguments_to_the_checkpoint_callback(proj):
     """R181: the checkpoint callback needs the call's arguments (not just
     its name) to snapshot the target file — `engine.py`'s real callback

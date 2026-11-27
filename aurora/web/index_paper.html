@@ -116,10 +116,12 @@ form#send textarea{width:100%;resize:none;font-size:16px;line-height:1.35;max-he
 
 /* the drawer: right edge, min(560px,100%), one at a time (A6.1); layers 10 bars, 20 drawer */
 #scrim{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:15}
-body:not(.sb-closed) #scrim{display:block}
-aside{position:fixed;top:0;right:0;bottom:0;width:min(560px,100%);z-index:20;background:var(--panel);border-left:1px solid var(--line);box-shadow:0 0 40px rgba(0,0,0,.3);overflow-y:auto;display:flex;flex-direction:column;animation:slide .25s ease-out}
-@keyframes slide{from{transform:translateX(24px);opacity:0}to{transform:none;opacity:1}}
-body.sb-closed aside{display:none}
+@keyframes scrim-in{from{opacity:0}to{opacity:1}}
+body:not(.sb-closed) #scrim{display:block;animation:scrim-in .25s ease}
+/* R443: the drawer slides in and out; once it has gone it is hidden from keyboard and screen readers */
+aside{position:fixed;top:0;right:0;bottom:0;width:min(560px,100%);z-index:20;background:var(--panel);border-left:1px solid var(--line);box-shadow:0 0 40px rgba(0,0,0,.3);overflow-y:auto;display:flex;flex-direction:column;transform:none;transition:transform .25s ease,visibility 0s}
+body.sb-closed aside{transform:translateX(105%);visibility:hidden;transition:transform .25s ease,visibility 0s .25s}
+@media (prefers-reduced-motion:reduce){#scrim{animation:none}aside,body.sb-closed aside{transition:none}}
 .drawer-head{display:flex;align-items:center;gap:var(--sp-half);padding:var(--sp);border-bottom:1px solid var(--line)}
 .drawer-head h2{font-size:var(--fs-title);font-weight:600}
 aside section{border-bottom:1px solid var(--line);display:flex;flex-direction:column}

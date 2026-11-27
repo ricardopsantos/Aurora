@@ -1,0 +1,20 @@
+[package]
+name = "aurora-providers"
+description = "Aurora's model providers: one OpenAI-compatible client for OpenRouter, llama.cpp and Ollama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aurora-core.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

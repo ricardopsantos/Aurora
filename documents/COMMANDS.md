@@ -8,8 +8,8 @@ The full command reference behind the quick list in the [README](../README.md).
 |---|---|
 | plain text (Ctrl+J, `\n` or `\br` for a new line) | Talk to the model. Writes and commands ask first, in a menu you answer with the arrow keys or a number: Yes / Allow for this session / Always allow (the prompt shows the rule it saves) / No / Stop / Comment (steer the model instead). |
 | `/…` + Tab | Complete a slash command (built-ins and skills). Prefix matches come first, then names that contain the typed text (`/ert` finds `qwertyuio`). |
-| `!` (on an empty prompt) | Bash mode. `>` becomes `$` and every Enter runs a shell command locally, with no model involved, until you press Esc or Backspace on an empty line. |
-| `/model` | Arrow-key menu of OpenRouter ($) and local (free) models. The current one is marked `✔` and selected. Opening it refreshes OpenRouter prices in the background, at most once a day and only when the network is up; rows update in place. Your choice is remembered for the next start. If the model needs a key you haven't stored, Aurora asks; leave it blank to keep the previous model. In the TUI, Esc also closes this menu without a change. Every other menu needs an explicit pick. |
+| `!` (on an empty prompt) | Bash mode. `>` becomes `$` and every Enter runs a shell command locally in bash, with no model involved, until you press Esc or Backspace on an empty line. The model never sees these commands or their output. Output appears as it arrives, a failed command shows `[exit N]`, and `cd`, `export` and `source` carry over to the next command (aliases and functions do not). Bash mode has its own up-arrow history. Programs that need a terminal (editors, `top`, `ssh host`, `git commit` without `-m`) are refused with a hint. |
+| `/model` | Arrow-key menu of OpenRouter ($) and local (free) models. The current one is marked `✔` and selected. Opening it refreshes OpenRouter prices in the background, at most once a day and only when the network is up; rows update in place. When two providers serve the same model name (several `local` servers), those rows read `provider/model`. Your choice is remembered for the next start. If the model needs a key you haven't stored, Aurora asks; leave it blank to keep the previous model. In the TUI, Esc also closes this menu without a change. Every other menu needs an explicit pick. |
 | `/model` → `+ add a model…` | The last row of the picker. Asks for an OpenRouter URL or `org/model` id and runs `/model add`. |
 | `/model add <url>` | Add an OpenRouter model by its page URL or `org/model` id. Aurora adds it to `config.yaml`, fetches its context size, price and description from the OpenRouter catalog, asks for the key if it's missing, and switches to it. |
 | `/model remove <name>` | Remove a configured model, by URL or exact name (`rm` works too). Removing the current one switches to the first remaining model that has a key. |
@@ -21,21 +21,17 @@ The full command reference behind the quick list in the [README](../README.md).
 | `/autocompact on\|off\|<pct>\|keep=<tokens>` | On by default, saved. Folds older history into a summary once the context passes the threshold. It checks between rounds of a running turn and at the end of each turn, and keeps recent turns as they are. (`/compact` folds everything, whenever you ask.) A number sets the threshold percent and `keep=<tokens>` sets how much recent history stays; both are saved. Aurora refuses out-of-range values (`0` would fold every turn; over `100` would never fold) and corrects a bad value in `config.yaml` with a warning. |
 | `/fallback on\|off` | Off by default, saved. If a provider fails hard, Aurora retries the same turn on the next configured model that has a key, in the same order as the picker. |
 | `/auto-approve on\|off` | Run tool calls without asking. The denylist still blocks. Works mid-turn. |
-| `/thinking` | Show or hide the live reasoning stream. In the TUI you can also click any "thought for Ns" row to open or close it. |
-| `/markdown` | Switch between formatted Markdown and raw text. |
+| `/thinking [on\|off]` | Show or hide the live reasoning stream; bare flips it. Saved to the config. In the TUI you can also click any "thought for Ns" row to open or close it. |
+| `/markdown [on\|off]` | Switch between formatted Markdown and raw text; bare flips it. Saved to the config. |
 | `/redact on\|off` | Secret detection in prompts and tool output (on by default, saved). A key, token or `.env` credential makes Aurora ask: keep it, redact it to `<secret>`, always allow it (never flagged again), or stop. |
 | `/redact allowlist [clear]` | Show how many false positives you've allowed, or clear them. They're saved as hashes, never as the values. |
-| `/multiline` | Multiline mode: Enter adds a new line and Alt+Enter sends. Saved to the config. |
+| `/multiline [on\|off]` | Multiline mode: Enter adds a new line and Alt+Enter sends; bare flips it. Saved to the config. |
 | `?` (empty prompt + Enter) | Open the help menu, same as `/help`. It scrolls; Esc closes it. |
 | Esc | The control key. See [Esc, pressed twice](#esc-pressed-twice) below. |
 | Ctrl+C | In the TUI it clears the input line and never quits; to cancel a busy turn press Esc twice. In the classic REPL (`--classic`) it interrupts a busy turn, and at an idle prompt it just redraws. |
 | `/compact` · `/clear` | Summarize and continue · start fresh. |
 | `/reset` | Full reset: clears the history and system prompt, then offers to run `/bootstrap` again. |
-| `/copy [N]` | Copy the Nth-last response to the clipboard. Works over SSH (OSC 52). |
-| `/copy-last` | Copy the whole last turn: the prompt, the thinking and every reply in order, with a marker for each tool call (tool output left out). Also in the status bar's `copy` picker as "copy last turn: prompt + replies". |
-| `/copy-response` | Copy only the model's final reply from the last turn, skipping a trailing message that only calls tools. Also "copy last turn: answer only" in the `copy` picker. |
-| `/copy-turn` | Copy the last turn with everything: prompt, thinking, every reply, and each tool's command and full output. Also "copy last turn: everything" in the `copy` picker. |
-| `/copy-all` | Copy the whole session: questions, answers, and each tool's command and output (the first 4000 characters of each, with a note for the rest; no thinking). Also "copy whole session" in the `copy` picker. |
+| `/copy [what]` | Copy to the clipboard; works over SSH (OSC 52). Bare: the model's final reply in the last turn. `N`: the Nth-last response. `turn`: the last turn (prompt, thinking, every reply, a marker per tool call). `full`: the same plus each tool's command and full output. `all`: the whole session (the first 4000 characters of each tool result; no thinking). `bash`: the last bash-mode output. `last`: whichever is newer, the last turn or the last bash-mode output, and it says which. The old names `/copy-response`, `/copy-last`, `/copy-turn` and `/copy-all` still work. The status bar's `copy` picker offers the same choices. |
 | `/rewind [id]` | List the checkpoints taken before each approved write, edit or command, and restore one. A restore is checkpointed too, so you can undo it. |
 | `/undo` | Revert only the last change instead of the whole tree. It always shows the diff and names the files before asking, so you can catch the wrong file before you confirm. |
 | `/diff` | Show what the last turn changed, compared with its checkpoint. |
@@ -91,8 +87,8 @@ counts as a new first press.
 
 | State | 1st Esc | 2nd Esc (within 2s) |
 |---|---|---|
-| Busy (thinking or working) | Arms; the status bar shows `Esc again to ask!` | Opens "Cancel this?". `Yes, cancel` stops the request; `No, keep going` closes the question. |
-| Bash mode (`$` prompt) | Arms without a hint (or click the `> prompt` hint to leave in one step) | Opens "Leave bash mode?". `Yes` returns to the `>` prompt; `No` stays. |
+| Busy (thinking or working, or a bash-mode command running) | Arms; the status bar shows `Esc again to ask!` | Opens "Cancel this?". `Yes, cancel` stops the request or command; `No, keep going` closes the question. A command on the side channel gets its own `Cancel the side command` row. |
+| Bash mode (`$` prompt), nothing running | Arms without a hint (or click the `> prompt` hint to leave in one step) | Opens "Leave bash mode?". `Yes` returns to the `>` prompt; `No` stays. |
 | Idle, empty prompt | Arms without a hint | Opens "Quit Aurora?". `Yes` quits; `No` stays. Typing `y` and Enter at the status-bar question also works. |
 
 Every question uses the same menu as the rest of the app: ↑/↓ and Enter, or

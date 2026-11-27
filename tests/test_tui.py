@@ -749,14 +749,74 @@ def test_drag_select_freezes_range_and_offers_copy_button(t, monkeypatch):
     t.sel_drag((1, 5))                # …through "gamma"
     assert t._sel == ((0, 6), (1, 5))
     assert t.sel_finish() is True     # drag → swallowed click
-    assert not copied                 # not copied yet — needs an explicit tap
+    assert copied["text"] == "beta\ngamma"   # copied by default on release…
+    assert "copied" in t._sel_notice[0]       # …and the status bar says so
     assert t._sel is None             # live drag cleared…
     assert t._sel_frozen == ((0, 6), (1, 5))  # …but stays frozen/highlighted
-    # tapping "copy selected" does the actual copy
+    # the "copy selected" menu entry still works, and overrides the clipboard
+    copied.clear()
     _copy_via_menu(t, "selected")
     assert copied["text"] == "beta\ngamma"
     assert "copied" in t._sel_notice[0]
     assert t._sel_frozen is None      # button disappears after copying
+
+
+def test_double_click_selects_and_copies_the_word(t, monkeypatch):
+    copied = {}
+    monkeypatch.setattr("aurora.clipboard.copy",
+                        lambda s: copied.update(text=s) or "OSC52")
+    t.append("alpha beta\ngamma delta\n")
+    assert t.chat_double_click((1, 7)) is False   # first click: nothing yet
+    assert not copied
+    assert t.chat_double_click((1, 8)) is True    # second click on "delta"
+    assert copied["text"] == "delta"
+    assert t._sel_frozen == ((1, 6), (1, 11))     # highlighted
+    assert "copied 5 chars" in t._sel_notice[0]   # status bar says so
+    # consumed: a third quick click starts over instead of re-copying
+    copied.clear()
+    assert t.chat_double_click((1, 8)) is False
+    assert not copied
+
+
+def test_double_click_needs_same_spot_and_a_word(t, monkeypatch):
+    copied = {}
+    monkeypatch.setattr("aurora.clipboard.copy",
+                        lambda s: copied.update(text=s) or "OSC52")
+    t.append("alpha beta\n")
+    t.chat_double_click((0, 1))
+    assert t.chat_double_click((0, 9)) is False   # moved far away: not a double
+    t.chat_double_click((0, 5))
+    assert t.chat_double_click((0, 5)) is False   # on the space: no word
+    assert not copied
+
+
+def test_double_click_through_the_real_chat_handler_in_sgr_and_legacy_terminals(t, monkeypatch):
+    """The whole path (mouse events -> _ChatControl.mouse_handler -> copy), not just chat_double_click. SGR terminals report
+    LEFT on release; legacy X10/urxvt ones report no button, which must work too. A right-button release must not."""
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+    copied = {}
+    monkeypatch.setattr("aurora.clipboard.copy", lambda s: copied.update(text=s) or "OSC52")
+    t.append("alpha beta\ngamma delta\n")
+    ctl = t._chat_win.content
+
+    def ev(kind, button):
+        return MouseEvent(position=Point(x=7, y=1), event_type=kind, button=button, modifiers=frozenset())
+
+    def click(release_button):
+        ctl.mouse_handler(ev(MouseEventType.MOUSE_DOWN, MouseButton.LEFT))
+        return ctl.mouse_handler(ev(MouseEventType.MOUSE_UP, release_button))
+
+    for release in (MouseButton.LEFT, MouseButton.NONE):
+        copied.clear(); t._chat_click = None
+        click(release)
+        assert not copied
+        assert click(release) is None          # swallowed: no per-fragment handler fires twice
+        assert copied["text"] == "delta", release
+        assert t._sel_frozen == ((1, 6), (1, 11))
+    copied.clear(); t._chat_click = None
+    click(MouseButton.RIGHT); click(MouseButton.RIGHT)
+    assert not copied
 
 
 def test_backwards_drag_normalizes(t, monkeypatch):
@@ -1031,6 +1091,7 @@ def test_copy_menu_reports_a_selection_that_vanished(t, monkeypatch):
     t.sel_begin((0, 0))
     t.sel_drag((0, 5))
     t.sel_finish()
+    copied.clear()                    # the drag itself auto-copies; ignore that
     t._copy_menu_click()(_mouse_up())
     t._copy_menu_sel = ""             # e.g. a redraw dropped it
     t._resolve_menu([k for k, _ in t._menu_options].index("selected"))
@@ -1690,12 +1751,19 @@ def _status_line1(t):
 
 def test_draft_token_estimate_shown_while_typing(t):
     t.input.buffer.text = "hello world this is a test prompt"  # 35 chars
-    assert "- ↑8" in _status_line1(t)
+    assert "- draft 8 tok" in _status_line1(t)
 
 
 def test_draft_token_estimate_hidden_when_empty(t):
     t.input.buffer.text = "   "
     assert "↑" not in _status_line1(t)
+
+
+def test_draft_token_estimate_hidden_for_a_command(t):
+    t.input.buffer.text = "/"                       # R455 (#30): no "↑0"
+    assert "draft" not in _status_line1(t) and "↑" not in _status_line1(t)
+    t.input.buffer.text = "/compact now please"
+    assert "draft" not in _status_line1(t)
 
 
 def test_draft_token_estimate_hidden_in_bash_mode(t):
@@ -1706,15 +1774,15 @@ def test_draft_token_estimate_hidden_in_bash_mode(t):
 
 def test_status_hint_row_in_prompt_mode(t):
     assert _status_line2(t) == (
-        "/ commands · ! bash · \\n/\\br newline · Ctrl+J newline · "
-        "? Help · Esc cancel/clear/exit")
+        "? Help · Esc cancel/clear/exit · / commands · ! bash · "
+        "Ctrl+J newline · \\n/\\br newline")
 
 
 def test_status_hint_row_in_bash_mode(t):
     t._bash_mode = True
     assert _status_line2(t) == (
-        "/ commands · > prompt · \\n/\\br newline · Ctrl+J newline · "
-        "? Help · Esc cancel/clear/exit")
+        "? Help · Esc cancel/clear/exit · / commands · > prompt · "
+        "Ctrl+J newline · \\n/\\br newline")
 
 
 def test_status_hint_select_one_for_generic_menu(t):
@@ -1748,10 +1816,10 @@ def test_copy_all_click_queues_the_command_instead_of_working_inline(t, monkeypa
 
     _copy_via_menu(t, "session")
 
-    assert t._inbox.get_nowait() == "/copy-all"
+    assert t._inbox.get_nowait() == "/copy all"
     assert called == [], f"ran on the UI thread: {called}"
     # echoed into the chat, same feedback shape as the agentic-report click
-    assert any("/copy-all" in e for e in t._chat if isinstance(e, str))
+    assert any("/copy all" in e for e in t._chat if isinstance(e, str))
 
 
 def test_click_dismisses_copy_notice_early(t):
@@ -1761,8 +1829,8 @@ def test_click_dismisses_copy_notice_early(t):
     t._dismiss_notice_click()(_mouse_up())
     assert t._sel_notice == ("", 0.0)
     assert _status_line2(t) == (
-        "/ commands · ! bash · \\n/\\br newline · Ctrl+J newline · "
-        "? Help · Esc cancel/clear/exit")
+        "? Help · Esc cancel/clear/exit · / commands · ! bash · "
+        "Ctrl+J newline · \\n/\\br newline")
 
 
 def test_click_prompt_leaves_bash_mode(t):
@@ -2093,7 +2161,7 @@ def test_bash_mode_command_is_timeout_and_process_group_safe(t, monkeypatch):
     from aurora import ui
     calls = []
     monkeypatch.setattr(_tools, "_run_command_once",
-                        lambda command, workdir, timeout=None:
+                        lambda command, workdir, timeout=None, **kw:
                         (calls.append((command, workdir)) or ("hi", 0)))
     monkeypatch.setattr(t, "_banner", lambda: None)
     monkeypatch.setattr("aurora.bootstrap.load", lambda cwd: ("", None))
@@ -2106,14 +2174,17 @@ def test_bash_mode_command_is_timeout_and_process_group_safe(t, monkeypatch):
     th.start()
     th.join(timeout=2)
     assert not th.is_alive()
-    assert calls == [("echo hi", t._bash_cwd)]
+    # R452: the command runs inside bashmode's state-saving wrapper
+    assert len(calls) == 1
+    assert calls[0][1] == t._bash_cwd
+    assert calls[0][0].rstrip().endswith("echo hi")
 
 
 def test_bash_mode_reports_a_timed_out_command(t, monkeypatch):
     from aurora import tools as _tools
     from aurora import ui
     monkeypatch.setattr(_tools, "_run_command_once",
-                        lambda command, workdir, timeout=None: ("partial", None))
+                        lambda command, workdir, timeout=None, **kw: ("partial", None))
     monkeypatch.setattr(t, "_banner", lambda: None)
     monkeypatch.setattr("aurora.bootstrap.load", lambda cwd: ("", None))
     monkeypatch.setattr(t.app, "exit", lambda: None)
@@ -3153,7 +3224,7 @@ def test_esc_hint_expires_back_to_tooltips(t):
     t._on_escape(lambda: None)
     t._esc_armed_at -= 3                        # age the arm past the 2s window
     t._exit_confirm = False                     # user typed/state moved on
-    assert _status_line2(t).startswith("/ commands")
+    assert _status_line2(t).startswith("? Help")
 
 
 # ── R48: drag-select coords vs. the bottom-anchor top pad ──────────────────
@@ -4409,13 +4480,22 @@ def test_esc_offers_the_side_row_only_when_the_side_channel_is_busy(t):
     assert [k for k, _ in t._menu_options] == ["cancel", "continue", "quit"]
     t._resolve_menu(1)                           # "No, keep going"
 
-    # R257: a `!` command on the side channel is NOT cancellable — only a
-    # quick-ask polls `_side_cancel` — so the row must not be offered for it
-    t._side_busy, t._side_kind = True, "bash"
+    # R257: side work that does not poll `_side_cancel` (a read-only
+    # /command) gets no row
+    t._side_busy, t._side_kind = True, "cmd"
     t._on_escape(lambda: None)
     t._on_escape(lambda: None)
     assert [k for k, _ in t._menu_options] == ["cancel", "continue", "quit"]
     t._resolve_menu(1)
+
+    # R452: a side `!` command polls `_side_cancel` now, so it gets the row
+    t._side_kind = "bash"
+    t._on_escape(lambda: None)
+    t._on_escape(lambda: None)
+    assert [k for k, _ in t._menu_options] == [
+        "cancel", "side", "continue", "quit"]
+    assert dict(t._menu_options)["side"] == "Cancel the side command"
+    t._resolve_menu(2)
 
     t._side_kind = "ask"
     t._on_escape(lambda: None)
@@ -4531,22 +4611,24 @@ def test_clearing_the_screen_does_not_strand_the_open_think_flag(t):
 
 
 def test_the_side_cancel_row_is_not_offered_for_work_it_cannot_stop(t):
-    """`_side_cancel` is polled by `quick_ask` and nothing else, so offering
-    the row while a `!` command runs promised a stop that did nothing."""
-    # main worker BUSY: the turn is cancellable, the `!` command is not
-    t._busy, t._side_busy, t._side_kind = True, True, "bash"
-    t._on_escape(lambda: None)
-    t._on_escape(lambda: None)
-    assert [k for k, _ in t._menu_options] == ["cancel", "continue", "quit"]
-    t._resolve_menu(1)
+    """R257: no row for side work that does not poll `_side_cancel` (a
+    read-only /command, a /model pick); it would promise a stop that does
+    nothing. (A side `!` command does poll it since R452.)"""
+    for kind in ("cmd", "model"):
+        t._busy, t._side_busy, t._side_kind = True, True, kind
+        t._on_escape(lambda: None)
+        t._on_escape(lambda: None)
+        assert [k for k, _ in t._menu_options] == ["cancel", "continue", "quit"]
+        t._resolve_menu(1)
 
-    # main worker IDLE with only a `!` command running: Esc-Esc falls
-    # through to the ordinary idle quit gesture rather than offering a
-    # "cancel" that would do nothing
-    t._busy = False
-    t._on_escape(lambda: None)
-    t._on_escape(lambda: None)
-    assert "side" not in [k for k, _ in (t._menu_options or [])]
+        # main worker IDLE with only that running: Esc-Esc falls through to
+        # the ordinary idle quit gesture
+        t._busy = False
+        t._on_escape(lambda: None)
+        t._on_escape(lambda: None)
+        assert "side" not in [k for k, _ in (t._menu_options or [])]
+        t._menu_options = None
+        t._esc_armed = None
 
 
 def _run_with_keys(tui_, sends, tail=0.6):

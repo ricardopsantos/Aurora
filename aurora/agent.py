@@ -6,6 +6,7 @@ UI-agnostic: the caller passes callbacks so this works under any front end.
 """
 
 import json
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -36,6 +37,14 @@ def _provider_label(provider) -> str:
         pass
     from urllib.parse import urlparse
     return urlparse(base).hostname or "remote backend"   # public SaaS domains are fine to show
+
+
+def _is_ollama(provider) -> bool:
+    """R455 (#25): an Ollama provider gets Ollama advice, not llama.cpp's."""
+    try:
+        return bool(provider._is_ollama())
+    except Exception:
+        return False
 
 
 def _connectivity_hint(provider) -> str:
@@ -133,6 +142,32 @@ def _stamp_first(on_text, first: list):
             first.append(_gen_clock())
         return on_text(chunk)
     return wrapped
+
+
+class _StampThink:
+    """R563: while a request runs, the provider's `on_think` also starts the generation clock: a thinking model's
+    output tokens include its reasoning, so timing from the first text alone overstated tokens/s."""
+    def __init__(self, provider, first: list):
+        self.provider, self.first = provider, first
+
+    def __enter__(self):
+        self.had = hasattr(self.provider, "on_think")
+        self.prev = getattr(self.provider, "on_think", None)
+        if self.had:
+            prev, first = self.prev, self.first
+
+            def stamp(chunk):
+                if chunk and not first:
+                    first.append(_gen_clock())
+                if prev:
+                    return prev(chunk)
+            self.provider.on_think = stamp
+        return self
+
+    def __exit__(self, *exc):
+        if self.had:
+            self.provider.on_think = self.prev
+        return False
 
 
 def _note_gen(turn, result, first: list) -> None:
@@ -299,6 +334,55 @@ def _load_allow_or_empty(cb: AgentCallbacks) -> dict:
         return {}
 
 
+def provider_error_notices(provider, msg: str) -> list[str]:
+    """The notices a failed provider request gets, on either core (R504): classified, never the raw exception where
+    it could name a private config key."""
+    out: list[str] = []
+    if "exceed" in msg and "context" in msg:
+        out.append(f"provider error: {msg}")
+        out.append("context is full — /compact to summarize and continue, "
+                  "or /clear to start fresh")
+    elif re.search(r"(?<!\d)429(?!\d)", msg) or ("rate" in msg.lower() and "limit" in msg.lower()):   # R564: whole number
+        # a free-tier model (e.g. an OpenRouter ":free" variant) shares
+        # a rate-limited pool across everyone using it without their
+        # own key on that specific upstream — not a bug, an expected
+        # limit. The raw error is a wall of provider JSON; give the
+        # actionable summary instead.
+        out.append("rate-limited by the provider — this model's free "
+                  "tier is shared; try again shortly, add your own "
+                  "provider key to get your own limit, or /model to "
+                  "switch to another backend")
+    elif any(s in msg.lower() for s in
+             ("timed out", "connect", "unreachable", "refused")):
+        # NEVER echo the raw exception here: it embeds the provider's
+        # config-key name (e.g. `{self.name} request failed: ...` —
+        # a user may key their private server with something personal).
+        # Classify local vs remote instead — the connectivity problem
+        # can be on ANY provider, so don't assume it was the local one.
+        label = _provider_label(provider)
+        hint = _connectivity_hint(provider)
+        # R345: the same cause/fix list the startup panel shows — no
+        # host, URL or config-key name (see the NEVER above)
+        from . import diagnose as _dg
+        d = _dg.diagnose(_dg.classify(msg), local=label.startswith("local"),
+                         is_ollama=_is_ollama(provider),   # R455 (#25)
+                         installed=_dg.server_installed(_is_ollama(provider), getattr(provider, "base_url", "")))   # R579
+        out.append(f"{label} unreachable — check your connection, or "
+                  "/model to switch to another backend"
+                  + (f"\n  {hint}" if hint else "")
+                  + "\n" + "\n".join(_dg.render(d, indent="  ")))
+    elif _diagnosable(msg):
+        # R345: a rejected key / unknown model / bad certificate is not
+        # "provider error: <wall of JSON>" — say what to do about it
+        from . import diagnose as _dg
+        d = _dg.diagnose(_dg.classify(msg), local=False)
+        out.append(f"{_provider_label(provider)} failed — {d.cause}\n"
+                  + "\n".join(_dg.render(d, indent="  ")[1:]))
+    else:
+        out.append(f"provider error: {msg}")
+    return out
+
+
 def run_turn(provider, model, messages, system, cb: AgentCallbacks,
              max_iterations: int, tools_enabled: bool) -> Turn:
     """Drive one turn. `messages` is mutated in place with the full exchange
@@ -349,8 +433,9 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
         _t0 = time.monotonic()
         try:
             _first = []
-            result = provider.turn(model, messages, system, tool_specs,
-                                   _stamp_first(cb.on_text, _first), cb.cancelled)
+            with _StampThink(provider, _first):
+                result = provider.turn(model, messages, system, tool_specs,
+                                       _stamp_first(cb.on_text, _first), cb.cancelled)
             turn.last_request_latency = time.monotonic() - _t0
             _note_gen(turn, result, _first)
         except MalformedToolCall as e:
@@ -368,8 +453,9 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
                 _t0 = time.monotonic()
                 try:
                     _first = []
-                    result = provider.turn(model, messages, system, tool_specs,
-                                           _stamp_first(cb.on_text, _first), cb.cancelled)
+                    with _StampThink(provider, _first):
+                        result = provider.turn(model, messages, system, tool_specs,
+                                               _stamp_first(cb.on_text, _first), cb.cancelled)
                     turn.last_request_latency = time.monotonic() - _t0
                     _note_gen(turn, result, _first)
                 except MalformedToolCall:
@@ -385,47 +471,8 @@ def run_turn(provider, model, messages, system, cb: AgentCallbacks,
             else:
                 raise
         except ProviderError as e:
-            msg = str(e)
-            if "exceed" in msg and "context" in msg:
-                cb.notify(f"provider error: {e}")
-                cb.notify("context is full — /compact to summarize and continue, "
-                          "or /clear to start fresh")
-            elif "429" in msg or ("rate" in msg.lower() and "limit" in msg.lower()):
-                # a free-tier model (e.g. an OpenRouter ":free" variant) shares
-                # a rate-limited pool across everyone using it without their
-                # own key on that specific upstream — not a bug, an expected
-                # limit. The raw error is a wall of provider JSON; give the
-                # actionable summary instead.
-                cb.notify("rate-limited by the provider — this model's free "
-                          "tier is shared; try again shortly, add your own "
-                          "provider key to get your own limit, or /model to "
-                          "switch to another backend")
-            elif any(s in msg.lower() for s in
-                     ("timed out", "connect", "unreachable", "refused")):
-                # NEVER echo the raw exception here: it embeds the provider's
-                # config-key name (e.g. `{self.name} request failed: ...` —
-                # a user may key their private server with something personal).
-                # Classify local vs remote instead — the connectivity problem
-                # can be on ANY provider, so don't assume it was the local one.
-                label = _provider_label(provider)
-                hint = _connectivity_hint(provider)
-                # R345: the same cause/fix list the startup panel shows — no
-                # host, URL or config-key name (see the NEVER above)
-                from . import diagnose as _dg
-                d = _dg.diagnose(_dg.classify(msg), local=label.startswith("local"))
-                cb.notify(f"{label} unreachable — check your connection, or "
-                          "/model to switch to another backend"
-                          + (f"\n  {hint}" if hint else "")
-                          + "\n" + "\n".join(_dg.render(d, indent="  ")))
-            elif _diagnosable(msg):
-                # R345: a rejected key / unknown model / bad certificate is not
-                # "provider error: <wall of JSON>" — say what to do about it
-                from . import diagnose as _dg
-                d = _dg.diagnose(_dg.classify(msg), local=False)
-                cb.notify(f"{_provider_label(provider)} failed — {d.cause}\n"
-                          + "\n".join(_dg.render(d, indent="  ")[1:]))
-            else:
-                cb.notify(f"provider error: {e}")
+            for line in provider_error_notices(provider, str(e)):
+                cb.notify(line)
             turn.events.append({"error": str(e)})
             return turn
 

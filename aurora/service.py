@@ -14,12 +14,16 @@ import re
 
 from . import __version__ as _version
 from . import config as _config
+from . import guard as _guard
+from . import htmltext as _htmltext
 from . import keystore as _keystore
 from . import configedit as _configedit
 from . import modelcfg as _modelcfg
 from . import paths as _paths
 from . import rewind as _rewind
+from . import secrets as _secrets
 from . import session as _session
+from . import tools as _tools
 from .providers.base import ProviderError
 
 __all__ = [
@@ -42,12 +46,23 @@ def version() -> str:
     return str(_version)
 
 
+def core_binary() -> str | None:
+    """R509: the aurora-rs a turn would start (rustcore.binary), or None."""
+    from . import rustcore
+    return rustcore.binary()
+
+
 def aurora_home():
     """The per-machine data dir (a Path)."""
     return _paths.aurora_home()
 
 
 # ── sessions ────────────────────────────────────────────────────────────
+def starts_with_path(line: str) -> bool:
+    """R453: a line starting with `/` that is a message about a path, not a command."""
+    return _paths.starts_with_path(line)
+
+
 def session_ids() -> list[str]:
     """Every exact session id on disk."""
     return _session._base_session_ids()
@@ -63,7 +78,10 @@ def session_exists(sid: str) -> bool:
     if not isinstance(sid, str) or not sid:
         return False
     if _PLAIN_ID.fullmatch(sid):
-        return (_paths.sessions_dir() / f"{sid}.jsonl").is_file()
+        if not (_paths.sessions_dir() / f"{sid}.jsonl").is_file():
+            return False
+        # a case-insensitive filesystem (macOS) would also match "ABC" for "abc": re-check exact case
+        return sid == sid.lower() or sid in _session._base_session_ids()
     return sid in _session._base_session_ids()
 
 
@@ -85,8 +103,8 @@ def count_prompts(sid: str) -> int:
     return _session.count_prompts(sid)
 
 
-def export_markdown(sid: str) -> str:
-    return _session.export_markdown(sid)
+def export_markdown(sid: str, max_chars: int | None = None) -> str:
+    return _session.export_markdown(sid, max_chars)
 
 
 def session_records(sid: str):
@@ -250,3 +268,45 @@ def config_merge(base, over):
 
 def load_config(path) -> dict:
     return _config.load_config(path)
+
+
+def has_secret(text: str) -> bool:
+    """R463: does this text contain something secrets.scan would redact?"""
+    return bool(_secrets.scan(text))
+
+
+# ── R450: what the web page needs from the tool layer ────────────────────────
+def set_web_guard(on: bool = True) -> None:
+    """Web mode: file tools refuse secrets, and Aurora's own policy/code files (see guard.py)."""
+    _guard.WEB = bool(on)
+
+
+def url_needs_approval(url: str) -> bool:
+    """R283: could fetching this URL reach a private service or carry data out?"""
+    return _tools.url_needs_approval(url)
+
+
+def html_to_plain(html: str) -> str:
+    """Tags and comments removed in one forward pass (linear time), `<script>`/`<style>` dropped."""
+    _h = _htmltext
+    return _h._flatten(_h._strip_blocks(_h._strip_comments(html), ("script", "style")))
+
+
+def add_tools(specs: list[dict], runners: dict) -> list[str]:
+    """R462: a web-only tool (e.g. `remember`) joins the extension tools the engine installed."""
+    return _tools.set_extensions(list(_tools._EXTENSION_SPECS) + list(specs), {**_tools._EXTENSION_RUNNERS, **runners})
+
+
+# ── R475: the command sandbox ────────────────────────────────────────────────
+def web_sandbox(runtime: dict) -> str:
+    """Box the web page's commands as `runtime: sandbox:` says (web, all: on; off). Returns "" or why it could not."""
+    from . import sandbox as _sandbox
+    if _sandbox.mode_from(runtime or {}) == "off":
+        _tools.disable_sandbox()
+        return ""
+    return _tools.enable_sandbox(_sandbox.policy_from(runtime or {}, str(aurora_home())))
+
+
+def sandbox_status() -> dict:
+    """{"wanted", "active", "problem"}: whether commands run in the box, and why not when one was asked for."""
+    return {"wanted": _tools.SANDBOX_WANTED, "active": _tools.sandbox_active(), "problem": _tools.SANDBOX_PROBLEM}

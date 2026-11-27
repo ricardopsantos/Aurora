@@ -122,6 +122,9 @@ DANGEROUS_ESCAPES = re.compile(
     # reaches these two and takes the rest of the text with it — which is
     # R171's own already-accepted trade, since a real terminal would swallow
     # that text as OSC payload anyway.
+    # R543: the single-byte C1 forms (U+009D OSC, U+0090 DCS, U+0098/9E/9F) that some terminals honour
+    r"|[\x9d\x90\x98\x9e\x9f][^\x07\x9c\x1b]*(?:\x07|\x9c|\x1b\\)"
+    r"|[\x9d\x90\x98\x9e\x9f][\s\S]*\Z"
     r"|\x1b\][\s\S]*\Z"                     # unterminated OSC → end of text
     r"|\x1b[PX^_][\s\S]*\Z"                 # unterminated DCS/SOS/PM/APC
 )

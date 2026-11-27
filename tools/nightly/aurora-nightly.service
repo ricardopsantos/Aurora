@@ -1,0 +1,9 @@
+[Unit]
+Description=Aurora nightly: Python and Rust cores on the same fixtures (N5)
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/aurora-nightly.env
+ExecStart=%h/repositories/Aurora/tools/nightly/aurora-nightly.sh
+Nice=10
+TimeoutStartSec=2h

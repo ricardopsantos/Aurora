@@ -128,7 +128,10 @@ class LineRenderer:
             # itself shouldn't require of every caller.
             suffix = "\n" if line.endswith("\n") else ""
             return f"{BOLD}{CYAN}{m.group(2)}{RESET}{suffix}"
+        # R542: code spans first, kept out of the bold pass (`a**b**c` in code stayed bold)
+        spans: list[str] = []
+        line = _CODE.sub(lambda m: spans.append(m.group(1)) or f"\x00{len(spans) - 1}\x00", line)
         line = _BOLD.sub(f"{BOLD}\\1{RESET}", line)
-        line = _CODE.sub(f"{CYAN}\\1{RESET}", line)
+        line = re.sub(r"\x00(\d+)\x00", lambda m: f"{CYAN}{spans[int(m.group(1))]}{RESET}", line)
         line = _BULLET.sub(r"\1• ", line)
         return linkify(line)

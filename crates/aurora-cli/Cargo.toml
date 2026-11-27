@@ -1,0 +1,21 @@
+[package]
+name = "aurora-cli"
+description = "aurora-rs: the Rust Aurora's command line (headless mode first)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "aurora-rs"
+path = "src/main.rs"
+
+[dependencies]
+aurora-core.workspace = true
+aurora-providers.workspace = true
+aurora-storage.workspace = true
+aurora-tools.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

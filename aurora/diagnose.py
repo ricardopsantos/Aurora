@@ -5,7 +5,13 @@ all say the same thing. Nothing here names a particular machine, network or
 vendor beyond the software Aurora itself supports (llama.cpp, Ollama,
 OpenRouter / any OpenAI-compatible server)."""
 
+import re
 from dataclasses import dataclass, field
+
+
+def _code(low: str, n: str) -> bool:
+    """R540: `n` as a whole number: port 4013 or a 4404-token count is not a 401/404."""
+    return re.search(rf"(?<![\d.:]){n}(?!\d)", low) is not None
 
 KINDS = ("refused", "timeout", "dns", "tls", "auth", "nokey", "notfound",
          "ratelimit", "other")
@@ -31,31 +37,55 @@ def classify(err) -> str:
     if any(s in low for s in ("name or service", "nodename", "getaddrinfo",
                               "errno -2", "errno -3", "temporary failure in name")):
         return "dns"
-    if "401" in low or "403" in low or "unauthorized" in low or "forbidden" in low \
+    if _code(low, "401") or _code(low, "403") or "unauthorized" in low or "forbidden" in low \
             or "invalid api key" in low or "incorrect api key" in low:
         return "auth"
-    if "404" in low or "not found" in low:
+    if _code(low, "404") or "not found" in low:
         return "notfound"
-    if "429" in low or "rate limit" in low or "rate-limit" in low:
+    if _code(low, "429") or "rate limit" in low or "rate-limit" in low:
         return "ratelimit"
     return "other"
 
 
+def server_installed(is_ollama: bool, url: str = "") -> bool | None:
+    """R579: whether the server program a local entry needs is on THIS machine. Only Ollama has one fixed command
+    to look for (`ollama`); None when it cannot be told (llama.cpp builds and remote hosts have no such name)."""
+    import shutil
+    if not is_ollama:
+        return None
+    host = re.sub(r"^\w+://", "", url or "").split("/")[0].rsplit(":", 1)[0].strip("[]").lower()
+    if url and host not in ("localhost", "127.0.0.1", "::1", ""):
+        return None                                      # Ollama on another machine: this one need not have it
+    return shutil.which("ollama") is not None
+
+
 def diagnose(kind: str, *, provider: str = "", url: str = "", model: str = "",
              key_env: str = "", detail: str = "", is_ollama: bool = False,
-             local: bool = True) -> Diagnosis:
+             local: bool = True, installed: bool | None = None,
+             alternatives: list[str] | None = None) -> Diagnosis:
     """Cause + fixes for `kind`. `local` says the backend is something the user
-    runs themselves (a llama.cpp/Ollama server) rather than a hosted API."""
+    runs themselves (a llama.cpp/Ollama server) rather than a hosted API.
+    R579: `installed` False means the server program is not on this machine (so "start it" is no fix), and
+    `alternatives` are other configured models that answer now: they come first, since they work today."""
     where = f" at {url}" if url else ""
     cfg = f"base_url under providers → {provider}" if provider else "base_url"
-    pick = "/model — pick another configured model"
+    alts = [a for a in (alternatives or []) if a][:3]
+    pick = ("/model — switch to " + " or ".join(f"`{a}`" for a in alts) + " (answer now)") if alts \
+        else "/model — pick another configured model"
     add = "/model add <org/model> — use a hosted OpenRouter model instead"
     if kind == "refused":
+        if is_ollama and installed is False:
+            # R579: "start Ollama" on a machine without Ollama is not a fix
+            return Diagnosis(kind, f"nothing is listening{where}, and Ollama is not installed on this machine",
+                             [pick, f"remove this entry from config.yaml, or point it at a server that runs ({cfg})",
+                              "or install Ollama (https://ollama.com) and `ollama pull " + (model or "<model>") + "`",
+                              *([] if alts else [add])])
         start = ("start Ollama (`ollama serve`)" if is_ollama else
                  "start your llama.cpp server (or whichever server `base_url` points at)")
-        return Diagnosis(kind, f"nothing is listening{where}",
-                         [start, f"check the host and port in config.yaml ({cfg})",
-                          pick, add])
+        fixes = [start, f"check the host and port in config.yaml ({cfg})", pick, add]
+        if alts:
+            fixes = [pick, start, f"check the host and port in config.yaml ({cfg})"]
+        return Diagnosis(kind, f"nothing is listening{where}", fixes)
     if kind == "timeout":
         return Diagnosis(kind, f"the server{where} did not answer in time",
                          ["check that the host is up and reachable (network / VPN)",

@@ -45,41 +45,13 @@ def web_search(query: str, max_results: int = 5, **_) -> str:
         f"{h.get('title', '')}\n{h.get('href', '')}\n{h.get('body', '')}" for h in hits)
 
 
-_TAG = re.compile(r"<[^>]+>")
 _WS = re.compile(r"\n\s*\n\s*\n+")
 
 
 _FETCH_CAP = 2_000_000  # bytes — a page this big is never useful past the cap
 
 
-def _strip_blocks(html: str, tags: tuple[str, ...]) -> str:
-    """R282: drop `<tag>…</tag>` blocks in ONE forward pass.
-
-    Was `re.sub(r"<(script|style)[\\s\\S]*?</\\1>", ...)`: on an opener
-    with no closer, the lazy scan runs to the end of the text, and it is
-    retried from every later opener — quadratic. Measured: 224KB of
-    unclosed `<script` took 33.7s, against a 2MB fetch cap, on an ungated
-    tool Esc could not interrupt. Here every search starts where the last
-    one ended. An unclosed block swallows the rest of the page, which is
-    what a browser does with it too."""
-    low = html.lower()
-    out, pos = [], 0
-    while True:
-        best, tag = -1, ""
-        for t in tags:
-            i = low.find(f"<{t}", pos)
-            if i != -1 and (best == -1 or i < best):
-                best, tag = i, t
-        if best == -1:
-            out.append(html[pos:])
-            break
-        out.append(html[pos:best])
-        close = low.find(f"</{tag}", best)
-        if close == -1:
-            break                         # unclosed: the rest is inside it
-        end = low.find(">", close)
-        pos = len(html) if end == -1 else end + 1
-    return "".join(out)
+from aurora.htmltext import _flatten, _strip_blocks, _strip_comments  # noqa: E402,F401
 
 
 def _strip_script_style(html: str) -> str:
@@ -89,14 +61,6 @@ def _strip_script_style(html: str) -> str:
 # R338: page furniture that is not the content
 _FURNITURE = ("script", "style", "nav", "footer", "aside", "form", "noscript",
               "svg", "template", "iframe")
-_BLOCK = re.compile(r"</?(?:p|div|section|article|main|header|h[1-6]|ul|ol|"
-                    r"table|tr|blockquote|pre|figure|figcaption|dl|dt|dd)\b[^>]*>",
-                    re.I)
-_BR = re.compile(r"<br\s*/?>", re.I)
-_LI = re.compile(r"<li\b[^>]*>", re.I)
-_COMMENT = re.compile(r"<!--[\s\S]*?-->")
-
-
 def _main_region(html: str) -> str:
     """The first <main> or <article> element, when the page has one."""
     low = html.lower()
@@ -116,13 +80,9 @@ def html_to_text(html: str) -> str:
     the <main>/<article> body preferred, block tags kept as line breaks, list
     items as `- `, entities decoded."""
     import html as htmllib
-    html = _COMMENT.sub("", html)
-    html = _strip_blocks(html, _FURNITURE)
+    html = _strip_blocks(_strip_comments(html), _FURNITURE)
     html = _main_region(html)
-    html = _BR.sub("\n", html)
-    html = _LI.sub("\n- ", html)
-    html = _BLOCK.sub("\n", html)
-    text = htmllib.unescape(_TAG.sub("", html))
+    text = htmllib.unescape(_flatten(html))
     text = "\n".join(re.sub(r"[ \t\r\f\v]+", " ", ln).strip()
                      for ln in text.split("\n"))
     return _WS.sub("\n\n", text).strip()
@@ -140,6 +100,44 @@ def _peer_is_private(r) -> bool:
     except Exception:
         return False
     return ip is not None and not ip.is_global
+
+
+def _proxied(url: str) -> bool:
+    """R512: whether httpx would send this URL through a `*_proxy` from the environment (then the peer we see is the
+    proxy, not the server, and the peer check below says nothing about the target)."""
+    import urllib.request
+    from urllib.parse import urlsplit
+    u = urlsplit(url)
+    host = u.hostname or ""
+    proxies = urllib.request.getproxies()
+    if not (proxies.get(u.scheme) or proxies.get("all")):
+        return False
+    try:
+        return not urllib.request.proxy_bypass(host)
+    except Exception:
+        return True
+
+
+def _resolves_private(url: str) -> bool:
+    """R512: the target's name resolved BEFORE the request is sent, so a public-looking name that points at a
+    private address never receives the GET (the old check read the peer after the request had gone out)."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+    host = (urlsplit(url).hostname or "").strip("[]")
+    if not host:
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return False                   # unresolvable: the fetch itself fails
+    for ai in infos:
+        try:
+            if not ipaddress.ip_address(ai[4][0].split("%")[0]).is_global:
+                return True
+        except ValueError:
+            return True
+    return False
 
 
 def web_fetch(url: str, **_) -> str:
@@ -162,6 +160,10 @@ def web_fetch(url: str, **_) -> str:
                                            resolve=False)
     try:
         for _hop in range(_MAX_REDIRECTS + 1):
+            if not approved_private and _resolves_private(url):
+                return ("[web_fetch blocked: the server resolves to a private/local address — fetch it by that "
+                        "address to get an approval prompt]")
+            via_proxy = _proxied(url)
             # stream with a byte cap — a plain .get() would download an
             # arbitrarily large body into memory before we ever truncate
             with httpx.stream("GET", url, timeout=20, follow_redirects=False,
@@ -169,7 +171,7 @@ def web_fetch(url: str, **_) -> str:
                 # R301: DNS rebinding — the name may have resolved public for
                 # the check and private for the connect. Refuse to read
                 # anything from a private peer the user didn't approve.
-                if not approved_private and _peer_is_private(r):
+                if not approved_private and not via_proxy and _peer_is_private(r):
                     return ("[web_fetch blocked: the server resolved to a "
                             "private/local address]")
                 if getattr(r, "is_redirect", False):

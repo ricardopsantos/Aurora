@@ -63,6 +63,7 @@ def test_yes_lets_a_gated_call_through(tmp_path, monkeypatch):
 
 def test_denylist_still_wins_over_yes(tmp_path, monkeypatch):
     from aurora import approve
+    monkeypatch.setenv("AURORA_CORE", "python")   # mocks Python's policy; Rust's: test_rust_compat_r482
     monkeypatch.setattr(approve, "is_denied", lambda *a, **k: True)
     code, *_ = _run(tmp_path, monkeypatch, [
         TurnResult(text="", tool_calls=[_write_call(tmp_path)], stop_reason="tool_use"),
@@ -79,6 +80,7 @@ def test_step_cap_exits_1(tmp_path, monkeypatch):
 
 def test_allowlisted_gated_call_runs_without_yes(tmp_path, monkeypatch):
     from aurora import approve
+    monkeypatch.setenv("AURORA_CORE", "python")   # mocks Python's policy; Rust's: test_rust_compat_r482
     monkeypatch.setattr(approve, "is_allowed", lambda *a, **k: True)
     code, out, err, _ = _run(tmp_path, monkeypatch, [
         TurnResult(text="", tool_calls=[_write_call(tmp_path)], stop_reason="tool_use"),
@@ -87,8 +89,12 @@ def test_allowlisted_gated_call_runs_without_yes(tmp_path, monkeypatch):
     assert "not on the allowlist" not in err
 
 
-def test_cli_flag_validation(monkeypatch, capsys):
+def test_cli_flag_validation(monkeypatch, capsys, tmp_path):
     from aurora import __main__ as m
+    # config.yaml is untracked: a fresh checkout has none, so give AURORA_HOME one
+    (tmp_path / "config.yaml").write_text("models: []\n")
+    monkeypatch.setenv("AURORA_HOME", str(tmp_path))
+    monkeypatch.delenv("AURORA_CONFIG", raising=False)
     for argv in (["--yes"], ["--max-steps", "3"]):
         monkeypatch.setattr("sys.argv", ["aurora", *argv])
         with pytest.raises(SystemExit) as ex:

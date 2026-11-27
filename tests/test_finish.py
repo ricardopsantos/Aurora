@@ -93,6 +93,7 @@ def test_mdrender_lines(monkeypatch):
     assert r2.render("**raw**") == "**raw**"
 
 
+@pytest.mark.python_loop  # a Python provider object's optional bulk hook; no real provider has one
 def test_agent_flushes_parallel_calls_via_bulk_api(tmp_path):
     from aurora import agent
     from aurora.providers.base import ToolCall, TurnResult

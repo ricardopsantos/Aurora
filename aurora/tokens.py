@@ -36,6 +36,8 @@ def estimate_tokens_from_chars(chars: int) -> int:
 
 def fmt_token_count(n: int) -> str:
     """Compact token count: 950 → '950', 1000 → '1k', 1500 → '1.5k'."""
+    if n >= 999_950:                      # R544: 1.2M, not 1200k (and never "1000k")
+        return f"{n / 1_000_000:.1f}".removesuffix(".0") + "M"
     if n >= 1000:
         s = f"{n / 1000:.1f}"
         s = s.removesuffix(".0")

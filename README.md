@@ -72,8 +72,15 @@ cd Aurora && ./install.sh     # asks for the data folder (default ~/.aurora)
                                # and offers to set up an API key if none is set
 ```
 
+Since Aurora 2.0 the agent loop (model requests, tools, approvals, the sandbox)
+runs in Rust (`aurora-rs`), behind the same Python screens. `install.sh` builds
+it when a Rust toolchain is installed ([rustup.rs](https://rustup.rs)). Without
+Rust, Aurora runs its Python loop, which does the same. `runtime.core: python`
+in `config.yaml` keeps the Python loop either way.
+
 To update, run `git pull`, then `./.venv/bin/pip install -e . -q` if the
-dependencies changed. `config.yaml` holds providers, models and endpoints.
+dependencies changed, and `cargo build --release -p aurora-cli` if you use the
+Rust core. `config.yaml` holds providers, models and endpoints.
 Some checkouts commit a shared one and others ignore it as machine-specific;
 either way, `./install.sh` creates it from `config.yaml.example` if it's
 missing. Keys are never stored in the config. They live in environment
@@ -136,8 +143,12 @@ run tools, so read [SECURITY.md](SECURITY.md) first.
   Aurora checks the list before saving and keeps the last 5 versions.
 - A meter shows how full the context is, and the session clears itself at
   90%.
-- Tool calls run without asking by default (auto-approve; the denylist still
-  blocks). Turn it off in Settings > Chat and each call asks yes, no or stop.
+- Each write and command asks yes, no or stop before it runs. Turn on
+  auto-approve in Settings > Chat to run them without asking (the denylist
+  and the command sandbox still apply).
+- Commands run in a sandbox (bubblewrap on Linux, `sandbox-exec` on
+  macOS) that can write only the workspace and cannot see ssh keys,
+  credentials or Aurora's own keys. See SECURITY.md.
 
 ### Three layouts
 
@@ -184,11 +195,24 @@ enforces the boundary. To swap the UI (HTML, websocket), implement
 `Frontend`; the engine doesn't change. The full write-up is in
 [documents/ARCHITECTURE.md](documents/ARCHITECTURE.md).
 
+Since Aurora 2.0 the agent loop itself is the Rust workspace in `crates/`
+(`aurora-rs`). The Python front ends drive it over the protocol in
+[documents/CORE_PROTOCOL.md](documents/CORE_PROTOCOL.md), and the Python loop in
+`aurora/` stays as the fallback and as the reference the Rust loop is tested
+against.
+
 ## Tests
 
 ```bash
-./.venv/bin/python -m pytest -q
+./.venv/bin/python -m pytest -q                      # on the Rust loop (the default)
+AURORA_CORE=python ./.venv/bin/python -m pytest -q   # on the Python loop
+cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
+
+Run the suite on both loops before a change lands; the nightly does the same.
+If a test changes your real `~/.aurora/allowlist.yaml` or `denylist.yaml`, the
+run fails with `tests changed the real ~/.aurora`. Give every test its own
+`AURORA_HOME`; the guard watches only those two files.
 
 ## Other documents
 
@@ -209,6 +233,10 @@ Everything except this README is in [documents/](documents/):
 - [EXTENSIONS.md](documents/EXTENSIONS.md): writing a `.py` tool extension.
 - [MCP_SERVERS.md](documents/MCP_SERVERS.md): adding MCP servers to
   `config.yaml`.
+- [CORE_PROTOCOL.md](documents/CORE_PROTOCOL.md): the protocol between the
+  Python front ends and the Rust core (`aurora-rs`).
+- [EXTENSIONS_PROTOCOL.md](documents/EXTENSIONS_PROTOCOL.md): running `.py`
+  extensions behind a process boundary.
 - [REQUIREMENTS_OVERVIEW.md](documents/REQUIREMENTS_OVERVIEW.md): a short
   map of the requirement groups.
 - [CHANGELOG.md](documents/CHANGELOG.md): release notes for people.
@@ -216,7 +244,18 @@ Everything except this README is in [documents/](documents/):
   bootstrap prompt.
 
 At the repo root, [REQUIREMENTS.md](REQUIREMENTS.md) and the files under
-[requirements/](requirements/) hold the current requirements (up to R440) as
+[requirements/](requirements/) hold the current requirements (up to R582) as
 testable rules. New requirements go there.
 
 The README, the requirements and `ARCHITECTURE.md` must match the code. Any change in behaviour ships with its doc update in the same commit.
+
+## Credits
+
+The services Aurora talks to: [CREDITS.md](CREDITS.md).
+
+## AI disclosure
+
+Parts of this project were written with the assistance of AI coding agents
+(Claude Code). All changes are reviewed by the maintainer, who is responsible
+for the code. This is the single place that fact is disclosed; it is
+deliberately kept out of the commit history.

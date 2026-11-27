@@ -113,14 +113,77 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
         cwd=cwd, capture_output=True, text=True, timeout=60, check=check)
 
 
+_CWD_MARK = "aurora-cwd"           # R450 (P3): the folder a shadow repo belongs to, so a repo whose folder is gone can be found
+STALE_DAYS = 90                    # R450 (P3): a shadow repo untouched this long is removed
+_SWEEP_EVERY_S = 86400.0
+_last_sweep = 0.0
+
+
 def _ensure(cwd: Path) -> None:
     gd = _gitdir(cwd)
+    try:
+        if (gd / "HEAD").exists() and not (gd / _CWD_MARK).exists():
+            (gd / _CWD_MARK).write_text(str(cwd), encoding="utf-8")     # repos made before R450 learn theirs now
+    except OSError:
+        pass
     if not (gd / "HEAD").exists():
         gd.mkdir(parents=True, exist_ok=True)
         _git(cwd, "init", "--quiet")
         (gd / "info").mkdir(exist_ok=True)
         (gd / "info" / "exclude").write_text("\n".join(EXCLUDES) + "\n",
                                             encoding="utf-8")
+        (gd / _CWD_MARK).write_text(str(cwd), encoding="utf-8")
+
+
+def _repo_age_s(gd: Path, now: float) -> float:
+    newest = 0.0
+    for f in (gd, gd / "HEAD", gd / "logs" / "HEAD", gd / "last-mutation.json", gd / _CWD_MARK):
+        try:
+            newest = max(newest, f.stat().st_mtime)
+        except OSError:
+            pass
+    return now - newest
+
+
+def sweep_stale(max_age_days: int = STALE_DAYS, now: float | None = None) -> int:
+    """R450 (P3): remove shadow repos whose folder no longer exists, or that nothing has touched for
+    `max_age_days`. Returns how many were removed. Never raises. Only directories directly inside
+    AURORA_HOME/checkpoints that are named like a shadow repo (16 hex digits, with a HEAD) are ever touched;
+    a repo made before R450 has no folder mark and goes by age alone."""
+    import re
+    import shutil
+    removed = 0
+    try:
+        base = aurora_home() / "checkpoints"
+        now = time.time() if now is None else now
+        for gd in list(base.iterdir()):
+            try:
+                if not (re.fullmatch(r"[0-9a-f]{16}", gd.name) and gd.is_dir() and not gd.is_symlink()
+                        and (gd / "HEAD").exists()):
+                    continue
+                try:
+                    folder = (gd / _CWD_MARK).read_text(encoding="utf-8").strip()
+                except OSError:
+                    folder = ""
+                gone = bool(folder) and not Path(folder).exists()
+                if gone or _repo_age_s(gd, now) > max_age_days * 86400:
+                    with _repo_lock(Path(folder or gd.name)):
+                        shutil.rmtree(gd)
+                    removed += 1
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return removed
+
+
+def _sweep_soon() -> None:
+    """At most once a day per process, on a daemon thread, after a checkpoint."""
+    global _last_sweep
+    if time.time() - _last_sweep < _SWEEP_EVERY_S:
+        return
+    _last_sweep = time.time()
+    threading.Thread(target=sweep_stale, daemon=True).start()
 
 
 def _last_mutation_path(wt: Path) -> Path:
@@ -343,6 +406,7 @@ def checkpoint(label: str, cwd: str = ".") -> str | None:
         # Scheduled OUTSIDE the lock: the prune thread takes the same lock, so
         # dispatching while still holding it would just make it wait on us.
         _prune_soon(str(wt))       # R151, background + rate-limited
+        _sweep_soon()              # R450 (P3)
         return short
     except Exception:
         return None

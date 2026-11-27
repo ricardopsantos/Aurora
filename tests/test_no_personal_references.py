@@ -23,7 +23,7 @@ _ALLOWED = {
     # asserts the diagnosis text does NOT contain these words
     "tests/test_diagnose.py": re.compile(r'for personal in \('),
 }
-_TEXT = re.compile(r"\.(py|md|sh|yaml|yml|toml|txt|json|html|js|css|example|service|cfg|ini)$")   # R393: deploy units too
+_TEXT = re.compile(r"\.(py|rs|md|sh|yaml|yml|toml|txt|json|html|js|css|example|service|cfg|ini)$")   # R393: deploy units too; R581: the Rust core too
 
 
 def _tracked():
